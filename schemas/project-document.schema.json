@@ -3,6 +3,7 @@
   "$id": "https://github.com/Baggrisha/ai_constructor/schemas/project-document.schema.json",
   "title": "AI Constructor project document, schema 1",
   "type": "object",
+  "additionalProperties": false,
   "required": ["schemaVersion", "projectId", "revision", "pages", "nodes", "components", "tokens", "variables", "actions", "animations", "assets", "codeModules", "targets", "referenceBaselines"],
   "properties": {
     "schemaVersion": { "const": 1 },
@@ -11,44 +12,107 @@
     "pages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/page" } },
     "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
     "components": { "type": "array" },
-    "tokens": { "type": "array" },
-    "variables": { "type": "array" },
-    "actions": { "type": "array" },
-    "animations": { "type": "array" },
-    "assets": { "type": "array" },
-    "codeModules": { "type": "array" },
+    "tokens": { "type": "array", "items": { "$ref": "#/$defs/token" } },
+    "variables": { "type": "array", "items": { "$ref": "#/$defs/token" } },
+    "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } },
+    "animations": { "type": "array", "items": { "$ref": "#/$defs/animation" } },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
+    "codeModules": { "type": "array", "items": { "$ref": "#/$defs/codeModule" } },
     "targets": { "type": "array" },
     "referenceBaselines": { "type": "array" }
   },
   "$defs": {
     "id": { "type": "string", "format": "uuid" },
+    "scalar": { "type": ["boolean", "number", "string"] },
+    "valueKind": { "enum": ["boolean", "number", "string"] },
     "page": {
-      "type": "object",
+      "type": "object", "additionalProperties": false,
       "required": ["id", "name", "rootId"],
-      "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string" }, "rootId": { "$ref": "#/$defs/id" } }
+      "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1 }, "rootId": { "$ref": "#/$defs/id" } }
+    },
+    "bounds": {
+      "type": "object", "additionalProperties": false, "required": ["x", "y", "w", "h"],
+      "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 } }
+    },
+    "flow": {
+      "type": "object", "additionalProperties": false, "required": ["direction", "gap", "padding", "align"],
+      "properties": {
+        "direction": { "enum": ["row", "column"] }, "gap": { "type": "number", "minimum": 0 },
+        "align": { "enum": ["start", "center", "end", "stretch"] },
+        "padding": { "type": "object", "additionalProperties": false, "required": ["top", "right", "bottom", "left"], "properties": {
+          "top": { "type": "number", "minimum": 0 }, "right": { "type": "number", "minimum": 0 },
+          "bottom": { "type": "number", "minimum": 0 }, "left": { "type": "number", "minimum": 0 }
+        } }
+      }
+    },
+    "layout": {
+      "type": "object", "additionalProperties": false, "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 },
+        "flow": { "anyOf": [{ "$ref": "#/$defs/flow" }, { "type": "null" }] }, "widthMode": { "enum": ["fixed", "hug", "fill", null] }, "heightMode": { "enum": ["fixed", "hug", "fill", null] }
+      }
+    },
+    "responsive": {
+      "type": "object", "additionalProperties": false, "required": ["breakpoint"],
+      "properties": {
+        "breakpoint": { "type": "number", "exclusiveMinimum": 0 }, "x": { "type": ["number", "null"] }, "y": { "type": ["number", "null"] },
+        "w": { "type": ["number", "null"], "exclusiveMinimum": 0 }, "h": { "type": ["number", "null"], "exclusiveMinimum": 0 }
+      }
+    },
+    "binding": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "tokenId"], "properties": { "type": { "const": "token" }, "tokenId": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "variableId"], "properties": { "type": { "const": "variable" }, "variableId": { "$ref": "#/$defs/id" } } }
+      ]
+    },
+    "vectorCommand": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "x", "y"], "properties": { "type": { "enum": ["moveTo", "lineTo"] }, "x": { "type": "number" }, "y": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "x1", "y1", "x2", "y2", "x", "y"], "properties": { "type": { "const": "curveTo" }, "x1": { "type": "number" }, "y1": { "type": "number" }, "x2": { "type": "number" }, "y2": { "type": "number" }, "x": { "type": "number" }, "y": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "close" } } }
+      ]
+    },
+    "vector": {
+      "type": "object", "additionalProperties": false, "required": ["paths"],
+      "properties": { "paths": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/vectorCommand" } } } }
     },
     "node": {
-      "type": "object",
+      "type": "object", "additionalProperties": false,
       "required": ["id", "parentId", "kind", "name", "children", "layout", "style", "content", "a11y", "bindings", "events", "propertyMeta"],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "parentId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "id": { "$ref": "#/$defs/id" }, "parentId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
         "kind": { "enum": ["frame", "group", "text", "image", "vector", "button", "input", "textarea", "checkbox", "select", "componentInstance", "codeComponent"] },
-        "name": { "type": "string" },
-        "children": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
-        "layout": {
-          "type": "object", "required": ["x", "y", "w", "h"],
-          "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 } }
-        },
-        "style": { "type": "object" }, "content": { "type": "object" }, "a11y": { "type": "object" },
-        "bindings": { "type": "object" }, "events": { "type": "object" },
+        "name": { "type": "string", "minLength": 1 }, "children": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "layout": { "$ref": "#/$defs/layout" }, "sourceBounds": { "anyOf": [{ "$ref": "#/$defs/bounds" }, { "type": "null" }] }, "sourceDensity": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "responsive": { "type": "array", "items": { "$ref": "#/$defs/responsive" } },
+        "style": { "type": "object", "properties": { "fill": { "type": ["string", "null"] }, "color": { "type": ["string", "null"] }, "opacity": { "type": ["number", "null"], "minimum": 0, "maximum": 1 } } },
+        "content": { "type": "object", "properties": { "text": { "type": ["string", "null"] }, "placeholder": { "type": ["string", "null"] }, "assetId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "moduleId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "vector": { "anyOf": [{ "$ref": "#/$defs/vector" }, { "type": "null" }] }, "props": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/scalar" } } } },
+        "a11y": { "type": "object", "properties": { "label": { "type": ["string", "null"] }, "alt": { "type": ["string", "null"] } } },
+        "bindings": { "type": "object", "additionalProperties": { "$ref": "#/$defs/binding" } },
+        "events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/id" } },
         "propertyMeta": {
-          "type": "object", "additionalProperties": {
-            "type": "object", "required": ["origin", "lastRevision", "agentLocked"],
-            "properties": { "origin": { "enum": ["import", "user", "agent"] }, "lastRevision": { "type": "integer", "minimum": 0 }, "agentLocked": { "type": "boolean" } }
-          }
+          "type": "object", "propertyNames": { "pattern": "^/(?:[^~]|~[01])*$" },
+          "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["origin", "lastRevision", "agentLocked"], "properties": { "origin": { "enum": ["import", "user", "agent"] }, "lastRevision": { "type": "integer", "minimum": 0 }, "agentLocked": { "type": "boolean" } } }
         }
       }
-    }
+    },
+    "token": { "type": "object", "additionalProperties": false, "required": ["id", "name", "value"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1 }, "value": { "$ref": "#/$defs/scalar" } } },
+    "action": {
+      "type": "object", "additionalProperties": false, "required": ["id", "kind"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "kind": { "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "pageId"], "properties": { "type": { "const": "navigate" }, "pageId": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "url"], "properties": { "type": { "const": "openUrl" }, "url": { "type": "string", "pattern": "^https?://\\S+$" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "nodeId"], "properties": { "type": { "const": "toggleVisibility" }, "nodeId": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "animationId"], "properties": { "type": { "const": "playAnimation" }, "animationId": { "$ref": "#/$defs/id" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "variableId", "value"], "properties": { "type": { "const": "setVariable" }, "variableId": { "$ref": "#/$defs/id" }, "value": { "$ref": "#/$defs/scalar" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "variableId"], "properties": { "type": { "const": "toggleVariable" }, "variableId": { "$ref": "#/$defs/id" } } }
+      ] } }
+    },
+    "animation": {
+      "type": "object", "additionalProperties": false, "required": ["id", "nodeId", "property", "durationMs", "delayMs", "keyframes"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "nodeId": { "$ref": "#/$defs/id" }, "property": { "type": "string", "pattern": "^/" }, "durationMs": { "type": "integer", "minimum": 1, "maximum": 4294967295 }, "delayMs": { "type": "integer", "minimum": 0, "maximum": 4294967295 }, "keyframes": { "type": "array", "minItems": 2, "items": { "type": "object", "additionalProperties": false, "required": ["offset", "value"], "properties": { "offset": { "type": "number", "minimum": 0, "maximum": 1 }, "value": { "$ref": "#/$defs/scalar" } } } } }
+    },
+    "asset": { "type": "object", "additionalProperties": false, "required": ["id", "path"], "properties": { "id": { "$ref": "#/$defs/id" }, "path": { "type": "string", "pattern": "^assets/[0-9a-f]{64}\\.[A-Za-z0-9]+$" } } },
+    "codeModule": { "type": "object", "additionalProperties": false, "required": ["id", "path", "props", "events"], "properties": { "id": { "$ref": "#/$defs/id" }, "path": { "type": "string", "pattern": "^src/user/.+\\.tsx?$" }, "props": { "type": "object", "additionalProperties": { "$ref": "#/$defs/valueKind" } }, "events": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" }, "uniqueItems": true } } }
   }
 }

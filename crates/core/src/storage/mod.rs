@@ -19,6 +19,9 @@ mod atomic;
 mod tests;
 
 #[cfg(test)]
+mod checkpoint_tests;
+
+#[cfg(test)]
 thread_local! {
     static INTERRUPT_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static PARTIAL_JOURNAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -301,6 +304,41 @@ fn unexpected_retained(dir: &Path, old: Option<&str>, new: Option<&str>) -> Resu
     Ok(false)
 }
 
+fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = parent;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(meta) if meta.file_type().is_dir() || (current == root && current.is_dir()) => break,
+            Ok(_) => return Err(CoreError::conflict("Destination parent is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if current == root {
+                    return Err(CoreError::conflict("Project directory disappeared"));
+                }
+                missing.push(current);
+                current = current
+                    .parent()
+                    .ok_or_else(|| CoreError::invalid("Invalid destination parent"))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::create_dir_all(parent)?;
+    for directory in missing.iter().rev() {
+        if !fs::symlink_metadata(directory)?.file_type().is_dir() {
+            return Err(CoreError::conflict(
+                "Destination parent changed during publication",
+            ));
+        }
+        sync_dir(
+            directory
+                .parent()
+                .ok_or_else(|| CoreError::invalid("Invalid destination parent"))?,
+        )?;
+    }
+    Ok(())
+}
+
 fn replace_with(
     root: &Path,
     relative: &str,
@@ -312,7 +350,7 @@ fn replace_with(
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::invalid("Invalid file path"))?;
-    fs::create_dir_all(parent)?;
+    create_destination_parent(root, parent)?;
     fs::create_dir_all(retained)?;
     sync_dir(
         retained
@@ -790,11 +828,308 @@ pub fn snapshot_inputs(root: &Path, expected_manifest: &[u8]) -> Result<BTreeMap
     Ok(result)
 }
 
+pub fn checkpoint_dependency_path(path: &str) -> bool {
+    (path.starts_with("src/user/")
+        || path.starts_with("src/generated/")
+        || path.starts_with("assets/"))
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[cfg(unix)]
+pub fn checkpoint_executable_mode(root: &Path, path: &str) -> Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(safe_path(root, path)?)?;
+    if !metadata.file_type().is_file() {
+        return Err(CoreError::unsupported(format!(
+            "Checkpoint dependency is not a regular file: {path}"
+        )));
+    }
+    Ok(metadata.permissions().mode() & 0o111)
+}
+
+#[cfg(not(unix))]
+pub fn checkpoint_executable_mode(_root: &Path, _path: &str) -> Result<u32> {
+    Err(CoreError::unsupported(
+        "Checkpoint file permissions are unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn require_non_casefold_directory(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let directory = File::open(path)?;
+    let mut flags: libc::c_int = 0;
+    // ioctl writes the flags into this initialized int; the descriptor stays open.
+    let result = unsafe {
+        libc::ioctl(
+            directory.as_raw_fd(),
+            libc::FS_IOC_GETFLAGS as _,
+            &mut flags,
+        )
+    };
+    if result < 0 {
+        return Err(CoreError::unsupported(format!(
+            "Cannot determine directory casefold behavior for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
+    if flags & FS_CASEFOLD_FL != 0 {
+        return Err(CoreError::unsupported(format!(
+            "Casefolded directory is not supported: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_checkpoint_tree(
+    root: &Path,
+    dependencies: &BTreeMap<String, String>,
+) -> Result<()> {
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    let probe = root
+        .join(".aic-local")
+        .join(format!("checkpoint-probe-{}", Uuid::new_v4()));
+    fs::create_dir(&probe)?;
+    let result = (|| {
+        #[cfg(unix)]
+        let device = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&probe)?.dev()
+        };
+        #[cfg(target_os = "linux")]
+        let mut checked_directories = {
+            require_non_casefold_directory(root)?;
+            BTreeSet::from([root.to_path_buf()])
+        };
+        let mut expected_children: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> =
+            BTreeMap::new();
+        for path in dependencies.keys() {
+            let mut actual = root.to_path_buf();
+            let mut scratch = probe.clone();
+            let mut missing = false;
+            for part in Path::new(path).components() {
+                let parent = scratch.clone();
+                scratch.push(part.as_os_str());
+                if expected_children
+                    .entry(parent)
+                    .or_default()
+                    .insert(part.as_os_str().to_owned())
+                {
+                    match fs::create_dir(&scratch) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(CoreError::unsupported(format!(
+                                "Checkpoint paths have filesystem aliases: {path}"
+                            )));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                if !missing {
+                    actual.push(part.as_os_str());
+                    match fs::symlink_metadata(&actual) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                return Err(CoreError::unsupported(
+                                    "Checkpoint destinations must not contain symlinks",
+                                ));
+                            }
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::MetadataExt;
+                                if meta.dev() != device {
+                                    return Err(CoreError::unsupported(
+                                        "Checkpoint files must be on the project storage volume",
+                                    ));
+                                }
+                            }
+                            #[cfg(target_os = "linux")]
+                            if meta.file_type().is_dir()
+                                && checked_directories.insert(actual.clone())
+                            {
+                                require_non_casefold_directory(&actual)?;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            missing = true
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                            return Err(CoreError::unsupported(format!(
+                                "Checkpoint file/directory collision: {path}"
+                            )));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        for (parent, expected) in expected_children {
+            let actual = fs::read_dir(parent)?
+                .map(|entry| entry.map(|item| item.file_name()))
+                .collect::<std::io::Result<BTreeSet<_>>>()?;
+            if actual != expected {
+                return Err(CoreError::unsupported(
+                    "Checkpoint paths are not preserved by the filesystem",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&probe);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+pub fn checkpoint_destination(
+    root: &Path,
+    path: &str,
+    directories: &mut BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>,
+) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let mut parts = Path::new(path).components().peekable();
+    while let Some(part) = parts.next() {
+        current.push(part.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                let parent = current
+                    .parent()
+                    .ok_or_else(|| CoreError::invalid("Invalid checkpoint path"))?;
+                let exact = if let Some(names) = directories.get(parent) {
+                    names.contains(part.as_os_str())
+                } else {
+                    let names = fs::read_dir(parent)?
+                        .map(|entry| entry.map(|item| item.file_name()))
+                        .collect::<std::io::Result<BTreeSet<_>>>()?;
+                    let exact = names.contains(part.as_os_str());
+                    directories.insert(parent.to_path_buf(), names);
+                    exact
+                };
+                if !exact {
+                    return Err(CoreError::unsupported(format!(
+                        "Checkpoint destination has a filesystem alias: {path}"
+                    )));
+                }
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::unsupported(
+                        "Checkpoint destinations must not contain symlinks",
+                    ));
+                }
+                if parts.peek().is_some() && !meta.file_type().is_dir() {
+                    return Err(CoreError::unsupported(format!(
+                        "Checkpoint file/directory collision: {path}"
+                    )));
+                }
+                if parts.peek().is_none() {
+                    if !meta.file_type().is_file() {
+                        return Err(CoreError::unsupported(format!(
+                            "Checkpoint file/directory collision: {path}"
+                        )));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if meta.permissions().mode() & 0o111 != 0 {
+                            return Err(CoreError::unsupported(format!(
+                                "Cannot safely replace an executable file: {path}"
+                            )));
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_checkpoint_asset(path: &str, digest: &str) -> Result<()> {
+    let Some(file) = path.strip_prefix("assets/") else {
+        return Ok(());
+    };
+    if file.contains('/') {
+        return Ok(());
+    }
+    let Some((address, _)) = file.split_once('.') else {
+        return Ok(());
+    };
+    if address.len() == 64
+        && address
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        && address != digest
+    {
+        return Err(CoreError::conflict(format!(
+            "Asset content does not match its address: {path}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn tracked_bytes(root: &Path, manifest: &Manifest, path: &str) -> Result<Vec<u8>> {
+    let expected = manifest
+        .files
+        .get(path)
+        .ok_or_else(|| CoreError::conflict(format!("Tracked file is missing: {path}")))?;
+    let bytes = file_bytes(root, path)?
+        .ok_or_else(|| CoreError::conflict(format!("Tracked file is missing: {path}")))?;
+    if hash(&bytes) != *expected {
+        return Err(CoreError::conflict(format!(
+            "Tracked file was modified: {path}"
+        )));
+    }
+    Ok(bytes)
+}
+
+pub fn checkpoint_blob(root: &Path, manifest: &Manifest, digest: &str) -> Result<Vec<u8>> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err(CoreError::invalid("Invalid checkpoint hash"));
+    }
+    let path = format!("checkpoints/blobs/{digest}");
+    if manifest.files.get(&path).map(String::as_str) != Some(digest) {
+        return Err(CoreError::conflict(format!(
+            "Checkpoint blob {digest} is missing or modified"
+        )));
+    }
+    tracked_bytes(root, manifest, &path)
+}
+
 pub fn commit(
     root: &Path,
     expected_manifest: &[u8],
     new_manifest: &Manifest,
     changes: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>> {
+    commit_with_deletions(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        &BTreeSet::new(),
+    )
+}
+
+pub fn commit_with_deletions(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
 ) -> Result<Vec<u8>> {
     let _lock = lock(root)?;
     if recover(root)?.is_some() {
@@ -827,14 +1162,24 @@ pub fn commit(
         let next = hash(bytes);
         if old.files.get(path) != Some(&next) {
             new.files.insert(path.clone(), next);
-            actual.insert(path.clone(), bytes.clone());
+            actual.insert(path.clone(), Some(bytes.clone()));
         }
     }
-    let document = actual
-        .get("document.json")
-        .cloned()
-        .or(file_bytes(root, "document.json")?)
-        .ok_or_else(|| CoreError::invalid("Missing document"))?;
+    for path in deletions {
+        safe_path(root, path)?;
+        if changes.contains_key(path) || path == "document.json" {
+            return Err(CoreError::invalid("Invalid or conflicting file deletion"));
+        }
+        if new.files.remove(path).is_some() {
+            actual.insert(path.clone(), None);
+        }
+    }
+    let document = match actual.get("document.json") {
+        Some(Some(bytes)) => bytes.clone(),
+        Some(None) => return Err(CoreError::invalid("Cannot delete the document")),
+        None => file_bytes(root, "document.json")?
+            .ok_or_else(|| CoreError::invalid("Missing document"))?,
+    };
     new.snapshot_hash = fingerprint(&document, &new.files);
     let new_bytes = json(&new)?;
     if actual.is_empty() && old.name == new.name && old.revision == new.revision {
@@ -861,14 +1206,19 @@ pub fn commit(
         } else {
             None
         };
-        let new_copy = format!("new-{i}");
-        durable_write(&txdir.join(&new_copy), bytes)?;
+        let new_copy = if let Some(bytes) = bytes {
+            let name = format!("new-{i}");
+            durable_write(&txdir.join(&name), bytes)?;
+            Some(name)
+        } else {
+            None
+        };
         entries.push(Entry {
             path: path.clone(),
             old_hash,
-            new_hash: Some(hash(bytes)),
+            new_hash: bytes.as_deref().map(hash),
             old_copy,
-            new_copy: Some(new_copy),
+            new_copy,
         });
     }
     let journal = Journal {
@@ -911,7 +1261,7 @@ pub fn commit(
             root,
             &entry.path,
             entry.old_hash.as_deref(),
-            actual.get(&entry.path).map(Vec::as_slice),
+            actual.get(&entry.path).and_then(Option::as_deref),
             &retained.join(format!("entry-{index}")),
         )?;
         #[cfg(test)]

@@ -453,6 +453,9 @@ private struct FrameEditor: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Страница 1").font(.title3.bold())
                 Text("Корневой фрейм").foregroundStyle(.secondary)
+                Text("Показан только контур: элементы, стили и поведение документа пока не отображаются.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 RoundedRectangle(cornerRadius: 14)
                     .fill(Color(nsColor: .controlBackgroundColor))
                     .overlay {

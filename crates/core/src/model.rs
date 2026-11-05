@@ -1,10 +1,26 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{CoreError, Result};
+mod domain;
+mod operations;
+mod validation;
+
+use domain::{
+    Action, Animation, Asset, Binding, Bounds, CodeModule, FeatureMap, Flow, NodeAccessibility,
+    NodeContent, NodeStyle, ResponsiveOverride, SizeMode, Token, Variable,
+};
+
+fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -15,12 +31,12 @@ pub struct Document {
     pub pages: Vec<Page>,
     pub nodes: Vec<Node>,
     pub components: Vec<Value>,
-    pub tokens: Vec<Value>,
-    pub variables: Vec<Value>,
-    pub actions: Vec<Value>,
-    pub animations: Vec<Value>,
-    pub assets: Vec<Value>,
-    pub code_modules: Vec<Value>,
+    pub tokens: Vec<Token>,
+    pub variables: Vec<Variable>,
+    pub actions: Vec<Action>,
+    pub animations: Vec<Animation>,
+    pub assets: Vec<Asset>,
+    pub code_modules: Vec<CodeModule>,
     pub targets: Vec<Value>,
     pub reference_baselines: Vec<Value>,
 }
@@ -37,16 +53,23 @@ pub struct Page {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Node {
     pub id: Uuid,
+    #[serde(deserialize_with = "required_option")]
     pub parent_id: Option<Uuid>,
     pub kind: NodeKind,
     pub name: String,
     pub children: Vec<Uuid>,
     pub layout: Layout,
-    pub style: BTreeMap<String, Value>,
-    pub content: BTreeMap<String, Value>,
-    pub a11y: BTreeMap<String, Value>,
-    pub bindings: BTreeMap<String, Value>,
-    pub events: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bounds: Option<Bounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_density: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responsive: Vec<ResponsiveOverride>,
+    pub style: FeatureMap<NodeStyle>,
+    pub content: FeatureMap<NodeContent>,
+    pub a11y: FeatureMap<NodeAccessibility>,
+    pub bindings: FeatureMap<BTreeMap<String, Binding>>,
+    pub events: FeatureMap<BTreeMap<String, Uuid>>,
     pub property_meta: BTreeMap<String, PropertyMeta>,
 }
 
@@ -74,6 +97,12 @@ pub struct Layout {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<Flow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_mode: Option<SizeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_mode: Option<SizeMode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,10 +140,41 @@ pub struct Transaction {
     deny_unknown_fields
 )]
 pub enum Operation {
+    InsertNode {
+        parent_id: Uuid,
+        index: usize,
+        node: Box<Node>,
+    },
+    RemoveNode {
+        node_id: Uuid,
+    },
+    MoveNode {
+        node_id: Uuid,
+        parent_id: Uuid,
+        index: usize,
+    },
     SetProperty {
         node_id: Uuid,
         path: String,
         value: Value,
+    },
+    SetBinding {
+        node_id: Uuid,
+        path: String,
+        #[serde(deserialize_with = "required_option")]
+        binding: Option<domain::Binding>,
+    },
+    UpsertAction {
+        action: Action,
+    },
+    UpsertAnimation {
+        animation: Animation,
+    },
+    UpsertCodeModule {
+        code_module: CodeModule,
+    },
+    SetToken {
+        token: Token,
     },
     SetViewport {
         node_id: Uuid,
@@ -145,13 +205,19 @@ impl Document {
                     x: 0.0,
                     y: 0.0,
                     w: 1440.0,
+                    flow: None,
+                    width_mode: None,
+                    height_mode: None,
                     h: 900.0,
                 },
-                style: BTreeMap::new(),
-                content: BTreeMap::new(),
-                a11y: BTreeMap::new(),
-                bindings: BTreeMap::new(),
-                events: BTreeMap::new(),
+                source_bounds: None,
+                source_density: None,
+                responsive: Vec::new(),
+                style: FeatureMap::Known(NodeStyle::default()),
+                content: FeatureMap::Known(NodeContent::default()),
+                a11y: FeatureMap::Known(NodeAccessibility::default()),
+                bindings: FeatureMap::Known(BTreeMap::new()),
+                events: FeatureMap::Known(BTreeMap::new()),
                 property_meta: BTreeMap::new(),
             }],
             components: vec![],
@@ -165,221 +231,4 @@ impl Document {
             reference_baselines: vec![],
         }
     }
-
-    // Until the corresponding editors and reference validation exist, do not
-    // rewrite documents containing data that this implementation cannot edit.
-    pub fn editable(&self) -> bool {
-        self.pages.len() == 1
-            && self.nodes.len() == 1
-            && matches!(self.nodes[0].kind, NodeKind::Frame)
-            && self.nodes[0].parent_id.is_none()
-            && self.nodes[0].children.is_empty()
-            && self.nodes[0].style.is_empty()
-            && self.nodes[0].content.is_empty()
-            && self.nodes[0].a11y.is_empty()
-            && self.nodes[0].bindings.is_empty()
-            && self.nodes[0].events.is_empty()
-            && self.components.is_empty()
-            && self.tokens.is_empty()
-            && self.variables.is_empty()
-            && self.actions.is_empty()
-            && self.animations.is_empty()
-            && self.assets.is_empty()
-            && self.code_modules.is_empty()
-            && self.targets.is_empty()
-            && self.reference_baselines.is_empty()
-    }
-
-    pub fn mark_restored_properties(&mut self, before: &Document) {
-        for node in &mut self.nodes {
-            if let Some(previous) = before.nodes.iter().find(|old| old.id == node.id) {
-                for (path, changed) in [
-                    ("/name", node.name != previous.name),
-                    ("/layout/x", node.layout.x != previous.layout.x),
-                    ("/layout/y", node.layout.y != previous.layout.y),
-                    ("/layout/w", node.layout.w != previous.layout.w),
-                    ("/layout/h", node.layout.h != previous.layout.h),
-                ] {
-                    if changed {
-                        let agent_locked = previous
-                            .property_meta
-                            .get(path)
-                            .is_some_and(|meta| meta.agent_locked);
-                        node.property_meta.insert(
-                            path.into(),
-                            PropertyMeta {
-                                origin: Origin::User,
-                                last_revision: self.revision,
-                                agent_locked,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 || self.pages.is_empty() {
-            return Err(CoreError::invalid("Unsupported or empty document"));
-        }
-        let ids: HashSet<_> = self.nodes.iter().map(|n| n.id).collect();
-        if ids.len() != self.nodes.len() {
-            return Err(CoreError::invalid("Duplicate node ID"));
-        }
-        let page_ids: HashSet<_> = self.pages.iter().map(|p| p.id).collect();
-        if page_ids.len() != self.pages.len() {
-            return Err(CoreError::invalid("Duplicate page ID"));
-        }
-        for node in &self.nodes {
-            let l = &node.layout;
-            if ![l.x, l.y, l.w, l.h].into_iter().all(f64::is_finite) || l.w <= 0.0 || l.h <= 0.0 {
-                return Err(CoreError::invalid(format!(
-                    "Invalid dimensions for node {}",
-                    node.id
-                )));
-            }
-            if let Some(parent) = node.parent_id {
-                let p = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == parent)
-                    .ok_or_else(|| CoreError::invalid("Missing parent"))?;
-                if p.children.iter().filter(|id| **id == node.id).count() != 1 {
-                    return Err(CoreError::invalid("Inconsistent parent/child links"));
-                }
-            }
-            let mut children = HashSet::new();
-            for child in &node.children {
-                let child_node = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == *child)
-                    .ok_or_else(|| CoreError::invalid("Missing child"))?;
-                if !children.insert(child) || child_node.parent_id != Some(node.id) {
-                    return Err(CoreError::invalid("Inconsistent parent/child links"));
-                }
-            }
-            let mut ancestors = HashSet::new();
-            let mut cursor = Some(node.id);
-            while let Some(id) = cursor {
-                if !ancestors.insert(id) {
-                    return Err(CoreError::invalid("Node cycle"));
-                }
-                cursor = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == id)
-                    .and_then(|n| n.parent_id);
-            }
-        }
-        for page in &self.pages {
-            let root = self
-                .nodes
-                .iter()
-                .find(|n| n.id == page.root_id)
-                .ok_or_else(|| CoreError::invalid("Missing page root"))?;
-            if root.parent_id.is_some() {
-                return Err(CoreError::invalid("Page root has a parent"));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn apply(&mut self, transaction: &Transaction) -> Result<()> {
-        if transaction.operations.is_empty() {
-            return Err(CoreError::invalid("Empty transaction"));
-        }
-        let revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| CoreError::invalid("Revision overflow"))?;
-        for op in &transaction.operations {
-            let id = match op {
-                Operation::SetProperty { node_id, .. } | Operation::SetViewport { node_id, .. } => {
-                    *node_id
-                }
-            };
-            if !transaction.scope_node_ids.contains(&id) {
-                return Err(CoreError::invalid(format!(
-                    "Node {id} is outside transaction scope"
-                )));
-            }
-            let node = self
-                .nodes
-                .iter_mut()
-                .find(|node| node.id == id)
-                .ok_or_else(|| CoreError::invalid(format!("Unknown node {id}")))?;
-            match op {
-                Operation::SetProperty { path, value, .. } => {
-                    if matches!(transaction.origin, Origin::Agent)
-                        && node.property_meta.get(path).is_some_and(|m| m.agent_locked)
-                    {
-                        return Err(CoreError::locked(format!("{id}: {path}")));
-                    }
-                    match path.as_str() {
-                        "/name" => {
-                            node.name = value
-                                .as_str()
-                                .filter(|s| !s.trim().is_empty())
-                                .ok_or_else(|| CoreError::invalid("Name must not be empty"))?
-                                .to_owned()
-                        }
-                        "/layout/x" => node.layout.x = number(value)?,
-                        "/layout/y" => node.layout.y = number(value)?,
-                        "/layout/w" => node.layout.w = number(value)?,
-                        "/layout/h" => node.layout.h = number(value)?,
-                        _ => {
-                            return Err(CoreError::unsupported(format!(
-                                "Property {path} is not supported"
-                            )))
-                        }
-                    }
-                    let locked = node.property_meta.get(path).is_some_and(|m| m.agent_locked);
-                    node.property_meta.insert(
-                        path.clone(),
-                        PropertyMeta {
-                            origin: transaction.origin,
-                            last_revision: revision,
-                            agent_locked: locked,
-                        },
-                    );
-                }
-                Operation::SetViewport { width, height, .. } => {
-                    if !matches!(node.kind, NodeKind::Frame) || node.parent_id.is_some() {
-                        return Err(CoreError::invalid("Viewport must be a root frame"));
-                    }
-                    for path in ["/layout/w", "/layout/h"] {
-                        if matches!(transaction.origin, Origin::Agent)
-                            && node.property_meta.get(path).is_some_and(|m| m.agent_locked)
-                        {
-                            return Err(CoreError::locked(format!("{id}: {path}")));
-                        }
-                    }
-                    node.layout.w = *width;
-                    node.layout.h = *height;
-                    for path in ["/layout/w", "/layout/h"] {
-                        let locked = node.property_meta.get(path).is_some_and(|m| m.agent_locked);
-                        node.property_meta.insert(
-                            path.into(),
-                            PropertyMeta {
-                                origin: transaction.origin,
-                                last_revision: revision,
-                                agent_locked: locked,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        self.revision = revision;
-        self.validate()
-    }
-}
-
-fn number(value: &Value) -> Result<f64> {
-    value
-        .as_f64()
-        .filter(|n| n.is_finite())
-        .ok_or_else(|| CoreError::invalid("Expected a finite number"))
 }
