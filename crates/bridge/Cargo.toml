@@ -1,0 +1,14 @@
+[package]
+name = "aic-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "aic_bridge"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+aic-core = { path = "../core" }
+uniffi = { version = "=0.32.2", features = ["cli"] }
+thiserror = "2.0"

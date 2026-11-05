@@ -1,0 +1,9 @@
+/target/
+/build/
+/apps/macos/Generated/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.xcuserstate
+xcuserdata/

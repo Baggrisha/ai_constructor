@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Baggrisha/ai_constructor/schemas/project-document.schema.json",
+  "title": "AI Constructor project document, schema 1",
+  "type": "object",
+  "required": ["schemaVersion", "projectId", "revision", "pages", "nodes", "components", "tokens", "variables", "actions", "animations", "assets", "codeModules", "targets", "referenceBaselines"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "projectId": { "$ref": "#/$defs/id" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "pages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/page" } },
+    "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+    "components": { "type": "array" },
+    "tokens": { "type": "array" },
+    "variables": { "type": "array" },
+    "actions": { "type": "array" },
+    "animations": { "type": "array" },
+    "assets": { "type": "array" },
+    "codeModules": { "type": "array" },
+    "targets": { "type": "array" },
+    "referenceBaselines": { "type": "array" }
+  },
+  "$defs": {
+    "id": { "type": "string", "format": "uuid" },
+    "page": {
+      "type": "object",
+      "required": ["id", "name", "rootId"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string" }, "rootId": { "$ref": "#/$defs/id" } }
+    },
+    "node": {
+      "type": "object",
+      "required": ["id", "parentId", "kind", "name", "children", "layout", "style", "content", "a11y", "bindings", "events", "propertyMeta"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "parentId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "kind": { "enum": ["frame", "group", "text", "image", "vector", "button", "input", "textarea", "checkbox", "select", "componentInstance", "codeComponent"] },
+        "name": { "type": "string" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "layout": {
+          "type": "object", "required": ["x", "y", "w", "h"],
+          "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 } }
+        },
+        "style": { "type": "object" }, "content": { "type": "object" }, "a11y": { "type": "object" },
+        "bindings": { "type": "object" }, "events": { "type": "object" },
+        "propertyMeta": {
+          "type": "object", "additionalProperties": {
+            "type": "object", "required": ["origin", "lastRevision", "agentLocked"],
+            "properties": { "origin": { "enum": ["import", "user", "agent"] }, "lastRevision": { "type": "integer", "minimum": 0 }, "agentLocked": { "type": "boolean" } }
+          }
+        }
+      }
+    }
+  }
+}
