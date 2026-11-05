@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -13,13 +13,30 @@ use walkdir::WalkDir;
 
 use crate::{CoreError, Result};
 
+mod assets;
 mod atomic;
+mod conflicts;
+pub(crate) mod control;
+mod diagnostics;
+mod migration;
+mod recovery_choice;
+pub(crate) mod retention;
+mod services;
+
+pub(crate) use assets::font_asset;
+pub(crate) use diagnostics::capture_external;
+pub(crate) use services::rewrite_chats;
+const EXTERNAL_CHANGE_REASON: &str =
+    "Project files were changed outside the editor; open read-only to avoid overwriting them";
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod checkpoint_tests;
+
+#[cfg(test)]
+mod retention_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -67,6 +84,23 @@ pub struct Manifest {
     pub files: BTreeMap<String, String>,
 }
 
+/// Inspect only top-level keys; unknown values are never deserialized into
+/// the current manifest or rewritten by this version of the application.
+pub(crate) fn manifest_has_unknown_fields(bytes: &[u8]) -> Result<bool> {
+    let fields: BTreeMap<String, serde::de::IgnoredAny> = serde_json::from_slice(bytes)
+        .map_err(|e| CoreError::invalid(format!("Invalid project manifest: {e}")))?;
+    const KNOWN: &[&str] = &[
+        "schemaVersion",
+        "projectId",
+        "name",
+        "revision",
+        "storageGeneration",
+        "snapshotHash",
+        "files",
+    ];
+    Ok(fields.keys().any(|key| !KNOWN.contains(&key.as_str())))
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
@@ -78,6 +112,11 @@ struct Entry {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ObservedMarker {
+    hash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Journal {
     old_manifest_hash: String,
@@ -86,9 +125,16 @@ struct Journal {
     new_revision: u64,
     old_generation: u64,
     new_generation: u64,
+    // External resolution rolls back to the observed filesystem, not the
+    // manifest's last known-good hashes. Old journals omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_files: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_marker: Option<ObservedMarker>,
     entries: Vec<Entry>,
 }
 
+#[derive(Debug)]
 pub struct Loaded {
     pub manifest: Manifest,
     pub manifest_bytes: Vec<u8>,
@@ -141,7 +187,16 @@ fn lock(root: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(root.join(".aic-local/write.lock"))?;
-    file.lock_exclusive()?;
+    loop {
+        control::check()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(file)
 }
 
@@ -169,9 +224,37 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(current)
 }
 
+fn read_checked(mut file: File) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        control::check()?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        control::check()?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn file_bytes(root: &Path, relative: &str) -> Result<Option<Vec<u8>>> {
-    match fs::read(safe_path(root, relative)?) {
-        Ok(bytes) => Ok(Some(bytes)),
+    match File::open(safe_path(root, relative)?) {
+        Ok(file) => Ok(Some(read_checked(file)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -201,7 +284,11 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
         return Err(CoreError::io("Simulated partial journal write"));
     }
-    file.write_all(bytes)?;
+    for chunk in bytes.chunks(64 * 1024) {
+        control::check()?;
+        file.write_all(chunk)?;
+    }
+    control::check()?;
     file.sync_all()?;
     Ok(())
 }
@@ -243,6 +330,13 @@ fn retained_transaction(root: &Path, txdir: &Path, journal: &Journal) -> Result<
     sync_dir(&base)?;
     let names = ["journal.json", "old-manifest", "new-manifest"]
         .into_iter()
+        .chain(
+            journal
+                .observed_marker
+                .as_ref()
+                .and_then(|marker| marker.hash.as_ref())
+                .map(|_| "observed-manifest"),
+        )
         .chain(journal.entries.iter().flat_map(|entry| {
             [entry.old_copy.as_deref(), entry.new_copy.as_deref()]
                 .into_iter()
@@ -410,6 +504,7 @@ fn scan(root: &Path) -> Result<BTreeMap<String, String>> {
             continue;
         }
         for entry in WalkDir::new(&path).follow_links(false) {
+            control::check()?;
             let entry = entry.map_err(|e| CoreError::io(e.to_string()))?;
             if entry.file_type().is_symlink() {
                 return Err(CoreError::invalid("Project symlinks are not supported"));
@@ -425,14 +520,14 @@ fn scan(root: &Path) -> Result<BTreeMap<String, String>> {
                 .to_str()
                 .ok_or_else(|| CoreError::invalid("Non-UTF-8 project path"))?
                 .replace('\\', "/");
-            files.insert(name, hash(&fs::read(entry.path())?));
+            files.insert(name, hash_file(entry.path())?);
         }
     }
     Ok(files)
 }
 
 pub fn create(root: &Path, manifest: &Manifest, document: &[u8]) -> Result<Manifest> {
-    fs::create_dir(root)?;
+    control::check()?;
     for dir in [
         "src/user",
         "src/generated",
@@ -451,7 +546,7 @@ pub fn create(root: &Path, manifest: &Manifest, document: &[u8]) -> Result<Manif
     durable_write(&root.join("document.json"), document)?;
     durable_write(
         &root.join(".gitignore"),
-        b".aic-local/\n.cache/\n.DS_Store\n.env\n.env.*\n",
+        b".aic-local/\n.cache/\n.DS_Store\n.env\n.env.*\n/build/\n/dist/\n/target/\n/out/\n/node_modules/\n/.next/\n/coverage/\n/DerivedData/\n",
     )?;
     let mut manifest = manifest.clone();
     manifest.files = scan(root)?;
@@ -459,6 +554,43 @@ pub fn create(root: &Path, manifest: &Manifest, document: &[u8]) -> Result<Manif
     durable_write(&root.join("project.json"), &json(&manifest)?)?;
     sync_dir(root)?;
     Ok(manifest)
+}
+
+#[cfg(unix)]
+pub fn copy_executable_modes(root: &Path, target: &Path, paths: &[String]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for path in paths {
+        control::check()?;
+        let mode = checkpoint_executable_mode(root, path)?;
+        let destination = safe_path(target, path)?;
+        let mut permissions = fs::symlink_metadata(&destination)?.permissions();
+        permissions.set_mode((permissions.mode() & !0o111) | mode);
+        fs::set_permissions(&destination, permissions)?;
+        File::open(&destination)?.sync_all()?;
+        if checkpoint_executable_mode(root, path)? != mode {
+            return Err(CoreError::conflict(format!(
+                "File mode changed while duplicating {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn copy_executable_modes(_root: &Path, _target: &Path, _paths: &[String]) -> Result<()> {
+    Err(CoreError::unsupported(
+        "Cannot preserve executable modes on this platform",
+    ))
+}
+
+pub fn publish_directory(staged: &Path, destination: &Path) -> Result<()> {
+    control::begin_commit()?;
+    atomic::move_no_replace(staged, destination)?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_dir(parent)
 }
 
 fn verify_backup(dir: &Path, name: &str, expected: &str) -> Result<Vec<u8>> {
@@ -474,6 +606,14 @@ fn preserve_conflict(root: &Path, dir: &Path, journal: &Journal, reason: &str) -
     fs::create_dir_all(&conflict)?;
     for name in ["old-manifest", "new-manifest", "journal.json"] {
         durable_write(&conflict.join(name), &fs::read(dir.join(name))?)?;
+    }
+    if let Some(marker) = &journal.observed_marker {
+        if let Some(expected) = &marker.hash {
+            durable_write(
+                &conflict.join("observed-manifest"),
+                &verify_backup(dir, "observed-manifest", expected)?,
+            )?;
+        }
     }
     if let Some(bytes) = file_bytes(root, "project.json")? {
         durable_write(&conflict.join("current-manifest"), &bytes)?;
@@ -556,8 +696,17 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
         if !journal_path.exists() {
             continue;
         } // incomplete preparation, never published
-        let journal: Journal = serde_json::from_slice(&fs::read(&journal_path)?)
+          // A published journal may require recovery writes before the main operation.
+        control::begin_commit()?;
+        let journal_bytes = fs::read(&journal_path)?;
+        let journal: Journal = serde_json::from_slice(&journal_bytes)
             .map_err(|e| CoreError::invalid(format!("Invalid recovery journal: {e}")))?;
+        if dir.join("recovery-choice.json").exists() {
+            if let Some(loaded) = recovery_choice::resume(root, &dir, &journal, &journal_bytes)? {
+                return Ok(Some(loaded));
+            }
+            continue;
+        }
         let old_manifest = verify_backup(&dir, "old-manifest", &journal.old_manifest_hash)?;
         let new_manifest = verify_backup(&dir, "new-manifest", &journal.new_manifest_hash)?;
         let old: Manifest =
@@ -574,10 +723,25 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                 "Journal manifest metadata does not match",
             ));
         }
+        let old_files = journal.observed_files.as_ref().unwrap_or(&old.files);
+        let old_marker = match &journal.observed_marker {
+            Some(marker) => {
+                if let Some(expected) = &marker.hash {
+                    verify_backup(&dir, "observed-manifest", expected)?;
+                }
+                marker.hash.as_deref()
+            }
+            None => Some(journal.old_manifest_hash.as_str()),
+        };
         let retained = retained_transaction(root, &dir, &journal)?;
         let marker = file_hash(root, "project.json")?;
         let forward = marker.as_deref() == Some(journal.new_manifest_hash.as_str());
-        let backward = marker.as_deref() == Some(journal.old_manifest_hash.as_str());
+        // Absence is not a completion marker, even if an earlier external
+        // resolution happened to start with an absent project.json.
+        let backward = marker.is_some() && marker.as_deref() == old_marker;
+        if forward && backward {
+            return Err(CoreError::invalid("Recovery marker is ambiguous"));
+        }
         let mut reason = if !forward && !backward {
             Some("Manifest does not match either saved version")
         } else {
@@ -585,7 +749,7 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
         };
         if unexpected_retained(
             &retained.join("manifest"),
-            Some(&journal.old_manifest_hash),
+            old_marker,
             Some(&journal.new_manifest_hash),
         )? {
             reason = Some("External change retained in .aic-local/retained; resolve manually");
@@ -623,7 +787,7 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                     return Err(CoreError::invalid("Invalid journal copy path"));
                 }
             }
-            if old.files.get(&entry.path) != entry.old_hash.as_ref()
+            if old_files.get(&entry.path) != entry.old_hash.as_ref()
                 || new.files.get(&entry.path) != entry.new_hash.as_ref()
                 || entry.old_copy.is_some() != entry.old_hash.is_some()
                 || entry.new_copy.is_some() != entry.new_hash.is_some()
@@ -641,7 +805,7 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                 reason = Some("External change conflicts with recovery");
             }
         }
-        let paths: BTreeSet<_> = old.files.keys().chain(new.files.keys()).collect();
+        let paths: BTreeSet<_> = old_files.keys().chain(new.files.keys()).collect();
         for path in paths {
             let changes = journal
                 .entries
@@ -649,7 +813,7 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                 .filter(|entry| &entry.path == path)
                 .count();
             if changes
-                != if old.files.get(path) != new.files.get(path) {
+                != if old_files.get(path) != new.files.get(path) {
                     1
                 } else {
                     0
@@ -661,14 +825,13 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             }
         }
         let observed = scan(root)?;
-        for path in old
-            .files
+        for path in old_files
             .keys()
             .chain(new.files.keys())
             .chain(observed.keys())
         {
             let current = observed.get(path);
-            if current != old.files.get(path) && current != new.files.get(path) {
+            if current != old_files.get(path) && current != new.files.get(path) {
                 reason = Some("External project change conflicts with recovery");
             }
         }
@@ -676,15 +839,25 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             preserve_conflict(root, &dir, &journal, reason)?;
             let manifest: Manifest = serde_json::from_slice(&old_manifest)
                 .map_err(|e| CoreError::invalid(e.to_string()))?;
-            let doc = journal
+            let fallback = journal
                 .entries
                 .iter()
-                .find(|e| e.path == "document.json")
-                .and_then(|e| e.old_copy.as_ref())
+                .find(|entry| entry.path == "document.json")
+                .and_then(|entry| entry.old_copy.as_ref())
                 .map(|name| fs::read(dir.join(name)))
                 .transpose()?
-                .or(file_bytes(root, "document.json")?)
-                .ok_or_else(|| CoreError::invalid("Recovery document unavailable"))?;
+                .or(file_bytes(root, "document.json")?);
+            let doc = match conflicts::baseline_document(root, &old_manifest, &old)? {
+                Some(document) => document,
+                None => fallback
+                    .filter(|bytes| old.files.get("document.json") == Some(&hash(bytes)))
+                    .ok_or_else(|| {
+                        CoreError::new(
+                            "BASELINE_UNAVAILABLE",
+                            "Recovery baseline document is unavailable",
+                        )
+                    })?,
+            };
             return Ok(Some(Loaded {
                 manifest,
                 manifest_bytes: old_manifest,
@@ -693,12 +866,12 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             }));
         }
         let expected_marker = if forward {
-            &journal.new_manifest_hash
+            Some(journal.new_manifest_hash.as_str())
         } else {
-            &journal.old_manifest_hash
+            old_marker
         };
         for (index, entry) in journal.entries.iter().enumerate() {
-            if file_hash(root, "project.json")?.as_ref() != Some(expected_marker) {
+            if file_hash(root, "project.json")?.as_deref() != expected_marker {
                 preserve_conflict(root, &dir, &journal, "Manifest changed during recovery")?;
                 return Err(CoreError::conflict(
                     "Manifest changed during recovery; copies saved in conflicts",
@@ -749,8 +922,9 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             &old_manifest
         })
         .map_err(|e| CoreError::invalid(e.to_string()))?;
-        if scan(root)? != target.files
-            || file_hash(root, "project.json")?.as_ref() != Some(expected_marker)
+        let target_files = if forward { &target.files } else { old_files };
+        if scan(root)? != *target_files
+            || file_hash(root, "project.json")?.as_deref() != expected_marker
         {
             preserve_conflict(root, &dir, &journal, "Project changed during recovery")?;
             return Err(CoreError::conflict(
@@ -766,7 +940,10 @@ pub fn load(root: &Path) -> Result<Loaded> {
     if !root.is_dir() {
         return Err(CoreError::io("Project folder does not exist"));
     }
-    if !root.join("project.json").is_file() && !root.join(".aic-local/transactions").is_dir() {
+    if !root.join("project.json").is_file()
+        && !root.join(".aic-local/transactions").is_dir()
+        && !root.join("conflicts").is_dir()
+    {
         return Err(CoreError::invalid(
             "Folder does not contain an AI Constructor project",
         ));
@@ -775,14 +952,50 @@ pub fn load(root: &Path) -> Result<Loaded> {
     if let Some(loaded) = recover(root)? {
         return Ok(loaded);
     }
-    let manifest_bytes = fs::read(root.join("project.json"))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| CoreError::invalid(format!("Invalid project manifest: {e}")))?;
-    let document_bytes = fs::read(root.join("document.json"))?;
-    let read_only_reason = if scan(root)? != manifest.files {
-        Some("Project files were changed outside the editor; open read-only to avoid overwriting them".into())
+    let marker = file_bytes(root, "project.json")?;
+    let observed = scan(root)?;
+    let parsed = marker
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Manifest>(bytes).ok());
+    let Some(mut manifest) = parsed else {
+        return conflicts::archived_base_for_disk(root, &observed, marker.as_deref())?
+            .ok_or_else(|| CoreError::new(
+                "BASELINE_UNAVAILABLE",
+                "Project manifest is missing or invalid and no unique verified recovery baseline is available",
+            ));
+    };
+    let mut manifest_bytes = marker.expect("a parsed manifest has source bytes");
+    let (document_bytes, read_only_reason) = if observed == manifest.files {
+        let mut document = file_bytes(root, "document.json")?
+            .ok_or_else(|| CoreError::invalid("Missing document"))?;
+        // A future extension cannot be safely migrated by a model which
+        // cannot represent all of its fields.
+        if !manifest_has_unknown_fields(&manifest_bytes)? {
+            if let Some(migrated) =
+                migration::migrate_locked(root, &manifest_bytes, &manifest, &document)?
+            {
+                manifest = migrated.manifest;
+                manifest_bytes = migrated.manifest_bytes;
+                document = migrated.document_bytes;
+            }
+        }
+        if !conflicts::bootstrap(root, &manifest_bytes, &manifest)? {
+            return Err(CoreError::conflict(
+                "Project changed while preparing its baseline",
+            ));
+        }
+        (document, None)
     } else {
-        None
+        let document = match conflicts::baseline_document(root, &manifest_bytes, &manifest)? {
+            Some(bytes) => bytes,
+            None => file_bytes(root, "document.json")?.ok_or_else(|| {
+                CoreError::new(
+                    "BASELINE_UNAVAILABLE",
+                    "Document is missing and no verified baseline is available",
+                )
+            })?,
+        };
+        (document, Some(EXTERNAL_CHANGE_REASON.into()))
     };
     Ok(Loaded {
         manifest,
@@ -792,7 +1005,38 @@ pub fn load(root: &Path) -> Result<Loaded> {
     })
 }
 
+pub fn validate_current(root: &Path, expected_manifest: &[u8]) -> Result<()> {
+    let _lock = lock(root)?;
+    if recover(root)?.is_some() {
+        return Err(CoreError::conflict("Project requires recovery"));
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(expected_manifest).map_err(|e| CoreError::invalid(e.to_string()))?;
+    if file_bytes(root, "project.json")?.as_deref() != Some(expected_manifest)
+        || scan(root)? != manifest.files
+        || file_bytes(root, "project.json")?.as_deref() != Some(expected_manifest)
+    {
+        return Err(CoreError::conflict("Project changed on disk"));
+    }
+    Ok(())
+}
+
 pub fn snapshot_inputs(root: &Path, expected_manifest: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
+    snapshot_selected(root, expected_manifest, false)
+}
+
+pub fn snapshot_all_inputs(
+    root: &Path,
+    expected_manifest: &[u8],
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    snapshot_selected(root, expected_manifest, true)
+}
+
+fn snapshot_selected(
+    root: &Path,
+    expected_manifest: &[u8],
+    all: bool,
+) -> Result<BTreeMap<String, Vec<u8>>> {
     let _lock = lock(root)?;
     if recover(root)?.is_some() {
         return Err(CoreError::conflict("Project requires recovery"));
@@ -811,6 +1055,11 @@ pub fn snapshot_inputs(root: &Path, expected_manifest: &[u8]) -> Result<BTreeMap
             || path.starts_with("src/user/")
             || path.starts_with("src/generated/")
             || path.starts_with("assets/")
+            || (all
+                && (path == ".gitignore"
+                    || path.starts_with("chats/")
+                    || path.starts_with("agent/")
+                    || path.starts_with("checkpoints/")))
         {
             let bytes = file_bytes(root, path)?
                 .ok_or_else(|| CoreError::conflict(format!("Missing {path}")))?;
@@ -1131,17 +1380,108 @@ pub fn commit_with_deletions(
     changes: &BTreeMap<String, Vec<u8>>,
     deletions: &BTreeSet<String>,
 ) -> Result<Vec<u8>> {
+    commit_observed(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        None,
+    )
+}
+
+fn commit_observed(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    expected_observed: Option<&BTreeMap<String, String>>,
+) -> Result<Vec<u8>> {
+    commit_inner(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        expected_observed,
+        None,
+    )
+}
+
+fn commit_resolution(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    expected_observed: &BTreeMap<String, String>,
+    observed_marker: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    commit_inner(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        Some(expected_observed),
+        Some(observed_marker),
+    )
+}
+
+fn commit_inner(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    expected_observed: Option<&BTreeMap<String, String>>,
+    observed_marker: Option<Option<&[u8]>>,
+) -> Result<Vec<u8>> {
     let _lock = lock(root)?;
+    commit_locked(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        expected_observed,
+        observed_marker,
+    )
+}
+
+fn commit_locked(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    expected_observed: Option<&BTreeMap<String, String>>,
+    observed_marker: Option<Option<&[u8]>>,
+) -> Result<Vec<u8>> {
     if recover(root)?.is_some() {
         return Err(CoreError::conflict("Project requires recovery"));
     }
-    let old_bytes = fs::read(root.join("project.json"))?;
-    if old_bytes != expected_manifest {
+    let marker = file_bytes(root, "project.json")?;
+    let expected_marker = observed_marker.unwrap_or(Some(expected_manifest));
+    if marker.as_deref() != expected_marker {
         return Err(CoreError::conflict("Project manifest changed on disk"));
     }
+    let old_bytes = expected_manifest.to_vec();
+    let old_marker_hash = marker.as_deref().map(hash);
     let old: Manifest =
         serde_json::from_slice(&old_bytes).map_err(|e| CoreError::invalid(e.to_string()))?;
-    if scan(root)? != old.files {
+    if observed_marker.is_none() {
+        for path in conflicts::blocked_generated(root, &old)? {
+            if changes.contains_key(&path) || deletions.contains(&path) {
+                return Err(CoreError::conflict(format!(
+                    "Generated file {path} has an unresolved external change"
+                )));
+            }
+        }
+    }
+    let old_files = expected_observed.unwrap_or(&old.files);
+    if scan(root)? != *old_files {
         return Err(CoreError::conflict("Project files changed on disk"));
     }
     #[cfg(test)]
@@ -1155,12 +1495,12 @@ pub fn commit_with_deletions(
         .storage_generation
         .checked_add(1)
         .ok_or_else(|| CoreError::invalid("Storage generation overflow"))?;
-    new.files = old.files.clone();
+    new.files = old_files.clone();
     let mut actual = BTreeMap::new();
     for (path, bytes) in changes {
         safe_path(root, path)?;
         let next = hash(bytes);
-        if old.files.get(path) != Some(&next) {
+        if old_files.get(path) != Some(&next) {
             new.files.insert(path.clone(), next);
             actual.insert(path.clone(), Some(bytes.clone()));
         }
@@ -1182,9 +1522,20 @@ pub fn commit_with_deletions(
     };
     new.snapshot_hash = fingerprint(&document, &new.files);
     let new_bytes = json(&new)?;
-    if actual.is_empty() && old.name == new.name && old.revision == new.revision {
+    if old_marker_hash.as_deref() == Some(hash(&new_bytes).as_str()) {
+        return Err(CoreError::conflict(
+            "Observed and target commit markers are indistinguishable",
+        ));
+    }
+    if actual.is_empty()
+        && old.schema_version == new.schema_version
+        && old.name == new.name
+        && old.revision == new.revision
+        && expected_observed.is_none()
+    {
         return Ok(old_bytes);
     }
+    conflicts::prepare_baselines(root, &old_bytes, &old, old_files, &new_bytes, &new, changes)?;
     let txdir = root
         .join(".aic-local/transactions")
         .join(Uuid::new_v4().to_string());
@@ -1192,11 +1543,14 @@ pub fn commit_with_deletions(
     sync_dir(&root.join(".aic-local"))?;
     durable_write(&txdir.join("old-manifest"), &old_bytes)?;
     durable_write(&txdir.join("new-manifest"), &new_bytes)?;
+    if let Some(Some(marker)) = observed_marker {
+        durable_write(&txdir.join("observed-manifest"), marker)?;
+    }
     let mut entries = Vec::new();
     for (i, (path, bytes)) in actual.iter().enumerate() {
         let old_content = file_bytes(root, path)?;
         let old_hash = old_content.as_deref().map(hash);
-        if old.files.get(path) != old_hash.as_ref() {
+        if old_files.get(path) != old_hash.as_ref() {
             return Err(CoreError::conflict(format!("External edit of {path}")));
         }
         let old_copy = if let Some(old_content) = &old_content {
@@ -1228,12 +1582,18 @@ pub fn commit_with_deletions(
         new_revision: new.revision,
         old_generation: old.storage_generation,
         new_generation: new.storage_generation,
+        observed_files: expected_observed.cloned(),
+        observed_marker: observed_marker.map(|_| ObservedMarker {
+            hash: old_marker_hash.clone(),
+        }),
         entries,
     };
     let pending_journal = txdir.join("journal.pending");
     durable_write(&pending_journal, &json(&journal)?)?;
     // Persist the prepared copies and temporary marker before publishing the journal.
     sync_dir(&txdir)?;
+    // Once the recovery journal is active, cancellation must report TooLate.
+    control::begin_commit()?;
     atomic::move_no_replace(&pending_journal, &txdir.join("journal.json"))?;
     sync_dir(&txdir)?;
     sync_dir(
@@ -1267,9 +1627,7 @@ pub fn commit_with_deletions(
         #[cfg(test)]
         interrupt_at(index + 1)?;
     }
-    if scan(root)? != new.files
-        || file_hash(root, "project.json")? != Some(journal.old_manifest_hash.clone())
-    {
+    if scan(root)? != new.files || file_hash(root, "project.json")? != old_marker_hash {
         return Err(CoreError::conflict(
             "External change before publishing the manifest",
         ));
@@ -1283,15 +1641,23 @@ pub fn commit_with_deletions(
     replace_with(
         root,
         "project.json",
-        Some(&journal.old_manifest_hash),
+        old_marker_hash.as_deref(),
         Some(&new_bytes),
         &retained.join("manifest"),
     )?;
     #[cfg(test)]
     interrupt_at(journal.entries.len() + 1)?;
-    if let Err(error) = retire_transaction(&txdir) {
-        // The commit marker is already durable; an unretired journal remains recoverable.
-        eprintln!("AI Constructor: could not clean completed transaction: {error}");
+    match retire_transaction(&txdir) {
+        Ok(()) => {
+            if let Err(error) = retention::record(&retained, &journal, &new) {
+                // A missing receipt keeps this transaction indefinitely.
+                eprintln!("AI Constructor: could not mark retained transaction complete: {error}");
+            }
+        }
+        Err(error) => {
+            // The commit marker is already durable; an unretired journal remains recoverable.
+            eprintln!("AI Constructor: could not clean completed transaction: {error}");
+        }
     }
     Ok(new_bytes)
 }

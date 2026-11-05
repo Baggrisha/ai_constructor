@@ -30,7 +30,7 @@
 		D00000000000000000000005 /* Products */ = {isa = PBXGroup; children = (B00000000000000000000004, B00000000000000000000005); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
-		E00000000000000000000001 /* AIConstructor */ = {isa = PBXNativeTarget; buildConfigurationList = D00000000000000000000011; buildPhases = (F00000000000000000000003, F00000000000000000000001, F00000000000000000000005); buildRules = (); dependencies = (); name = AIConstructor; productName = AIConstructor; productReference = B00000000000000000000004; productType = "com.apple.product-type.application"; };
+		E00000000000000000000001 /* AIConstructor */ = {isa = PBXNativeTarget; buildConfigurationList = D00000000000000000000011; buildPhases = (F00000000000000000000007, F00000000000000000000003, F00000000000000000000001, F00000000000000000000005); buildRules = (); dependencies = (); name = AIConstructor; productName = AIConstructor; productReference = B00000000000000000000004; productType = "com.apple.product-type.application"; };
 		E00000000000000000000002 /* AIConstructorUITests */ = {isa = PBXNativeTarget; buildConfigurationList = D00000000000000000000012; buildPhases = (F00000000000000000000004, F00000000000000000000002, F00000000000000000000006); buildRules = (); dependencies = (C00000000000000000000002); name = AIConstructorUITests; productName = AIConstructorUITests; productReference = B00000000000000000000005; productType = "com.apple.product-type.bundle.ui-testing"; };
 /* End PBXNativeTarget section */
 /* Begin PBXProject section */
@@ -40,6 +40,9 @@
 		F00000000000000000000005 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		F00000000000000000000006 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
+/* Begin PBXShellScriptBuildPhase section */
+		F00000000000000000000007 /* Build Rust bridge */ = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Build Rust bridge"; outputPaths = (); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "export PATH=\"$HOME/.cargo/bin:$PATH\"\n\"$SRCROOT/../../scripts/generate-bindings.sh\"\n"; };
+/* End PBXShellScriptBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
 		F00000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002); runOnlyForDeploymentPostprocessing = 0; };
 		F00000000000000000000004 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000003); runOnlyForDeploymentPostprocessing = 0; };
@@ -48,8 +51,8 @@
 		C00000000000000000000002 = {isa = PBXTargetDependency; target = E00000000000000000000001; targetProxy = C00000000000000000000001; };
 /* End PBXTargetDependency section */
 /* Begin XCBuildConfiguration section */
-		D00000000000000000000020 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Debug; };
-		D00000000000000000000021 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Release; };
+		D00000000000000000000020 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CLANG_ENABLE_MODULES = YES; ENABLE_USER_SCRIPT_SANDBOXING = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Debug; };
+		D00000000000000000000021 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CLANG_ENABLE_MODULES = YES; ENABLE_USER_SCRIPT_SANDBOXING = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Release; };
 		D00000000000000000000022 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; COMBINE_HIDPI_IMAGES = YES; ENABLE_APP_SANDBOX = NO; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = "AI Constructor"; OTHER_LDFLAGS = ("$(inherited)", "$(SRCROOT)/../../target/debug/libaic_bridge.a", "-lc++", "-lresolv", "-framework", Security, "-framework", CoreFoundation); PRODUCT_BUNDLE_IDENTIFIER = xyz.baggrisha.AIConstructor; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Generated"; SWIFT_VERSION = 5.0; }; name = Debug; };
 		D00000000000000000000023 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; COMBINE_HIDPI_IMAGES = YES; ENABLE_APP_SANDBOX = NO; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = "AI Constructor"; OTHER_LDFLAGS = ("$(inherited)", "$(SRCROOT)/../../target/debug/libaic_bridge.a", "-lc++", "-lresolv", "-framework", Security, "-framework", CoreFoundation); PRODUCT_BUNDLE_IDENTIFIER = xyz.baggrisha.AIConstructor; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Generated"; SWIFT_VERSION = 5.0; }; name = Release; };
 		D00000000000000000000024 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = xyz.baggrisha.AIConstructorUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TEST_TARGET_NAME = AIConstructor; }; name = Debug; };

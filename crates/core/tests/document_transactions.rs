@@ -43,7 +43,16 @@ fn write_document_fixture(path: &std::path::Path, doc: &Value) {
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
     let hash = format!("{:x}", Sha256::digest(&bytes));
     manifest["files"]["document.json"] = json!(hash);
-    manifest["snapshotHash"] = json!(hash);
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(&bytes);
+    for (path, hash) in manifest["files"].as_object().unwrap() {
+        if path.starts_with("assets/") || path.starts_with("src/user/") {
+            fingerprint.update((path.len() as u64).to_be_bytes());
+            fingerprint.update(path.as_bytes());
+            fingerprint.update(hash.as_str().unwrap().as_bytes());
+        }
+    }
+    manifest["snapshotHash"] = json!(format!("{:x}", fingerprint.finalize()));
     let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     bytes.push(b'\n');
     std::fs::write(manifest_path, bytes).unwrap();
@@ -345,6 +354,86 @@ fn ancestor_agent_lock_survives_user_edit_and_undo() {
         session.apply_transaction(&tx.to_string()).unwrap_err().code,
         "LOCKED_PROPERTY"
     );
+}
+
+#[test]
+fn changing_single_frame_properties_preserves_other_metadata_and_locks_through_history() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Frame metadata").unwrap();
+    let root = root(&session);
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 1200},
+            {"type": "setProperty", "nodeId": root, "path": "/layout/h", "value": 700}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    let lock = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/propertyMeta/~1layout~1w/agentLocked", "value": true}
+        ]),
+    );
+    session.apply_transaction(&lock.to_string()).unwrap();
+    let before = snapshot(&session)["document"]["nodes"][0]["propertyMeta"].clone();
+    assert_eq!(before["/layout/w"]["agentLocked"], true);
+    assert_eq!(before["/layout/h"]["origin"], "agent");
+    let rename = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/name", "value": "Renamed"}
+        ]),
+    );
+    session.apply_transaction(&rename.to_string()).unwrap();
+    for action in [0, 1, 2] {
+        if action == 1 {
+            session.undo().unwrap();
+        }
+        if action == 2 {
+            session.redo().unwrap();
+        }
+        let meta = &snapshot(&session)["document"]["nodes"][0]["propertyMeta"];
+        assert_eq!(meta["/layout/w"], before["/layout/w"]);
+        assert_eq!(meta["/layout/h"], before["/layout/h"]);
+    }
+    let resize = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 1300}
+        ]),
+    );
+    session.apply_transaction(&resize.to_string()).unwrap();
+    let after = snapshot(&session);
+    assert_eq!(
+        after["document"]["nodes"][0]["propertyMeta"]["/layout/w"]["agentLocked"],
+        true
+    );
+    assert_eq!(
+        after["document"]["nodes"][0]["propertyMeta"]["/layout/h"],
+        before["/layout/h"]
+    );
+    let mut agent_resize = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 1400}
+        ]),
+    );
+    agent_resize["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent_resize.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), after);
 }
 
 #[test]
@@ -779,4 +868,936 @@ fn agent_cannot_change_a_shared_token_behind_a_locked_binding() {
         "LOCKED_PROPERTY"
     );
     assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn component_instances_and_targets_round_trip_and_references_are_atomic() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Components").unwrap());
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = Uuid::parse_str(doc["pages"][0]["rootId"].as_str().unwrap()).unwrap();
+    let template = Uuid::new_v4();
+    let component = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    doc["nodes"][0]["children"] = json!([template]);
+    doc["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(node(template, root, "group"));
+    doc["components"] = json!([{"id": component, "rootId": template, "name": "Card"}]);
+    doc["targets"] = json!([{"id": target, "adapter": "web-react"}]);
+    write_document_fixture(&path, &doc);
+
+    let session = open_project(&path).unwrap();
+    assert_eq!(snapshot(&session)["readOnly"], false);
+    let instance = Uuid::new_v4();
+    let mut instance_node = node(instance, root, "componentInstance");
+    instance_node["content"]["componentId"] = json!(component);
+    let tx = transaction(
+        &session,
+        &[root, instance],
+        json!([{"type": "insertNode", "parentId": root, "index": 1, "node": instance_node}]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let before = snapshot(&session);
+    assert_eq!(
+        before["document"]["nodes"][2]["propertyMeta"]["/content/componentId"]["origin"],
+        "user"
+    );
+    let tx = transaction(
+        &session,
+        &[instance],
+        json!([{"type": "setProperty", "nodeId": instance, "path": "/content/componentId", "value": Uuid::new_v4()}]),
+    );
+    assert!(session.apply_transaction(&tx.to_string()).is_err());
+    assert_eq!(snapshot(&session), before);
+    let tx = transaction(
+        &session,
+        &[instance],
+        json!([{
+            "type": "setProperty", "nodeId": instance,
+            "path": "/propertyMeta/~1content~1componentId/agentLocked", "value": true
+        }]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let before = snapshot(&session);
+    let mut agent_tx = transaction(
+        &session,
+        &[instance],
+        json!([{
+            "type": "setProperty", "nodeId": instance, "path": "/content/componentId", "value": component
+        }]),
+    );
+    agent_tx["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent_tx.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+    let tx = transaction(
+        &session,
+        &[root, template],
+        json!([{"type": "removeNode", "nodeId": template}]),
+    );
+    assert!(session.apply_transaction(&tx.to_string()).is_err());
+    assert_eq!(snapshot(&session), before);
+    let tx = transaction(
+        &session,
+        &[root, template, instance],
+        json!([{"type": "moveNode", "nodeId": instance, "parentId": template, "index": 0}]),
+    );
+    assert!(session.apply_transaction(&tx.to_string()).is_err());
+    assert_eq!(snapshot(&session), before);
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(snapshot(&reopened)["document"], before["document"]);
+}
+
+#[test]
+fn malformed_known_records_are_rejected_but_unknown_legacy_records_are_preserved() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Unknown").unwrap());
+    let original: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let mut invalid = original.clone();
+    invalid["components"] = json!([{"id": Uuid::new_v4(), "rootId": "not-a-uuid"}]);
+    write_document_fixture(&path, &invalid);
+    assert!(open_project(&path).is_err());
+
+    let mut legacy = original;
+    legacy["components"] = json!([{"oldFormat": {"keep": [1, 2, 3]}}]);
+    legacy["targets"] = json!(["legacy-target"]);
+    legacy["referenceBaselines"] = json!([{"future": true}]);
+    let root = Uuid::parse_str(legacy["pages"][0]["rootId"].as_str().unwrap()).unwrap();
+    let instance = Uuid::new_v4();
+    legacy["nodes"][0]["children"] = json!([instance]);
+    legacy["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(node(instance, root, "componentInstance"));
+    write_document_fixture(&path, &legacy);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    let session = open_project(&path).unwrap();
+    assert_eq!(snapshot(&session)["readOnly"], true);
+    assert_eq!(snapshot(&session)["document"], legacy);
+    assert!(session.save().is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+}
+
+#[test]
+fn component_extensions_remain_read_only_but_known_references_are_validated() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Future component").unwrap());
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = doc["pages"][0]["rootId"].clone();
+    doc["components"] = json!([{"id": Uuid::new_v4(), "rootId": root, "future": {"keep": 1}}]);
+    write_document_fixture(&path, &doc);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    let session = open_project(&path).unwrap();
+    assert_eq!(snapshot(&session)["readOnly"], true);
+    assert_eq!(snapshot(&session)["document"], doc);
+    assert!(session.save().is_err());
+    drop(session);
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+    doc["components"][0]["rootId"] = json!(Uuid::new_v4());
+    write_document_fixture(&path, &doc);
+    assert!(open_project(&path).is_err());
+}
+
+#[test]
+fn known_properties_are_checked_even_when_other_fields_are_unknown() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Invalid known field").unwrap());
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    doc["nodes"][0]["style"] = json!({"future": true, "opacity": "not-a-number"});
+    write_document_fixture(&path, &doc);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    assert!(open_project(&path).is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+    doc["nodes"][0]["style"] = json!({"future": true, "opacity": 2});
+    write_document_fixture(&path, &doc);
+    assert!(open_project(&path).is_err());
+}
+
+#[test]
+fn unknown_vector_command_fields_do_not_hide_invalid_known_commands() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Mixed vector").unwrap());
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = Uuid::parse_str(doc["pages"][0]["rootId"].as_str().unwrap()).unwrap();
+    let id = Uuid::new_v4();
+    let mut vector = node(id, root, "vector");
+    vector["content"]["vector"] = json!({"paths": [[
+        {"type": "close", "future": true}, {"type": "lineTo", "x": "invalid", "y": 2}
+    ]]});
+    doc["nodes"][0]["children"] = json!([id]);
+    doc["nodes"].as_array_mut().unwrap().push(vector);
+    write_document_fixture(&path, &doc);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    assert!(open_project(&path).is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+}
+
+#[test]
+fn unknown_nested_fields_are_opened_read_only_without_rewriting() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Future layout").unwrap());
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    doc["nodes"][0]["layout"]["futureTransform"] = json!({"preserve": [1, 2]});
+    write_document_fixture(&path, &doc);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    let session = open_project(&path).unwrap();
+    assert_eq!(snapshot(&session)["readOnly"], true);
+    assert_eq!(snapshot(&session)["document"], doc);
+    assert!(session.save().is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+}
+
+#[test]
+fn viewport_coordinates_follow_flow_reordering_and_source_density() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Flow coordinates").unwrap();
+    let root = root(&session);
+    let fixed = Uuid::new_v4();
+    let fill = Uuid::new_v4();
+    let mut fixed_node = node(fixed, root, "group");
+    fixed_node["layout"]["h"] = json!(40);
+    fixed_node["responsive"] = json!([{"breakpoint": 600, "w": 150}]);
+    let mut fill_node = node(fill, root, "group");
+    fill_node["layout"] = json!({"x": 500, "y": 600, "w": 100, "h": 20, "widthMode": "fill"});
+    fill_node["sourceDensity"] = json!(2);
+    fill_node["sourceBounds"] = json!({"x": 800, "y": 900, "w": 200, "h": 40});
+    let tx = transaction(
+        &session,
+        &[root, fixed, fill],
+        json!([
+            {"type": "setViewport", "nodeId": root, "width": 300, "height": 120},
+            {"type": "setProperty", "nodeId": root, "path": "/layout/flow", "value": {
+                "direction": "row", "gap": 10,
+                "padding": {"top": 10, "right": 10, "bottom": 10, "left": 10}, "align": "center"
+            }},
+            {"type": "insertNode", "parentId": root, "index": 0, "node": fixed_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": fill_node}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let transform = |x, y, inverse| -> Value {
+        serde_json::from_str(
+            &session
+                .transform_point_json(&fill.to_string(), x, y, 2.0, 7.0, 11.0, inverse, true)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(transform(6.0, 8.0, false), json!({"x": 253.0, "y": 119.0}));
+    assert_eq!(transform(253.0, 119.0, true), json!({"x": 6.0, "y": 8.0}));
+    let before_override = snapshot(&session);
+    let at_breakpoint: Value = serde_json::from_str(
+        &session
+            .transform_point_at_breakpoint_json(
+                &fill.to_string(),
+                6.0,
+                8.0,
+                2.0,
+                7.0,
+                11.0,
+                false,
+                true,
+                600.0,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(at_breakpoint, json!({"x": 353.0, "y": 119.0}));
+    assert_eq!(snapshot(&session), before_override);
+    let tx = transaction(
+        &session,
+        &[root, fill],
+        json!([{"type": "moveNode", "nodeId": fill, "parentId": root, "index": 0}]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    assert_eq!(transform(6.0, 8.0, false), json!({"x": 33.0, "y": 119.0}));
+    let after = snapshot(&session);
+    assert_eq!(
+        after["document"]["nodes"][2]["layout"]["x"].as_f64(),
+        Some(500.0)
+    );
+    assert_eq!(
+        after["document"]["nodes"][2]["sourceBounds"]["x"].as_f64(),
+        Some(800.0)
+    );
+    assert!(session
+        .transform_point_json(&fill.to_string(), 0.0, 0.0, 0.0, 0.0, 0.0, false, false)
+        .is_err());
+}
+
+#[test]
+fn explicit_breakpoint_transforms_nested_free_layout_without_mutating_it() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Responsive").unwrap();
+    let root = root(&session);
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let mut parent_node = node(parent, root, "group");
+    parent_node["layout"]["x"] = json!(10);
+    parent_node["layout"]["y"] = json!(20);
+    parent_node["responsive"] = json!([{"breakpoint": 600, "x": 40}]);
+    let mut child_node = node(child, parent, "text");
+    child_node["layout"]["x"] = json!(3);
+    child_node["layout"]["y"] = json!(4);
+    child_node["responsive"] = json!([{"breakpoint": 600, "x": 8}]);
+    let tx = transaction(
+        &session,
+        &[root, parent, child],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": parent_node},
+            {"type": "insertNode", "parentId": parent, "index": 0, "node": child_node}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let before = snapshot(&session);
+    let at = |width| -> Value {
+        serde_json::from_str(
+            &session
+                .transform_point_at_breakpoint_json(
+                    &child.to_string(),
+                    1.0,
+                    2.0,
+                    2.0,
+                    5.0,
+                    7.0,
+                    false,
+                    false,
+                    width,
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(at(600.0), json!({"x": 103.0, "y": 59.0}));
+    assert_eq!(at(601.0), json!({"x": 33.0, "y": 59.0}));
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn hug_flow_uses_measured_text_dimensions() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Hug").unwrap();
+    let font_path = temp.path().join("ahem.ttf");
+    std::fs::write(&font_path, font_test_data::AHEM).unwrap();
+    let font: Value = serde_json::from_str(&session.import_asset(&font_path).unwrap()).unwrap();
+    let root = root(&session);
+    let group = Uuid::new_v4();
+    let text = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut group_node = node(group, root, "group");
+    group_node["layout"] = json!({
+        "x": 0, "y": 0, "w": 100, "h": 100, "widthMode": "hug", "heightMode": "hug",
+        "flow": {"direction": "column", "gap": 5,
+            "padding": {"top": 5, "right": 5, "bottom": 5, "left": 5}, "align": "start"}
+    });
+    let mut text_node = node(text, group, "text");
+    text_node["layout"]["w"] = json!(70);
+    text_node["layout"]["h"] = json!(20);
+    text_node["content"]["text"] = json!("Hello");
+    text_node["style"] = json!({"fontAssetId": font["id"], "fontSize": 16});
+    let mut second_node = node(second, group, "group");
+    second_node["layout"]["w"] = json!(40);
+    second_node["layout"]["h"] = json!(30);
+    let tx = transaction(
+        &session,
+        &[root, group, text, second, marker],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/layout/flow", "value": {
+                "direction": "row", "gap": 0,
+                "padding": {"top": 10, "right": 10, "bottom": 10, "left": 10}, "align": "start"
+            }},
+            {"type": "insertNode", "parentId": root, "index": 0, "node": group_node},
+            {"type": "insertNode", "parentId": group, "index": 0, "node": text_node},
+            {"type": "insertNode", "parentId": group, "index": 1, "node": second_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": node(marker, root, "group")}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let mapped: Value = serde_json::from_str(
+        &session
+            .transform_point_json(&second.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mapped, json!({"x": 15.0, "y": 40.0}));
+    let tx = transaction(
+        &session,
+        &[text],
+        json!([
+            {"type": "setProperty", "nodeId": text, "path": "/layout/widthMode", "value": "hug"}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let marker: Value = serde_json::from_str(
+        &session
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker, json!({"x": 100.0, "y": 10.0}));
+}
+
+#[test]
+fn visual_baseline_tracks_page_and_asset_and_rejects_missing_references() {
+    use sha2::{Digest, Sha256};
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Baseline").unwrap());
+    let image = b"synthetic baseline image";
+    let hash = format!("{:x}", Sha256::digest(image));
+    let asset_path = format!("assets/{hash}.png");
+    std::fs::write(path.join(&asset_path), image).unwrap();
+    let manifest_path = path.join("project.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["files"][asset_path.as_str()] = json!(hash);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let asset = Uuid::new_v4();
+    let baseline = Uuid::new_v4();
+    let page = doc["pages"][0]["id"].clone();
+    doc["assets"] = json!([{"id": asset, "path": asset_path}]);
+    doc["referenceBaselines"] = json!([{"id": baseline, "pageId": page, "assetId": asset}]);
+    write_document_fixture(&path, &doc);
+    let session = open_project(&path).unwrap();
+    assert_eq!(snapshot(&session)["readOnly"], false);
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(
+        snapshot(&reopened)["document"]["referenceBaselines"],
+        doc["referenceBaselines"]
+    );
+    drop(reopened);
+
+    doc["referenceBaselines"][0]["assetId"] = json!(Uuid::new_v4());
+    write_document_fixture(&path, &doc);
+    let bytes = std::fs::read(path.join("document.json")).unwrap();
+    let error = open_project(&path).err().unwrap();
+    assert_eq!(error.code, "MISSING_ASSET");
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+}
+
+#[test]
+fn ordinary_node_types_accept_only_applicable_content_and_remain_atomic() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Node types").unwrap();
+    let root = root(&session);
+    let kinds = [
+        "frame", "group", "text", "image", "vector", "button", "input", "textarea", "checkbox",
+        "select",
+    ];
+    let ids: Vec<_> = kinds.iter().map(|_| Uuid::new_v4()).collect();
+    let mut scope = vec![root];
+    scope.extend(ids.iter().copied());
+    let operations: Vec<_> = kinds.iter().zip(&ids).enumerate().map(|(index, (kind, id))| {
+        json!({"type": "insertNode", "parentId": root, "index": index, "node": node(*id, root, kind)})
+    }).collect();
+    let tx = transaction(&session, &scope, json!(operations));
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let before = snapshot(&session);
+    let tx = transaction(
+        &session,
+        &[ids[9]],
+        json!([
+            {"type": "setProperty", "nodeId": ids[9], "path": "/content/text", "value": "invalid"}
+        ]),
+    );
+    assert!(session.apply_transaction(&tx.to_string()).is_err());
+    assert_eq!(snapshot(&session), before);
+    let tx = transaction(
+        &session,
+        &[ids[2], ids[6]],
+        json!([
+            {"type": "setProperty", "nodeId": ids[2], "path": "/content/text", "value": "Title"},
+            {"type": "setProperty", "nodeId": ids[6], "path": "/content/placeholder", "value": "Type here"}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let after = snapshot(&session);
+    assert_eq!(after["document"]["nodes"][3]["content"]["text"], "Title");
+    assert_eq!(
+        after["document"]["nodes"][7]["content"]["placeholder"],
+        "Type here"
+    );
+    assert_eq!(
+        after["document"]["nodes"][3]["propertyMeta"]["/content/text"]["origin"],
+        "user"
+    );
+}
+
+#[test]
+fn column_flow_supports_end_and_stretch_alignment() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Column").unwrap();
+    let root = root(&session);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut first_node = node(first, root, "group");
+    first_node["layout"] = json!({"x": 0, "y": 0, "w": 30, "h": 40});
+    let mut second_node = node(second, root, "group");
+    second_node["layout"] = json!({"x": 0, "y": 0, "w": 50, "h": 20, "heightMode": "fill"});
+    let end_flow = json!({"direction": "column", "gap": 10,
+        "padding": {"top": 10, "right": 10, "bottom": 10, "left": 10}, "align": "end"});
+    let tx = transaction(
+        &session,
+        &[root, first, second],
+        json!([
+            {"type": "setViewport", "nodeId": root, "width": 200, "height": 200},
+            {"type": "setProperty", "nodeId": root, "path": "/layout/flow", "value": end_flow},
+            {"type": "insertNode", "parentId": root, "index": 0, "node": first_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": second_node}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let point = || -> Value {
+        serde_json::from_str(
+            &session
+                .transform_point_json(&second.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(point(), json!({"x": 140.0, "y": 60.0}));
+    let tx = transaction(
+        &session,
+        &[root],
+        json!([{
+            "type": "setProperty", "nodeId": root, "path": "/layout/flow",
+            "value": {"direction": "column", "gap": 10,
+                "padding": {"top": 10, "right": 10, "bottom": 10, "left": 10}, "align": "stretch"}
+        }]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    assert_eq!(point(), json!({"x": 10.0, "y": 60.0}));
+}
+
+struct TextFlowFixture {
+    _temp: tempfile::TempDir,
+    session: ProjectSession,
+    root: Uuid,
+    text: Uuid,
+    marker: Uuid,
+    font_path: std::path::PathBuf,
+}
+
+impl TextFlowFixture {
+    fn new(direction: &str, width: f64, text_layout: Value, text_value: &str) -> Self {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        let session = create_project(&project, "Text flow").unwrap();
+        let source = temp.path().join("ahem.ttf");
+        std::fs::write(&source, font_test_data::AHEM).unwrap();
+        let font: Value = serde_json::from_str(&session.import_asset(&source).unwrap()).unwrap();
+        let font_path = project.join(font["path"].as_str().unwrap());
+        let root = root(&session);
+        let text = Uuid::new_v4();
+        let marker = Uuid::new_v4();
+        let mut text_node = node(text, root, "text");
+        text_node["layout"] = text_layout;
+        text_node["content"]["text"] = json!(text_value);
+        text_node["style"] = json!({"fontAssetId": font["id"], "fontSize": 16, "lineHeight": 20});
+        let mut marker_node = node(marker, root, "group");
+        marker_node["layout"]["w"] = json!(16);
+        marker_node["layout"]["h"] = json!(10);
+        marker_node["sourceDensity"] = json!(2);
+        let tx = transaction(
+            &session,
+            &[root, text, marker],
+            json!([
+                {"type": "setViewport", "nodeId": root, "width": width, "height": 100},
+                {"type": "setProperty", "nodeId": root, "path": "/layout/flow", "value": {
+                    "direction": direction, "gap": 0,
+                    "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}, "align": "start"
+                }},
+                {"type": "insertNode", "parentId": root, "index": 0, "node": text_node},
+                {"type": "insertNode", "parentId": root, "index": 1, "node": marker_node}
+            ]),
+        );
+        session.apply_transaction(&tx.to_string()).unwrap();
+        Self {
+            _temp: temp,
+            session,
+            root,
+            text,
+            marker,
+            font_path,
+        }
+    }
+
+    fn set(&self, id: Uuid, path: &str, value: Value) {
+        let tx = transaction(
+            &self.session,
+            &[id],
+            json!([
+                {"type": "setProperty", "nodeId": id, "path": path, "value": value}
+            ]),
+        );
+        self.session.apply_transaction(&tx.to_string()).unwrap();
+    }
+
+    fn point(&self, id: Uuid) -> Value {
+        serde_json::from_str(
+            &self
+                .session
+                .transform_point_json(&id.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn text_hug_shapes_unicode_multiline_styles_and_viewport_scale() {
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({
+            "x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"
+        }),
+        "一二三",
+    );
+    assert_eq!(f.point(f.marker)["x"], 48.0);
+    f.set(f.text, "/content/text", json!("AB\nC"));
+    assert_eq!(f.point(f.marker)["x"], 32.0);
+    for separator in ["\r\n", "\u{85}", "\u{2028}", "\u{2029}"] {
+        f.set(f.text, "/content/text", json!(format!("AB{separator}C")));
+        assert_eq!(f.point(f.marker)["x"], 32.0, "separator {separator:?}");
+    }
+    f.set(f.text, "/content/text", json!("AB\nC"));
+    let scaled: Value = serde_json::from_str(
+        &f.session
+            .transform_point_json(&f.marker.to_string(), 4.0, 8.0, 2.0, 7.0, 11.0, false, true)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(scaled, json!({"x": 75.0, "y": 19.0}));
+    f.set(f.text, "/style/fontSize", json!(24));
+    assert_eq!(f.point(f.marker)["x"], 48.0);
+    f.set(f.text, "/style/letterSpacing", json!(2));
+    assert!(f.point(f.marker)["x"].as_f64().unwrap() > 48.0);
+}
+
+#[test]
+fn text_hug_height_wraps_to_fixed_fill_and_breakpoint_width() {
+    let f = TextFlowFixture::new(
+        "column",
+        32.0,
+        json!({
+            "x": 0, "y": 0, "w": 32, "h": 20, "widthMode": "fixed", "heightMode": "hug"
+        }),
+        "AAAAAA",
+    );
+    assert_eq!(f.point(f.marker)["y"], 60.0);
+    f.set(f.text, "/content/text", json!("AA\n"));
+    assert_eq!(f.point(f.marker)["y"], 40.0);
+    f.set(f.text, "/content/text", json!("AA\r\n"));
+    assert_eq!(f.point(f.marker)["y"], 40.0);
+    f.set(f.text, "/content/text", json!("\n\r"));
+    assert_eq!(f.point(f.marker)["y"], 60.0);
+    f.set(f.text, "/content/text", json!(""));
+    assert_eq!(f.point(f.marker)["y"], 20.0);
+    f.set(f.text, "/content/text", json!("A\u{a0}A"));
+    f.set(f.text, "/style/textWrap", json!("word"));
+    assert_eq!(f.point(f.marker)["y"], 20.0);
+    f.set(f.text, "/content/text", json!("A A"));
+    assert_eq!(f.point(f.marker)["y"], 40.0);
+    f.set(f.text, "/style/textWrap", json!("wordOrGlyph"));
+    f.set(f.text, "/content/text", json!("AAAAAA"));
+    f.set(f.text, "/style/textWrap", json!("none"));
+    assert_eq!(f.point(f.marker)["y"], 20.0);
+    f.set(f.text, "/style/textWrap", json!("wordOrGlyph"));
+    f.set(f.text, "/responsive", json!([{"breakpoint": 600, "w": 16}]));
+    let point: Value = serde_json::from_str(
+        &f.session
+            .transform_point_at_breakpoint_json(
+                &f.marker.to_string(),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                false,
+                false,
+                600.0,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(point["y"], 120.0);
+    assert_eq!(f.point(f.marker)["y"], 60.0);
+    f.set(f.text, "/layout/widthMode", json!("fill"));
+    assert_eq!(f.point(f.marker)["y"], 60.0);
+    let tx = transaction(
+        &f.session,
+        &[f.root],
+        json!([
+            {"type": "setViewport", "nodeId": f.root, "width": 48, "height": 100}
+        ]),
+    );
+    f.session.apply_transaction(&tx.to_string()).unwrap();
+    assert_eq!(f.point(f.marker)["y"], 40.0);
+}
+
+#[test]
+fn text_hug_height_uses_remaining_row_width_before_alignment() {
+    let f = TextFlowFixture::new(
+        "row",
+        80.0,
+        json!({
+            "x": 0, "y": 0, "w": 1, "h": 20, "widthMode": "fill", "heightMode": "hug"
+        }),
+        "AAAAAA",
+    );
+    f.set(
+        f.root,
+        "/layout/flow",
+        json!({
+            "direction": "row", "gap": 0,
+            "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}, "align": "end"
+        }),
+    );
+    assert_eq!(f.point(f.text), json!({"x": 0.0, "y": 60.0}));
+    assert_eq!(f.point(f.marker), json!({"x": 64.0, "y": 90.0}));
+}
+
+#[test]
+fn text_hug_reports_missing_fonts_glyphs_and_changed_assets() {
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({
+            "x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"
+        }),
+        "A",
+    );
+    let error = || {
+        f.session
+            .transform_point_json(&f.marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code
+    };
+    f.set(
+        f.text,
+        "/style/fontFamily",
+        json!("Font that does not exist"),
+    );
+    assert_eq!(error(), "MISSING_FONT");
+    f.set(
+        f.text,
+        "/style/fontFamily",
+        json!("/System/Library/Fonts/Supplemental/Arial.ttf"),
+    );
+    assert_eq!(error(), "MISSING_FONT");
+    f.set(f.text, "/style/fontFamily", Value::Null);
+    f.set(
+        f.text,
+        "/style/fontFallback",
+        json!("Font that does not exist"),
+    );
+    assert_eq!(error(), "MISSING_FONT");
+    f.set(f.text, "/style/fontFallback", Value::Null);
+    f.set(f.text, "/content/text", json!("Ж"));
+    assert_eq!(error(), "MISSING_GLYPH");
+    f.set(f.text, "/content/text", json!("A"));
+    f.set(f.text, "/style/fontWeight", json!(700));
+    assert_eq!(error(), "MISSING_FONT");
+    f.set(f.text, "/style/fontWeight", Value::Null);
+    let before = snapshot(&f.session);
+    let bad = transaction(
+        &f.session,
+        &[f.text],
+        json!([
+            {"type": "setProperty", "nodeId": f.text, "path": "/style/fontSize", "value": -1}
+        ]),
+    );
+    assert!(f.session.apply_transaction(&bad.to_string()).is_err());
+    assert_eq!(snapshot(&f.session), before);
+    let svg = f._temp.path().join("image.svg");
+    std::fs::write(&svg, br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).unwrap();
+    let image: Value = serde_json::from_str(&f.session.import_asset(&svg).unwrap()).unwrap();
+    let before = snapshot(&f.session);
+    let font_id = before["document"]["assets"][0]["id"].as_str().unwrap();
+    let bad = transaction(
+        &f.session,
+        &[f.text],
+        json!([
+            {"type": "setProperty", "nodeId": f.text, "path": "/style/fontAssetId", "value": image["id"]}
+        ]),
+    );
+    assert!(f.session.apply_transaction(&bad.to_string()).is_err());
+    assert!(f.session.relink_asset(font_id, &svg).is_err());
+    assert_eq!(snapshot(&f.session), before);
+    std::fs::write(&f.font_path, b"external change").unwrap();
+    assert_eq!(error(), "REVISION_CONFLICT");
+    std::fs::remove_file(&f.font_path).unwrap();
+    assert_eq!(error(), "MISSING_ASSET");
+}
+
+#[test]
+fn text_hug_shapes_rtl_and_emoji_clusters_from_project_fonts() {
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({
+            "x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"
+        }),
+        "A",
+    );
+    let hebrew = f._temp.path().join("hebrew.ttf");
+    std::fs::write(&hebrew, font_test_data::NOTOSERIFHEBREW_AUTOHINT_METRICS).unwrap();
+    let font: Value = serde_json::from_str(&f.session.import_asset(&hebrew).unwrap()).unwrap();
+    f.set(f.text, "/style/fontAssetId", font["id"].clone());
+    f.set(f.text, "/content/text", json!("CHEהבד"));
+    let width = f.point(f.marker)["x"].as_f64().unwrap();
+    assert!(width > 0.0);
+    assert_eq!(width, f.point(f.marker)["x"].as_f64().unwrap());
+    let emoji = f._temp.path().join("emoji.ttf");
+    std::fs::write(&emoji, font_test_data::NOTO_COLOR_EMOJI_FLAGS).unwrap();
+    let font: Value = serde_json::from_str(&f.session.import_asset(&emoji).unwrap()).unwrap();
+    f.set(f.text, "/style/fontAssetId", font["id"].clone());
+    f.set(f.text, "/content/text", json!("🇪🇨"));
+    let width = f.point(f.marker)["x"].as_f64().unwrap();
+    assert!(width > 0.0);
+    f.set(f.text, "/content/text", json!("🇪🇨🇪🇨"));
+    let doubled = f.point(f.marker)["x"].as_f64().unwrap();
+    assert!((doubled - 2.0 * width).abs() < 0.01);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn text_hug_uses_real_installed_cyrillic_and_bold_italic_fonts() {
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({
+            "x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"
+        }),
+        "A",
+    );
+    f.set(f.text, "/style/fontAssetId", Value::Null);
+    f.set(f.text, "/style/fontFamily", json!("Arial"));
+    f.set(f.text, "/content/text", json!("Привет"));
+    assert!(f.point(f.marker)["x"].as_f64().unwrap() > 0.0);
+    f.set(f.text, "/content/text", json!("Привет🌍"));
+    assert_eq!(
+        f.session
+            .transform_point_json(&f.marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code,
+        "MISSING_GLYPH"
+    );
+    f.set(f.text, "/style/fontFallback", json!("Apple Color Emoji"));
+    assert!(f.point(f.marker)["x"].as_f64().unwrap() > 0.0);
+    f.set(f.text, "/style/fontFallback", Value::Null);
+    f.set(f.text, "/content/text", json!("é"));
+    let composed = f.point(f.marker)["x"].as_f64().unwrap();
+    f.set(f.text, "/content/text", json!("e\u{301}"));
+    assert!((f.point(f.marker)["x"].as_f64().unwrap() - composed).abs() < 0.01);
+    f.set(f.text, "/content/text", json!("Hello"));
+    let regular = f.point(f.marker)["x"].as_f64().unwrap();
+    f.set(f.text, "/style/fontWeight", json!(700));
+    f.set(f.text, "/style/fontStyle", json!("italic"));
+    let styled = f.point(f.marker)["x"].as_f64().unwrap();
+    assert!(styled > regular);
+}
+
+#[test]
+fn text_hug_variable_font_weight_is_measured_and_survives_reopen() {
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({"x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"}),
+        "A",
+    );
+    let source = f._temp.path().join("cantarell.ttf");
+    std::fs::write(&source, font_test_data::CANTARELL_VF_TRIMMED).unwrap();
+    let font: Value = serde_json::from_str(&f.session.import_asset(&source).unwrap()).unwrap();
+    f.set(f.text, "/style/fontAssetId", font["id"].clone());
+    f.set(f.text, "/content/text", json!("iiii"));
+    let regular = f.point(f.marker)["x"].as_f64().unwrap();
+    f.set(f.text, "/style/fontWeight", json!(700));
+    let bold = f.point(f.marker)["x"].as_f64().unwrap();
+    assert!(regular > 0.0 && bold > regular);
+    f.session.save().unwrap();
+    let reopened = open_project(f._temp.path().join("project")).unwrap();
+    let point: Value = serde_json::from_str(
+        &reopened
+            .transform_point_json(&f.marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(point["x"].as_f64().unwrap(), bold);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn text_hug_collection_requires_a_family_and_never_uses_unselected_faces() {
+    // Package two real fixture fonts as a TTC, adjusting SFNT table offsets.
+    let mut collection = b"ttcf\0\x01\0\0\0\0\0\x02".to_vec();
+    collection.resize(20, 0);
+    for (index, data) in [font_test_data::AHEM, font_test_data::NOTO_COLOR_EMOJI_FLAGS]
+        .into_iter()
+        .enumerate()
+    {
+        let offset = collection.len().next_multiple_of(4);
+        collection.resize(offset, 0);
+        collection[12 + index * 4..16 + index * 4].copy_from_slice(&(offset as u32).to_be_bytes());
+        collection.extend_from_slice(data);
+        let tables = usize::from(u16::from_be_bytes([data[4], data[5]]));
+        for table in 0..tables {
+            let pos = offset + 12 + table * 16 + 8;
+            let old = u32::from_be_bytes(collection[pos..pos + 4].try_into().unwrap());
+            collection[pos..pos + 4].copy_from_slice(&(old + offset as u32).to_be_bytes());
+        }
+    }
+    let f = TextFlowFixture::new(
+        "row",
+        400.0,
+        json!({"x": 0, "y": 0, "w": 100, "h": 20, "widthMode": "hug"}),
+        "A",
+    );
+    let source = f._temp.path().join("collection.ttc");
+    std::fs::write(&source, collection).unwrap();
+    let font: Value = serde_json::from_str(&f.session.import_asset(&source).unwrap()).unwrap();
+    f.set(f.text, "/style/fontAssetId", font["id"].clone());
+    let error = || {
+        f.session
+            .transform_point_json(&f.marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code
+    };
+    assert_eq!(error(), "INVALID_DOCUMENT");
+    f.set(f.text, "/style/fontFamily", json!("Ahem"));
+    assert_eq!(f.point(f.marker)["x"], 16.0);
+    f.set(f.text, "/style/fontFallback", json!("Arial"));
+    f.set(f.text, "/content/text", json!("🇪🇨"));
+    assert_eq!(error(), "MISSING_GLYPH");
 }

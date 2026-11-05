@@ -1,14 +1,36 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path};
 
-use super::domain::{ActionKind, Binding, ValueKind};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::domain::{
+    ActionKind, Binding, Component as DocumentComponent, FeatureItem, FeatureMap, ValueKind,
+    VectorCommand,
+};
 use super::{CoreError, Document, Node, NodeKind, Result};
 
 pub(super) fn property_kind(node: &Node, path: &str) -> Option<ValueKind> {
     use ValueKind::{Number, String};
     match path {
-        "/name" | "/style/fill" | "/style/color" | "/a11y/label" | "/a11y/alt" => Some(String),
-        "/layout/x" | "/layout/y" | "/layout/w" | "/layout/h" | "/style/opacity" => Some(Number),
+        "/name"
+        | "/style/fill"
+        | "/style/color"
+        | "/style/fontFamily"
+        | "/style/fontFallback"
+        | "/a11y/label"
+        | "/a11y/alt" => Some(String),
+        "/layout/x"
+        | "/layout/y"
+        | "/layout/w"
+        | "/layout/h"
+        | "/style/opacity"
+        | "/style/fontSize"
+        | "/style/fontWeight"
+        | "/style/lineHeight"
+        | "/style/letterSpacing" => Some(Number),
         "/content/text" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => Some(String),
         "/content/placeholder" if matches!(node.kind, NodeKind::Input | NodeKind::Textarea) => {
             Some(String)
@@ -38,7 +60,7 @@ fn pointer(path: &str) -> bool {
 }
 
 pub(super) fn node_supported(node: &Node) -> bool {
-    let (Some(_), Some(_), Some(_), Some(bindings), Some(events)) = (
+    let (Some(_), Some(content), Some(_), Some(bindings), Some(events)) = (
         node.style.known(),
         node.content.known(),
         node.a11y.known(),
@@ -47,7 +69,7 @@ pub(super) fn node_supported(node: &Node) -> bool {
     ) else {
         return false;
     };
-    !matches!(node.kind, NodeKind::ComponentInstance)
+    (!matches!(node.kind, NodeKind::ComponentInstance) || content.component_id.is_some())
         && bindings
             .keys()
             .all(|path| property_kind(node, path).is_some())
@@ -63,12 +85,144 @@ fn relative_path(path: &str, prefix: &str) -> bool {
         && path.len() > prefix.len()
 }
 
+fn records<'a, T: Clone + DeserializeOwned>(
+    items: &'a [FeatureItem<T>],
+    fields: &[&str],
+    required: &[&str],
+) -> Result<(Vec<Cow<'a, T>>, bool)> {
+    let mut result = Vec::with_capacity(items.len());
+    let mut unresolved = false;
+    for item in items {
+        match item {
+            FeatureItem::Known(value) => result.push(Cow::Borrowed(value)),
+            FeatureItem::Unsupported(Value::Object(object))
+                if required.iter().skip(1).any(|key| object.contains_key(*key)) =>
+            {
+                let mut known = object.clone();
+                known.retain(|key, _| fields.contains(&key.as_str()));
+                result.push(Cow::Owned(
+                    serde_json::from_value(Value::Object(known)).map_err(|error| {
+                        CoreError::invalid(format!("Invalid document record: {error}"))
+                    })?,
+                ));
+            }
+            FeatureItem::Unsupported(_) => unresolved = true,
+        }
+    }
+    Ok((result, unresolved))
+}
+
+fn validate_component_cycles(
+    components: &[Cow<'_, DocumentComponent>],
+    nodes: &HashMap<Uuid, &Node>,
+) -> Result<()> {
+    let ids: HashSet<_> = components.iter().map(|component| component.id).collect();
+    let mut edges = HashMap::new();
+    for component in components {
+        let mut dependencies = HashSet::new();
+        let mut pending = vec![component.root_id];
+        while let Some(id) = pending.pop() {
+            let node = nodes[&id];
+            if let Some(id) = node
+                .content
+                .known()
+                .and_then(|content| content.component_id)
+            {
+                if ids.contains(&id) {
+                    dependencies.insert(id);
+                }
+            }
+            pending.extend(node.children.iter().copied());
+        }
+        edges.insert(component.id, dependencies);
+    }
+    let mut visited = HashSet::new();
+    let mut active = HashSet::new();
+    for component in components {
+        let mut pending = vec![(component.id, false)];
+        while let Some((id, leave)) = pending.pop() {
+            if leave {
+                active.remove(&id);
+                visited.insert(id);
+            } else if active.contains(&id) {
+                return Err(CoreError::invalid(format!("Component cycle at {id}")));
+            } else if !visited.contains(&id) {
+                active.insert(id);
+                pending.push((id, true));
+                pending.extend(edges[&id].iter().map(|dependency| (*dependency, false)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_known_vector_fields(node: &Node) -> Result<()> {
+    let FeatureMap::Unsupported(content) = &node.content else {
+        return Ok(());
+    };
+    let Some(vector) = content.get("vector").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(paths) = vector.get("paths") else {
+        return Ok(());
+    };
+    if !matches!(node.kind, NodeKind::Vector) {
+        return Err(CoreError::invalid(format!(
+            "Content does not match node {}",
+            node.id
+        )));
+    }
+    let paths = paths
+        .as_array()
+        .ok_or_else(|| CoreError::invalid(format!("Invalid vector paths on node {}", node.id)))?;
+    for path in paths {
+        let commands = path.as_array().ok_or_else(|| {
+            CoreError::invalid(format!("Invalid vector path on node {}", node.id))
+        })?;
+        for command in commands {
+            let Some(object) = command.as_object() else {
+                return Err(CoreError::invalid(format!(
+                    "Invalid vector command on node {}",
+                    node.id
+                )));
+            };
+            let fields: &[&str] = match object.get("type").and_then(Value::as_str) {
+                Some("moveTo" | "lineTo") => &["type", "x", "y"],
+                Some("curveTo") => &["type", "x1", "y1", "x2", "y2", "x", "y"],
+                Some("close") => &["type"],
+                _ => continue,
+            };
+            let mut known = object.clone();
+            known.retain(|key, _| fields.contains(&key.as_str()));
+            let command: VectorCommand =
+                serde_json::from_value(Value::Object(known)).map_err(|error| {
+                    CoreError::invalid(format!("Invalid vector on node {}: {error}", node.id))
+                })?;
+            if !command.finite() {
+                return Err(CoreError::invalid(format!(
+                    "Invalid vector on node {}",
+                    node.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Document {
     // Unknown current-schema content remains readable but cannot be rewritten.
     pub fn editable(&self) -> bool {
-        self.components.is_empty()
-            && self.targets.is_empty()
-            && self.reference_baselines.is_empty()
+        self.components
+            .iter()
+            .all(|v| matches!(v, FeatureItem::Known(_)))
+            && self
+                .targets
+                .iter()
+                .all(|v| matches!(v, FeatureItem::Known(_)))
+            && self
+                .reference_baselines
+                .iter()
+                .all(|v| matches!(v, FeatureItem::Known(_)))
             && self.nodes.iter().all(node_supported)
     }
 
@@ -76,6 +230,17 @@ impl Document {
         if self.schema_version != 1 || self.pages.is_empty() {
             return Err(CoreError::invalid("Unsupported or empty document"));
         }
+        let (components, unknown_components) = records(
+            &self.components,
+            &["id", "rootId", "name"],
+            &["id", "rootId"],
+        )?;
+        let (targets, _) = records(&self.targets, &["id", "adapter"], &["id", "adapter"])?;
+        let (baselines, _) = records(
+            &self.reference_baselines,
+            &["id", "pageId", "assetId"],
+            &["id", "pageId", "assetId"],
+        )?;
         let mut all_ids = HashSet::new();
         let mut insert_id = |id| {
             if all_ids.insert(id) {
@@ -96,6 +261,9 @@ impl Document {
             .chain(self.animations.iter().map(|v| v.id))
             .chain(self.assets.iter().map(|v| v.id))
             .chain(self.code_modules.iter().map(|v| v.id))
+            .chain(components.iter().map(|v| v.id))
+            .chain(targets.iter().map(|v| v.id))
+            .chain(baselines.iter().map(|v| v.id))
         {
             insert_id(id)?;
         }
@@ -105,8 +273,44 @@ impl Document {
         let variables: HashMap<_, _> = self.variables.iter().map(|v| (v.id, v)).collect();
         let actions: HashMap<_, _> = self.actions.iter().map(|v| (v.id, v)).collect();
         let animations: HashMap<_, _> = self.animations.iter().map(|v| (v.id, v)).collect();
-        let assets: HashSet<_> = self.assets.iter().map(|v| v.id).collect();
+        let assets: HashMap<_, _> = self.assets.iter().map(|v| (v.id, v)).collect();
         let modules: HashMap<_, _> = self.code_modules.iter().map(|v| (v.id, v)).collect();
+        let component_ids: HashSet<_> = components.iter().map(|v| v.id).collect();
+        for component in &components {
+            if !nodes.contains_key(&component.root_id)
+                || component
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(CoreError::invalid(format!(
+                    "Invalid component {}",
+                    component.id
+                )));
+            }
+        }
+        for target in &targets {
+            if target.adapter.trim().is_empty() {
+                return Err(CoreError::invalid(format!("Invalid target {}", target.id)));
+            }
+        }
+        for baseline in &baselines {
+            if !pages.contains(&baseline.page_id) {
+                return Err(CoreError::invalid(format!(
+                    "Missing page for baseline {}",
+                    baseline.id
+                )));
+            }
+            if !assets.contains_key(&baseline.asset_id) {
+                return Err(CoreError::new(
+                    "MISSING_ASSET",
+                    format!(
+                        "Missing asset {} for baseline {}",
+                        baseline.asset_id, baseline.id
+                    ),
+                ));
+            }
+        }
         for token in &self.tokens {
             if token.name.trim().is_empty() || !token.value.finite() {
                 return Err(CoreError::invalid(format!("Invalid token {}", token.id)));
@@ -336,14 +540,12 @@ impl Document {
                     )));
                 }
             }
-            if !node_supported(node) {
-                continue;
-            }
+            validate_known_vector_fields(node)?;
             let (Some(style), Some(content), Some(bindings), Some(events)) = (
-                node.style.known(),
-                node.content.known(),
-                node.bindings.known(),
-                node.events.known(),
+                node.style.recognized(),
+                node.content.recognized(),
+                node.bindings.recognized(),
+                node.events.recognized(),
             ) else {
                 return Err(CoreError::invalid(format!("Unsupported node {}", node.id)));
             };
@@ -356,6 +558,44 @@ impl Document {
                     node.id
                 )));
             }
+            if style
+                .font_family
+                .as_ref()
+                .is_some_and(|s| s.trim().is_empty())
+                || style
+                    .font_fallback
+                    .as_ref()
+                    .is_some_and(|s| s.trim().is_empty())
+                || [style.font_size, style.line_height]
+                    .into_iter()
+                    .flatten()
+                    .any(|n| {
+                        !n.is_finite() || n <= 0.0 || !(n as f32).is_finite() || n as f32 == 0.0
+                    })
+                || style
+                    .letter_spacing
+                    .is_some_and(|n| !n.is_finite() || !(n as f32).is_finite())
+                || style.font_weight.is_some_and(|n| !(1..=1000).contains(&n))
+            {
+                return Err(CoreError::invalid(format!(
+                    "Invalid typography on node {}",
+                    node.id
+                )));
+            }
+            if let Some(id) = style.font_asset_id {
+                let asset = assets.get(&id).ok_or_else(|| {
+                    CoreError::new(
+                        "MISSING_ASSET",
+                        format!("Missing font asset {id} on node {}", node.id),
+                    )
+                })?;
+                if !matches!(
+                    asset.path.rsplit_once('.').map(|(_, ext)| ext),
+                    Some("ttf" | "otf" | "ttc")
+                ) {
+                    return Err(CoreError::invalid(format!("Asset {id} is not a font")));
+                }
+            }
             if (content.text.is_some() && !matches!(node.kind, NodeKind::Text | NodeKind::Button))
                 || (content.placeholder.is_some()
                     && !matches!(node.kind, NodeKind::Input | NodeKind::Textarea))
@@ -363,18 +603,36 @@ impl Document {
                 || (content.vector.is_some() && !matches!(node.kind, NodeKind::Vector))
                 || ((content.module_id.is_some() || content.props.is_some())
                     && !matches!(node.kind, NodeKind::CodeComponent))
+                || (content.component_id.is_some()
+                    && !matches!(node.kind, NodeKind::ComponentInstance))
             {
                 return Err(CoreError::invalid(format!(
                     "Content does not match node {}",
                     node.id
                 )));
             }
+            if let Some(id) = content.component_id {
+                if !component_ids.contains(&id) && !unknown_components {
+                    return Err(CoreError::invalid(format!(
+                        "Missing component {id} on node {}",
+                        node.id
+                    )));
+                }
+            }
             if let Some(id) = content.asset_id {
-                if !assets.contains(&id) {
-                    return Err(CoreError::new(
+                let asset = assets.get(&id).ok_or_else(|| {
+                    CoreError::new(
                         "MISSING_ASSET",
                         format!("Missing asset {id} on node {}", node.id),
-                    ));
+                    )
+                })?;
+                if matches!(
+                    asset.path.rsplit_once('.').map(|(_, ext)| ext),
+                    Some("ttf" | "otf" | "ttc")
+                ) {
+                    return Err(CoreError::invalid(format!(
+                        "Font asset {id} cannot be used as an image"
+                    )));
                 }
             }
             if content.vector.as_ref().is_some_and(|vector| {
@@ -389,7 +647,9 @@ impl Document {
                     node.id
                 )));
             }
-            if matches!(node.kind, NodeKind::CodeComponent) {
+            if matches!(node.kind, NodeKind::CodeComponent)
+                && (content.module_id.is_some() || node.content.known().is_some())
+            {
                 let id = content.module_id.ok_or_else(|| {
                     CoreError::invalid(format!("Missing module on node {}", node.id))
                 })?;
@@ -413,7 +673,10 @@ impl Document {
                     )));
                 }
             }
-            for (path, binding) in bindings {
+            for (path, binding) in bindings.iter() {
+                if property_kind(node, path).is_none() {
+                    continue;
+                }
                 let kind = match binding {
                     Binding::Token { token_id } => tokens.get(token_id).map(|v| v.value.kind()),
                     Binding::Variable { variable_id } => {
@@ -451,6 +714,7 @@ impl Document {
                 "Document contains orphaned or cyclic nodes",
             ));
         }
+        validate_component_cycles(&components, &nodes)?;
         Ok(())
     }
 

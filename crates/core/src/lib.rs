@@ -1,10 +1,16 @@
+pub mod cancellation;
 mod model;
 mod storage;
+
+pub use storage::control::{create_project_controlled, open_project_controlled};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use model::{Document, Transaction};
@@ -36,6 +42,9 @@ impl CoreError {
     }
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::new("INVALID_DOCUMENT", message)
+    }
+    pub(crate) fn import_limit(message: impl Into<String>) -> Self {
+        Self::new("IMPORT_LIMIT_EXCEEDED", message)
     }
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new("REVISION_CONFLICT", message)
@@ -77,6 +86,101 @@ struct Checkpoint {
     executable_modes: Option<BTreeMap<String, u32>>,
 }
 
+fn duplicate_checkpoints(
+    inputs: &BTreeMap<String, Vec<u8>>,
+    source_project: Uuid,
+    target_project: Uuid,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut copied = BTreeMap::new();
+    for (path, bytes) in inputs
+        .iter()
+        .filter(|(path, _)| path.starts_with("checkpoints/"))
+    {
+        if let Some(digest) = path.strip_prefix("checkpoints/blobs/") {
+            if digest.len() != 64 || storage::hash(bytes) != digest {
+                return Err(CoreError::invalid(format!(
+                    "Invalid checkpoint blob {path}"
+                )));
+            }
+            copied.insert(path.clone(), bytes.clone());
+            continue;
+        }
+        let value: Value = serde_json::from_slice(bytes)
+            .map_err(|e| CoreError::invalid(format!("Invalid checkpoint {path}: {e}")))?;
+        let known = [
+            "id",
+            "projectId",
+            "revision",
+            "documentHash",
+            "dependencies",
+            "executableModes",
+        ];
+        if value
+            .as_object()
+            .is_none_or(|object| object.keys().any(|key| !known.contains(&key.as_str())))
+        {
+            return Err(CoreError::unsupported(format!(
+                "Unsupported checkpoint metadata {path}"
+            )));
+        }
+        let mut checkpoint: Checkpoint = serde_json::from_value(value)
+            .map_err(|e| CoreError::invalid(format!("Invalid checkpoint {path}: {e}")))?;
+        if checkpoint.project_id != source_project
+            || *path != format!("checkpoints/{}.json", checkpoint.id)
+        {
+            return Err(CoreError::invalid(format!(
+                "Checkpoint identity does not match {path}"
+            )));
+        }
+        let blob = format!("checkpoints/blobs/{}", checkpoint.document_hash);
+        let doc = inputs
+            .get(&blob)
+            .ok_or_else(|| CoreError::invalid(format!("Missing {blob}")))?;
+        if storage::hash(doc) != checkpoint.document_hash {
+            return Err(CoreError::invalid(format!(
+                "Checkpoint document is corrupted: {path}"
+            )));
+        }
+        let mut document: Document = serde_json::from_slice(doc)
+            .map_err(|e| CoreError::unsupported(format!("Unsupported checkpoint document: {e}")))?;
+        if document.project_id != source_project || document.revision != checkpoint.revision {
+            return Err(CoreError::invalid(format!(
+                "Checkpoint document identity does not match {path}"
+            )));
+        }
+        document.validate()?;
+        document.validate_files(&checkpoint.dependencies)?;
+        for (dependency, digest) in &checkpoint.dependencies {
+            if !storage::checkpoint_dependency_path(dependency) {
+                return Err(CoreError::invalid(format!(
+                    "Unsafe checkpoint dependency {dependency}"
+                )));
+            }
+            storage::validate_checkpoint_asset(dependency, digest)?;
+            let blob_path = format!("checkpoints/blobs/{digest}");
+            if inputs
+                .get(&blob_path)
+                .is_none_or(|bytes| storage::hash(bytes) != *digest)
+            {
+                return Err(CoreError::invalid(format!(
+                    "Missing or corrupted checkpoint blob {digest}"
+                )));
+            }
+        }
+        document.project_id = target_project;
+        document.validate()?;
+        let doc = storage::json(&document)?;
+        checkpoint.project_id = target_project;
+        checkpoint.document_hash = storage::hash(&doc);
+        copied.insert(
+            format!("checkpoints/blobs/{}", checkpoint.document_hash),
+            doc,
+        );
+        copied.insert(path.clone(), storage::json(&checkpoint)?);
+    }
+    Ok(copied)
+}
+
 struct State {
     manifest: Manifest,
     manifest_bytes: Vec<u8>,
@@ -84,15 +188,55 @@ struct State {
     history: History,
     pending: BTreeMap<String, Vec<u8>>,
     read_only_reason: Option<String>,
+    local_generation: u64,
     dirty: bool,
 }
 
 pub struct ProjectSession {
     path: PathBuf,
     state: Mutex<State>,
+    retention_limit: AtomicU64,
 }
 
-pub fn create_project(path: impl AsRef<Path>, name: &str) -> Result<ProjectSession> {
+struct StagedProject(Option<PathBuf>);
+
+impl StagedProject {
+    fn new(destination: &Path) -> Result<Self> {
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let path = parent.join(format!(".aic-stage-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path)?;
+        let stage = Self(Some(path));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(stage)
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("staged directory is present")
+    }
+
+    fn publish(mut self, destination: &Path) -> Result<()> {
+        storage::publish_directory(self.path(), destination)?;
+        self.0 = None;
+        Ok(())
+    }
+}
+
+impl Drop for StagedProject {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn create_in_place(path: &Path, name: &str) -> Result<ProjectSession> {
     if name.trim().is_empty() {
         return Err(CoreError::invalid("Project name must not be empty"));
     }
@@ -108,7 +252,16 @@ pub fn create_project(path: impl AsRef<Path>, name: &str) -> Result<ProjectSessi
         snapshot_hash: String::new(),
         files: BTreeMap::new(),
     };
-    storage::create(path.as_ref(), &manifest, &bytes)?;
+    storage::create(path, &manifest, &bytes)?;
+    open_project(path)
+}
+
+pub fn create_project(path: impl AsRef<Path>, name: &str) -> Result<ProjectSession> {
+    let path = path.as_ref();
+    let stage = StagedProject::new(path)?;
+    let project = storage::control::staging(|| create_in_place(stage.path(), name))?;
+    drop(project);
+    stage.publish(path)?;
     open_project(path)
 }
 
@@ -122,6 +275,10 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
         .and_then(Value::as_u64)
         .ok_or_else(|| CoreError::invalid("Missing document schemaVersion"))?;
     let mut read_only_reason = loaded.read_only_reason;
+    if storage::manifest_has_unknown_fields(&loaded.manifest_bytes)? {
+        read_only_reason =
+            Some("This project manifest contains unsupported fields and is open read-only".into());
+    }
     if schema_version > 1 || loaded.manifest.schema_version > 1 {
         read_only_reason = Some("This project uses a newer schema and is open read-only".into());
     } else if schema_version != 1 || loaded.manifest.schema_version != 1 {
@@ -129,20 +286,32 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
             "This project schema cannot be migrated",
         ));
     } else {
-        let model: Document = serde_json::from_value(document.clone())
-            .map_err(|e| CoreError::invalid(format!("Invalid document: {e}")))?;
-        model.validate()?;
-        if let Err(error) = model.validate_files(&loaded.manifest.files) {
-            read_only_reason = Some(error.to_string());
-        }
-        if !model.editable() {
-            read_only_reason =
-                Some("This document contains features not yet supported for editing".into());
-        }
-        if model.project_id != loaded.manifest.project_id
-            || model.revision != loaded.manifest.revision
-        {
-            read_only_reason = Some("Document and project manifest do not match".into());
+        match serde_json::from_value::<Document>(document.clone()) {
+            Ok(model) => {
+                model.validate()?;
+                if let Err(error) = model.validate_files(&loaded.manifest.files) {
+                    read_only_reason = Some(error.to_string());
+                }
+                if !model.editable() {
+                    read_only_reason = Some(
+                        "This document contains features not yet supported for editing".into(),
+                    );
+                }
+                if model.project_id != loaded.manifest.project_id
+                    || model.revision != loaded.manifest.revision
+                {
+                    read_only_reason = Some("Document and project manifest do not match".into());
+                }
+            }
+            Err(error)
+                if error.to_string().contains("unknown field")
+                    || error.to_string().contains("unknown variant") =>
+            {
+                read_only_reason = Some(format!(
+                    "This document contains unsupported data and is open read-only: {error}"
+                ));
+            }
+            Err(error) => return Err(CoreError::invalid(format!("Invalid document: {error}"))),
         }
         if storage::fingerprint(&loaded.document_bytes, &loaded.manifest.files)
             != loaded.manifest.snapshot_hash
@@ -162,12 +331,14 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
     };
     Ok(ProjectSession {
         path,
+        retention_limit: AtomicU64::new(storage::retention::UNLIMITED),
         state: Mutex::new(State {
             manifest: loaded.manifest,
             manifest_bytes: loaded.manifest_bytes,
             document,
             history,
             pending: BTreeMap::new(),
+            local_generation: 0,
             read_only_reason,
             dirty: false,
         }),
@@ -175,6 +346,16 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
 }
 
 impl State {
+    fn next_generation(&self) -> Result<u64> {
+        self.local_generation
+            .checked_add(1)
+            .ok_or_else(|| CoreError::invalid("Local state generation overflow"))
+    }
+    fn bump(&mut self) -> Result<()> {
+        self.local_generation = self.next_generation()?;
+        Ok(())
+    }
+
     fn ensure_writable(&self) -> Result<()> {
         if let Some(reason) = &self.read_only_reason {
             return Err(CoreError::unsupported(reason));
@@ -206,6 +387,7 @@ impl State {
         let transaction = storage::json(&description)?;
         let history = storage::json(&self.history)?;
         let snapshot = self.snapshot_for(&document, true)?;
+        self.bump()?;
         self.pending
             .insert(format!("history/transactions/{id}.json"), transaction);
         self.pending.insert("history/state.json".into(), history);
@@ -216,14 +398,121 @@ impl State {
 }
 
 impl ProjectSession {
+    /// Applies only to subsequent completed saves, not to opening a project.
+    pub fn set_retention_limit(&self, limit: Option<u32>) {
+        self.retention_limit.store(
+            limit
+                .map(u64::from)
+                .unwrap_or(storage::retention::UNLIMITED),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn after_commit(&self, before: &[u8], after: &[u8], project: Uuid) {
+        if before == after {
+            return;
+        }
+        if let Err(error) = storage::retention::prune(&self.path, project, &self.retention_limit) {
+            // The save has already committed; cleanup errors must not make it look unsaved.
+            eprintln!("AI Constructor: retained cleanup deferred: {error}");
+        }
+    }
+
     fn state(&self) -> Result<std::sync::MutexGuard<'_, State>> {
-        self.state
-            .lock()
-            .map_err(|_| CoreError::io("Project session lock poisoned"))
+        loop {
+            storage::control::check()?;
+            match self.state.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(CoreError::io("Project session lock poisoned"));
+                }
+            }
+        }
+    }
+
+    fn preserve_conflict_error(&self, state: &State, error: CoreError) -> CoreError {
+        if error.code != "REVISION_CONFLICT" {
+            return error;
+        }
+        match storage::capture_external(&self.path, state) {
+            Ok(()) => error,
+            Err(archive_error) => CoreError::new(
+                "CONFLICT_ARCHIVE_FAILED",
+                format!(
+                    "{}; could not preserve local and external versions: {}",
+                    error.message, archive_error
+                ),
+            ),
+        }
     }
 
     pub fn snapshot_json(&self) -> Result<String> {
         self.state()?.snapshot()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the flat API aligned with its UniFFI bridge"
+    )]
+    pub fn transform_point_json(
+        &self,
+        node_id: &str,
+        x: f64,
+        y: f64,
+        zoom: f64,
+        pan_x: f64,
+        pan_y: f64,
+        inverse: bool,
+        source_pixels: bool,
+    ) -> Result<String> {
+        let node_id =
+            Uuid::parse_str(node_id).map_err(|_| CoreError::invalid("Invalid node ID"))?;
+        let document = self.state()?.model()?;
+        let (x, y) = document.transform_point(
+            &self.path,
+            node_id,
+            (x, y),
+            (zoom, pan_x, pan_y),
+            inverse,
+            source_pixels,
+        )?;
+        serde_json::to_string(&serde_json::json!({"x": x, "y": y}))
+            .map_err(|e| CoreError::invalid(e.to_string()))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the flat API aligned with its UniFFI bridge"
+    )]
+    pub fn transform_point_at_breakpoint_json(
+        &self,
+        node_id: &str,
+        x: f64,
+        y: f64,
+        zoom: f64,
+        pan_x: f64,
+        pan_y: f64,
+        inverse: bool,
+        source_pixels: bool,
+        breakpoint: f64,
+    ) -> Result<String> {
+        let node_id =
+            Uuid::parse_str(node_id).map_err(|_| CoreError::invalid("Invalid node ID"))?;
+        let document = self.state()?.model()?;
+        let (x, y) = document.transform_point_at_breakpoint(
+            &self.path,
+            node_id,
+            (x, y),
+            (zoom, pan_x, pan_y),
+            inverse,
+            source_pixels,
+            breakpoint,
+        )?;
+        serde_json::to_string(&serde_json::json!({"x": x, "y": y}))
+            .map_err(|e| CoreError::invalid(e.to_string()))
     }
 
     pub fn apply_transaction(&self, transaction_json: &str) -> Result<String> {
@@ -232,6 +521,10 @@ impl ProjectSession {
         })?;
         let mut state = self.state()?;
         state.ensure_writable()?;
+        // The in-memory base may have been checked out or changed by another session.
+        if let Err(error) = storage::validate_current(&self.path, &state.manifest_bytes) {
+            return Err(self.preserve_conflict_error(&state, error));
+        }
         let before = state.model()?;
         if transaction.base_revision != before.revision
             || transaction.base_fingerprint != state.fingerprint()?
@@ -255,6 +548,7 @@ impl ProjectSession {
         let id = transaction.transaction_id;
         let description =
             serde_json::json!({"transaction": transaction, "before": before, "after": next});
+        storage::control::begin_commit()?;
         let redo = std::mem::take(&mut state.history.redo);
         state.history.undo.push(before);
         state.history.transaction_ids.insert(id);
@@ -317,6 +611,7 @@ impl ProjectSession {
             }
         };
         let description = serde_json::json!({"transactionId": id, "kind": if redo { "redo" } else { "undo" }, "before": before, "after": next});
+        storage::control::begin_commit()?;
         let selected = if redo {
             state.history.redo.pop().expect("history entry was checked")
         } else {
@@ -350,6 +645,8 @@ impl ProjectSession {
         let mut state = self.state()?;
         state.ensure_writable()?;
         if state.manifest.name != name {
+            storage::control::begin_commit()?;
+            state.bump()?;
             state.manifest.name = name.to_owned();
             state.dirty = true;
         }
@@ -364,20 +661,11 @@ impl ProjectSession {
         self.save()?;
         let state = self.state()?;
         state.ensure_writable()?;
-        if state
-            .manifest
-            .files
-            .keys()
-            .any(|path| path.starts_with("chats/"))
-        {
-            return Err(CoreError::unsupported(
-                "Duplicating projects with chats is not supported",
-            ));
-        }
         let destination = destination.as_ref();
         let parent = destination
             .parent()
-            .ok_or_else(|| CoreError::invalid("Destination needs a parent directory"))?;
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         if parent
             .canonicalize()?
             .starts_with(self.path.canonicalize()?)
@@ -386,24 +674,56 @@ impl ProjectSession {
                 "A duplicate cannot be placed inside the source project",
             ));
         }
-        let inputs = storage::snapshot_inputs(&self.path, &state.manifest_bytes)?;
+        let inputs = storage::snapshot_all_inputs(&self.path, &state.manifest_bytes)?;
+        if inputs.keys().any(|path| path.starts_with("agent/")) {
+            return Err(CoreError::unsupported(
+                "Duplicating projects with agent records is not supported by this version",
+            ));
+        }
+        let chats = storage::rewrite_chats(&inputs, state.manifest.project_id)?;
+        let modes: Vec<String> = inputs
+            .keys()
+            .filter(|path| path.starts_with("src/") || path.starts_with("assets/"))
+            .cloned()
+            .collect();
         let source = state.model()?;
-        let duplicate = create_project(destination, name)?;
-        {
-            let mut target = duplicate.state()?;
-            let mut document = source;
-            document.project_id = target.manifest.project_id;
-            target.document =
-                serde_json::to_value(document).map_err(|e| CoreError::invalid(e.to_string()))?;
-            for (path, bytes) in inputs {
-                if path != "document.json" {
+        let stage = StagedProject::new(destination)?;
+        let duplicate = storage::control::staging(|| {
+            let duplicate = create_in_place(stage.path(), name)?;
+            {
+                let mut target = duplicate.state()?;
+                target.bump()?;
+                let checkpoints = duplicate_checkpoints(
+                    &inputs,
+                    state.manifest.project_id,
+                    target.manifest.project_id,
+                )?;
+                let mut document = source;
+                document.project_id = target.manifest.project_id;
+                document.validate()?;
+                target.document = serde_json::to_value(document)
+                    .map_err(|e| CoreError::invalid(e.to_string()))?;
+                for (path, bytes) in inputs {
+                    if path == ".gitignore"
+                        || path.starts_with("src/")
+                        || path.starts_with("assets/")
+                    {
+                        target.pending.insert(path, bytes);
+                    }
+                }
+                for (path, bytes) in chats.into_files(target.manifest.project_id)? {
                     target.pending.insert(path, bytes);
                 }
+                target.pending.extend(checkpoints);
+                target.dirty = true;
             }
-            target.dirty = true;
-        }
-        duplicate.save()?;
-        Ok(duplicate)
+            duplicate.save()?;
+            storage::copy_executable_modes(&self.path, stage.path(), &modes)?;
+            Ok(duplicate)
+        })?;
+        drop(duplicate);
+        stage.publish(destination)?;
+        open_project(destination)
     }
 
     pub fn create_checkpoint(&self) -> Result<String> {
@@ -478,14 +798,19 @@ impl ProjectSession {
             return Err(CoreError::conflict("Checkpoint ID already exists"));
         }
         changes.insert(metadata_path, storage::json(&checkpoint)?);
+        let next_generation = state.next_generation()?;
         let committed = match storage::commit(&self.path, &state.manifest_bytes, &saved, &changes) {
             Ok(committed) => committed,
+            Err(error) if error.code == "CANCELED" => return Err(error),
             Err(error) => {
+                state.local_generation = next_generation;
                 state.read_only_reason =
                     Some("Checkpoint publication failed; reopen the project to recover".into());
                 return Err(error);
             }
         };
+        self.after_commit(&state.manifest_bytes, &committed, state.manifest.project_id);
+        state.local_generation = next_generation;
         let mut manifest: Manifest =
             serde_json::from_slice(&committed).map_err(|e| CoreError::invalid(e.to_string()))?;
         // A concurrent in-memory rename after the initial save is still pending.
@@ -497,7 +822,7 @@ impl ProjectSession {
 
     pub fn checkpoints_json(&self) -> Result<String> {
         let state = self.state()?;
-        storage::snapshot_inputs(&self.path, &state.manifest_bytes)?;
+        storage::validate_current(&self.path, &state.manifest_bytes)?;
         let mut checkpoints = Vec::new();
         for path in state.manifest.files.keys() {
             if !path.starts_with("checkpoints/")
@@ -700,6 +1025,7 @@ impl ProjectSession {
         changes.insert("document.json".into(), storage::json(&document)?);
         let mut manifest = state.manifest.clone();
         manifest.revision = next.revision;
+        let next_generation = state.next_generation()?;
         let committed = match storage::commit_with_deletions(
             &self.path,
             &state.manifest_bytes,
@@ -708,12 +1034,16 @@ impl ProjectSession {
             &deletions,
         ) {
             Ok(committed) => committed,
+            Err(error) if error.code == "CANCELED" => return Err(error),
             Err(error) => {
+                state.local_generation = next_generation;
                 state.read_only_reason =
                     Some("Checkpoint restoration failed; reopen the project to recover".into());
                 return Err(error);
             }
         };
+        self.after_commit(&state.manifest_bytes, &committed, state.manifest.project_id);
+        state.local_generation = next_generation;
         state.manifest =
             serde_json::from_slice(&committed).map_err(|e| CoreError::invalid(e.to_string()))?;
         state.manifest_bytes = committed;
@@ -728,13 +1058,18 @@ impl ProjectSession {
         let mut state = self.state()?;
         state.ensure_writable()?;
         if !state.dirty {
-            return Ok(());
+            return storage::validate_current(&self.path, &state.manifest_bytes)
+                .map_err(|error| self.preserve_conflict_error(&state, error));
         }
         let mut changes = state.pending.clone();
         changes.insert("document.json".into(), storage::json(&state.document)?);
         let mut manifest = state.manifest.clone();
         manifest.revision = state.model()?.revision;
-        let committed = storage::commit(&self.path, &state.manifest_bytes, &manifest, &changes)?;
+        let next_generation = state.next_generation()?;
+        let committed = storage::commit(&self.path, &state.manifest_bytes, &manifest, &changes)
+            .map_err(|error| self.preserve_conflict_error(&state, error))?;
+        self.after_commit(&state.manifest_bytes, &committed, state.manifest.project_id);
+        state.local_generation = next_generation;
         state.manifest =
             serde_json::from_slice(&committed).map_err(|e| CoreError::invalid(e.to_string()))?;
         state.manifest_bytes = committed;

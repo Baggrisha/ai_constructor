@@ -6,12 +6,15 @@ use uuid::Uuid;
 
 use crate::{CoreError, Result};
 mod domain;
+mod geometry;
 mod operations;
+mod text;
 mod validation;
 
 use domain::{
-    Action, Animation, Asset, Binding, Bounds, CodeModule, FeatureMap, Flow, NodeAccessibility,
-    NodeContent, NodeStyle, ResponsiveOverride, SizeMode, Token, Variable,
+    Action, Animation, Asset, Binding, Bounds, CodeModule, Component, FeatureItem, FeatureMap,
+    Flow, NodeAccessibility, NodeContent, NodeStyle, ReferenceBaseline, ResponsiveOverride,
+    SizeMode, Target, Token, Variable,
 };
 
 fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -30,15 +33,15 @@ pub struct Document {
     pub revision: u64,
     pub pages: Vec<Page>,
     pub nodes: Vec<Node>,
-    pub components: Vec<Value>,
+    pub components: Vec<FeatureItem<Component>>,
     pub tokens: Vec<Token>,
     pub variables: Vec<Variable>,
     pub actions: Vec<Action>,
     pub animations: Vec<Animation>,
     pub assets: Vec<Asset>,
     pub code_modules: Vec<CodeModule>,
-    pub targets: Vec<Value>,
-    pub reference_baselines: Vec<Value>,
+    pub targets: Vec<FeatureItem<Target>>,
+    pub reference_baselines: Vec<FeatureItem<ReferenceBaseline>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

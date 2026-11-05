@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Baggrisha/ai_constructor/schemas/project-document.schema.json",
   "title": "AI Constructor project document, schema 1",
+  "$comment": "Schema 1 uses the following minimal project conventions for component roots, adapter targets and visual baselines; their precise JSON fields are implementation choices, not quotations from the product plan. Unknown supported-version records are preserved read-only; newer schemas open read-only and older unrecognised schemas are rejected without migration.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "projectId", "revision", "pages", "nodes", "components", "tokens", "variables", "actions", "animations", "assets", "codeModules", "targets", "referenceBaselines"],
@@ -11,20 +12,35 @@
     "revision": { "type": "integer", "minimum": 0 },
     "pages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/page" } },
     "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
-    "components": { "type": "array" },
+    "components": { "type": "array", "items": { "$ref": "#/$defs/component" } },
     "tokens": { "type": "array", "items": { "$ref": "#/$defs/token" } },
     "variables": { "type": "array", "items": { "$ref": "#/$defs/token" } },
     "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } },
     "animations": { "type": "array", "items": { "$ref": "#/$defs/animation" } },
     "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
     "codeModules": { "type": "array", "items": { "$ref": "#/$defs/codeModule" } },
-    "targets": { "type": "array" },
-    "referenceBaselines": { "type": "array" }
+    "targets": { "type": "array", "items": { "$ref": "#/$defs/target" } },
+    "referenceBaselines": { "type": "array", "items": { "$ref": "#/$defs/referenceBaseline" } }
   },
   "$defs": {
     "id": { "type": "string", "format": "uuid" },
     "scalar": { "type": ["boolean", "number", "string"] },
     "valueKind": { "enum": ["boolean", "number", "string"] },
+    "component": {
+      "description": "A definition references an existing document subtree; instances reference its id.",
+      "type": "object", "additionalProperties": false, "required": ["id", "rootId"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "rootId": { "$ref": "#/$defs/id" }, "name": { "type": ["string", "null"], "pattern": "\\S" } }
+    },
+    "target": {
+      "description": "Adapter identifier only; recording a target does not imply its export is implemented.",
+      "type": "object", "additionalProperties": false, "required": ["id", "adapter"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "adapter": { "type": "string", "pattern": "\\S" } }
+    },
+    "referenceBaseline": {
+      "description": "Historical visual reference for a page, stored as an asset separate from node layout.",
+      "type": "object", "additionalProperties": false, "required": ["id", "pageId", "assetId"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "pageId": { "$ref": "#/$defs/id" }, "assetId": { "$ref": "#/$defs/id" } }
+    },
     "page": {
       "type": "object", "additionalProperties": false,
       "required": ["id", "name", "rootId"],
@@ -35,6 +51,7 @@
       "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 } }
     },
     "flow": {
+      "description": "Computed as a CSS-flex subset: fixed and measured hug items do not shrink, fill items share remaining main-axis space, and unspecified cross-axis sizes stretch only when align is stretch. Text hug uses the specified font metrics; other intrinsic leaf content is not yet measurable.",
       "type": "object", "additionalProperties": false, "required": ["direction", "gap", "padding", "align"],
       "properties": {
         "direction": { "enum": ["row", "column"] }, "gap": { "type": "number", "minimum": 0 },
@@ -46,6 +63,7 @@
       }
     },
     "layout": {
+      "description": "Coordinates and dimensions are logical CSS pixels. Source bounds and source density describe the separate original image; they are not substituted for layout.",
       "type": "object", "additionalProperties": false, "required": ["x", "y", "w", "h"],
       "properties": {
         "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 },
@@ -53,6 +71,7 @@
       }
     },
     "responsive": {
+      "description": "An override applies only when its exact breakpoint is explicitly selected; missing properties use the base layout without changing it.",
       "type": "object", "additionalProperties": false, "required": ["breakpoint"],
       "properties": {
         "breakpoint": { "type": "number", "exclusiveMinimum": 0 }, "x": { "type": ["number", "null"] }, "y": { "type": ["number", "null"] },
@@ -85,8 +104,17 @@
         "name": { "type": "string", "minLength": 1 }, "children": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
         "layout": { "$ref": "#/$defs/layout" }, "sourceBounds": { "anyOf": [{ "$ref": "#/$defs/bounds" }, { "type": "null" }] }, "sourceDensity": { "type": ["number", "null"], "exclusiveMinimum": 0 },
         "responsive": { "type": "array", "items": { "$ref": "#/$defs/responsive" } },
-        "style": { "type": "object", "properties": { "fill": { "type": ["string", "null"] }, "color": { "type": ["string", "null"] }, "opacity": { "type": ["number", "null"], "minimum": 0, "maximum": 1 } } },
-        "content": { "type": "object", "properties": { "text": { "type": ["string", "null"] }, "placeholder": { "type": ["string", "null"] }, "assetId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "moduleId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "vector": { "anyOf": [{ "$ref": "#/$defs/vector" }, { "type": "null" }] }, "props": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/scalar" } } } },
+        "style": { "type": "object", "properties": {
+          "fill": { "type": ["string", "null"] }, "color": { "type": ["string", "null"] }, "opacity": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "fontFamily": { "type": ["string", "null"], "minLength": 1 }, "fontFallback": { "type": ["string", "null"], "minLength": 1 },
+          "fontAssetId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+          "fontSize": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+          "fontWeight": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000 },
+          "fontStyle": { "enum": ["normal", "italic", "oblique", null] },
+          "lineHeight": { "type": ["number", "null"], "exclusiveMinimum": 0 }, "letterSpacing": { "type": ["number", "null"] },
+          "textWrap": { "enum": ["none", "word", "wordOrGlyph", null] }
+        } },
+        "content": { "type": "object", "properties": { "text": { "type": ["string", "null"] }, "placeholder": { "type": ["string", "null"] }, "assetId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "moduleId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "componentId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "vector": { "anyOf": [{ "$ref": "#/$defs/vector" }, { "type": "null" }] }, "props": { "type": ["object", "null"], "additionalProperties": { "$ref": "#/$defs/scalar" } } } },
         "a11y": { "type": "object", "properties": { "label": { "type": ["string", "null"] }, "alt": { "type": ["string", "null"] } } },
         "bindings": { "type": "object", "additionalProperties": { "$ref": "#/$defs/binding" } },
         "events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/id" } },
@@ -94,7 +122,19 @@
           "type": "object", "propertyNames": { "pattern": "^/(?:[^~]|~[01])*$" },
           "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["origin", "lastRevision", "agentLocked"], "properties": { "origin": { "enum": ["import", "user", "agent"] }, "lastRevision": { "type": "integer", "minimum": 0 }, "agentLocked": { "type": "boolean" } } }
         }
-      }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "componentInstance" } } }, "then": { "properties": { "content": { "required": ["componentId"], "properties": { "componentId": { "$ref": "#/$defs/id" } } } } } },
+        { "if": { "properties": { "kind": { "const": "codeComponent" } } }, "then": { "properties": { "content": { "required": ["moduleId"], "properties": { "moduleId": { "$ref": "#/$defs/id" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "enum": ["text", "button"] } } } }, "then": { "properties": { "content": { "properties": { "text": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "enum": ["input", "textarea"] } } } }, "then": { "properties": { "content": { "properties": { "placeholder": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "const": "image" } } } }, "then": { "properties": { "content": { "properties": { "assetId": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "const": "vector" } } } }, "then": { "properties": { "content": { "properties": { "vector": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "const": "codeComponent" } } } }, "then": { "properties": { "content": { "properties": { "moduleId": { "type": "null" }, "props": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "const": "componentInstance" } } } }, "then": { "properties": { "content": { "properties": { "componentId": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "enum": ["frame", "group", "button"] } } } }, "then": { "properties": { "layout": { "properties": { "flow": { "type": "null" } } } } } },
+        { "if": { "properties": { "kind": { "not": { "enum": ["frame", "group", "button", "componentInstance"] } } } }, "then": { "properties": { "children": { "maxItems": 0 } } } }
+      ]
     },
     "token": { "type": "object", "additionalProperties": false, "required": ["id", "name", "value"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1 }, "value": { "$ref": "#/$defs/scalar" } } },
     "action": {

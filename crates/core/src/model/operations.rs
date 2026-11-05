@@ -104,6 +104,7 @@ fn lock_target(node: &Node, path: &str) -> Result<String> {
         || (target == "/content/vector" && matches!(node.kind, NodeKind::Vector))
         || (matches!(target.as_str(), "/content/moduleId" | "/content/props")
             && matches!(node.kind, NodeKind::CodeComponent))
+        || (target == "/content/componentId" && matches!(node.kind, NodeKind::ComponentInstance))
         || target
             .strip_prefix("/bindings/")
             .is_some_and(|p| decode_token(p).is_ok_and(|p| property_kind(node, &p).is_some()));
@@ -177,6 +178,15 @@ fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
         "/style/fill" => known_mut(&mut node.style)?.fill = optional(value)?,
         "/style/color" => known_mut(&mut node.style)?.color = optional(value)?,
         "/style/opacity" => known_mut(&mut node.style)?.opacity = optional(value)?,
+        "/style/fontFamily" => known_mut(&mut node.style)?.font_family = optional(value)?,
+        "/style/fontFallback" => known_mut(&mut node.style)?.font_fallback = optional(value)?,
+        "/style/fontAssetId" => known_mut(&mut node.style)?.font_asset_id = optional(value)?,
+        "/style/fontSize" => known_mut(&mut node.style)?.font_size = optional(value)?,
+        "/style/fontWeight" => known_mut(&mut node.style)?.font_weight = optional(value)?,
+        "/style/fontStyle" => known_mut(&mut node.style)?.font_style = optional(value)?,
+        "/style/lineHeight" => known_mut(&mut node.style)?.line_height = optional(value)?,
+        "/style/letterSpacing" => known_mut(&mut node.style)?.letter_spacing = optional(value)?,
+        "/style/textWrap" => known_mut(&mut node.style)?.text_wrap = optional(value)?,
         "/a11y/label" => known_mut(&mut node.a11y)?.label = optional(value)?,
         "/a11y/alt" => known_mut(&mut node.a11y)?.alt = optional(value)?,
         "/content/text" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => {
@@ -193,6 +203,9 @@ fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
         }
         "/content/moduleId" if matches!(node.kind, NodeKind::CodeComponent) => {
             known_mut(&mut node.content)?.module_id = optional(value)?
+        }
+        "/content/componentId" if matches!(node.kind, NodeKind::ComponentInstance) => {
+            known_mut(&mut node.content)?.component_id = optional(value)?
         }
         "/content/props" if matches!(node.kind, NodeKind::CodeComponent) => {
             known_mut(&mut node.content)?.props = optional(value)?
@@ -410,10 +423,20 @@ impl Document {
                         (style.fill.is_some(), "/style/fill"),
                         (style.color.is_some(), "/style/color"),
                         (style.opacity.is_some(), "/style/opacity"),
+                        (style.font_family.is_some(), "/style/fontFamily"),
+                        (style.font_fallback.is_some(), "/style/fontFallback"),
+                        (style.font_asset_id.is_some(), "/style/fontAssetId"),
+                        (style.font_size.is_some(), "/style/fontSize"),
+                        (style.font_weight.is_some(), "/style/fontWeight"),
+                        (style.font_style.is_some(), "/style/fontStyle"),
+                        (style.line_height.is_some(), "/style/lineHeight"),
+                        (style.letter_spacing.is_some(), "/style/letterSpacing"),
+                        (style.text_wrap.is_some(), "/style/textWrap"),
                         (content.text.is_some(), "/content/text"),
                         (content.placeholder.is_some(), "/content/placeholder"),
                         (content.asset_id.is_some(), "/content/assetId"),
                         (content.module_id.is_some(), "/content/moduleId"),
+                        (content.component_id.is_some(), "/content/componentId"),
                         (content.vector.is_some(), "/content/vector"),
                         (content.props.is_some(), "/content/props"),
                         (a11y.label.is_some(), "/a11y/label"),

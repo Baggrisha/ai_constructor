@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -5,11 +6,75 @@ use serde_json::Value;
 use uuid::Uuid;
 
 // Unknown fields are retained only so older builds can open the document read-only.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum FeatureMap<T> {
     Known(T),
     Unsupported(BTreeMap<String, Value>),
+}
+
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for FeatureMap<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("Expected an object"))?;
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(known) => Ok(Self::Known(known)),
+            Err(error) => {
+                let unknown = |error: &serde_json::Error| {
+                    let message = error.to_string();
+                    message.contains("unknown field") || message.contains("unknown variant")
+                };
+                if !unknown(&error) {
+                    return Err(serde::de::Error::custom(error));
+                }
+                for (key, field) in map {
+                    let single =
+                        Value::Object(std::iter::once((key.clone(), field.clone())).collect());
+                    if let Err(error) = serde_json::from_value::<T>(single) {
+                        if !unknown(&error) {
+                            return Err(serde::de::Error::custom(error));
+                        }
+                    }
+                }
+                Ok(Self::Unsupported(
+                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FeatureItem<T> {
+    Known(T),
+    Unsupported(Value),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Component {
+    pub id: Uuid,
+    pub root_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Target {
+    pub id: Uuid,
+    pub adapter: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReferenceBaseline {
+    pub id: Uuid,
+    pub page_id: Uuid,
+    pub asset_id: Uuid,
 }
 
 impl<T> FeatureMap<T> {
@@ -27,6 +92,27 @@ impl<T> FeatureMap<T> {
     }
 }
 
+impl<T: Clone + serde::de::DeserializeOwned> FeatureMap<T> {
+    pub fn recognized(&self) -> Option<Cow<'_, T>> {
+        match self {
+            Self::Known(value) => Some(Cow::Borrowed(value)),
+            Self::Unsupported(fields) => {
+                let mut known = serde_json::Map::new();
+                for (key, value) in fields {
+                    let single =
+                        Value::Object(std::iter::once((key.clone(), value.clone())).collect());
+                    if serde_json::from_value::<T>(single).is_ok() {
+                        known.insert(key.clone(), value.clone());
+                    }
+                }
+                serde_json::from_value(Value::Object(known))
+                    .ok()
+                    .map(Cow::Owned)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeStyle {
@@ -36,6 +122,40 @@ pub struct NodeStyle {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_asset_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_weight: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_style: Option<FontStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub letter_spacing: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_wrap: Option<TextWrap>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FontStyle {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextWrap {
+    None,
+    Word,
+    WordOrGlyph,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -49,6 +169,8 @@ pub struct NodeContent {
     pub asset_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
