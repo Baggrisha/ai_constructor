@@ -7,8 +7,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::domain::{
-    ActionKind, Binding, Component as DocumentComponent, FeatureItem, FeatureMap, ValueKind,
-    VectorCommand,
+    ActionKind, Binding, Component as DocumentComponent, FeatureItem, FeatureMap, Scalar,
+    ValueKind, VectorCommand, VectorShape,
 };
 use super::{CoreError, Document, Node, NodeKind, Result};
 
@@ -206,6 +206,43 @@ fn validate_known_vector_fields(node: &Node) -> Result<()> {
             }
         }
     }
+    if let Some(shapes) = vector.get("shapes") {
+        let shapes = shapes.as_array().ok_or_else(|| {
+            CoreError::invalid(format!("Invalid vector shapes on node {}", node.id))
+        })?;
+        for shape in shapes {
+            let object = shape.as_object().ok_or_else(|| {
+                CoreError::invalid(format!("Invalid vector shape on node {}", node.id))
+            })?;
+            let fields: &[&str] = match object.get("type").and_then(Value::as_str) {
+                Some("rect") => &["type", "x", "y", "w", "h", "rx", "ry"],
+                Some("circle") => &["type", "cx", "cy", "r"],
+                Some("ellipse") => &["type", "cx", "cy", "rx", "ry"],
+                Some("line") => &["type", "x1", "y1", "x2", "y2"],
+                Some("polyline" | "polygon") => &["type", "points"],
+                _ => continue,
+            };
+            let mut known = object.clone();
+            known.retain(|key, _| fields.contains(&key.as_str()));
+            if let Some(Value::Array(points)) = known.get_mut("points") {
+                for point in points {
+                    if let Some(fields) = point.as_object_mut() {
+                        fields.retain(|key, _| matches!(key.as_str(), "x" | "y"));
+                    }
+                }
+            }
+            let shape: VectorShape =
+                serde_json::from_value(Value::Object(known)).map_err(|error| {
+                    CoreError::invalid(format!("Invalid vector on node {}: {error}", node.id))
+                })?;
+            if !shape.valid() {
+                return Err(CoreError::invalid(format!(
+                    "Invalid vector on node {}",
+                    node.id
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -227,6 +264,14 @@ impl Document {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(false)
+    }
+
+    pub(super) fn validate_transaction(&self) -> Result<()> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, strict_bound_sizes: bool) -> Result<()> {
         if self.schema_version != 1 || self.pages.is_empty() {
             return Err(CoreError::invalid("Unsupported or empty document"));
         }
@@ -641,6 +686,7 @@ impl Document {
                     .iter()
                     .flatten()
                     .any(|command| !command.finite())
+                    || vector.shapes.iter().any(|shape| !shape.valid())
             }) {
                 return Err(CoreError::invalid(format!(
                     "Invalid vector on node {}",
@@ -677,15 +723,25 @@ impl Document {
                 if property_kind(node, path).is_none() {
                     continue;
                 }
-                let kind = match binding {
-                    Binding::Token { token_id } => tokens.get(token_id).map(|v| v.value.kind()),
+                let value = match binding {
+                    Binding::Token { token_id } => tokens.get(token_id).map(|v| &v.value),
                     Binding::Variable { variable_id } => {
-                        variables.get(variable_id).map(|v| v.value.kind())
+                        variables.get(variable_id).map(|v| &v.value)
                     }
                 };
+                let kind = value.map(Scalar::kind);
                 if kind.is_none() || kind != property_kind(node, path) {
                     return Err(CoreError::invalid(format!(
                         "Missing or incompatible binding on node {}",
+                        node.id
+                    )));
+                }
+                if strict_bound_sizes
+                    && matches!(path.as_str(), "/layout/w" | "/layout/h")
+                    && matches!(value, Some(Scalar::Number(number)) if *number <= 0.0)
+                {
+                    return Err(CoreError::invalid(format!(
+                        "Invalid bound {path} on node {}",
                         node.id
                     )));
                 }

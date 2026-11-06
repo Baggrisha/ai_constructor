@@ -1,8 +1,11 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use uuid::Uuid;
 
-use super::domain::{Alignment, FlowDirection, SizeMode};
+use super::domain::{Alignment, Binding, FlowDirection, Scalar, SizeMode};
 use super::{text::TextEngine, CoreError, Document, Node, NodeKind, Result};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,48 +14,194 @@ enum Axis {
     Vertical,
 }
 
+struct LayoutContext<'a> {
+    text: TextEngine<'a>,
+    document: &'a Document,
+    project_path: &'a Path,
+    images: HashMap<Uuid, (f64, f64)>,
+    active: HashSet<(Uuid, Axis)>,
+    active_stack: Vec<(Uuid, Axis)>,
+}
+
+impl<'a> LayoutContext<'a> {
+    fn new(document: &'a Document, project_path: &'a Path) -> Self {
+        Self {
+            text: TextEngine::new(document, project_path),
+            document,
+            project_path,
+            images: HashMap::new(),
+            active: HashSet::new(),
+            active_stack: Vec::new(),
+        }
+    }
+
+    fn number(&self, node: &Node, path: &str, fallback: f64) -> Result<(f64, bool)> {
+        let bindings = node
+            .bindings
+            .known()
+            .ok_or_else(|| CoreError::unsupported("Unknown layout bindings"))?;
+        let Some(binding) = bindings.get(path) else {
+            return Ok((fallback, false));
+        };
+        let value = match binding {
+            Binding::Token { token_id } => self
+                .document
+                .tokens
+                .iter()
+                .find(|token| token.id == *token_id)
+                .map(|token| &token.value),
+            Binding::Variable { variable_id } => self
+                .document
+                .variables
+                .iter()
+                .find(|variable| variable.id == *variable_id)
+                .map(|variable| &variable.value),
+        };
+        match value {
+            Some(Scalar::Number(value)) if value.is_finite() => Ok((*value, true)),
+            _ => Err(CoreError::invalid(format!(
+                "Invalid layout binding {path} on node {}",
+                node.id
+            ))),
+        }
+    }
+
+    fn image_size(&mut self, node: &Node) -> Result<(f64, f64)> {
+        let id = node
+            .content
+            .known()
+            .ok_or_else(|| CoreError::unsupported("Unknown image content"))?
+            .asset_id
+            .ok_or_else(|| {
+                CoreError::new(
+                    "MISSING_ASSET",
+                    format!("Missing image on node {}", node.id),
+                )
+            })?;
+        if let Some(size) = self.images.get(&id) {
+            return Ok(*size);
+        }
+        let asset = self
+            .document
+            .assets
+            .iter()
+            .find(|asset| asset.id == id)
+            .ok_or_else(|| {
+                CoreError::new(
+                    "MISSING_ASSET",
+                    format!("Missing image {id} on node {}", node.id),
+                )
+            })?;
+        let (width, height) = crate::storage::image_dimensions(self.project_path, &asset.path)?;
+        let size = (f64::from(width), f64::from(height));
+        self.images.insert(id, size);
+        Ok(size)
+    }
+}
+
 fn responsive(node: &Node, breakpoint: Option<f64>) -> Option<&super::ResponsiveOverride> {
     breakpoint.and_then(|width| node.responsive.iter().find(|item| item.breakpoint == width))
 }
 
-fn position(node: &Node, breakpoint: Option<f64>) -> (f64, f64) {
+fn position(
+    node: &Node,
+    breakpoint: Option<f64>,
+    context: &LayoutContext<'_>,
+) -> Result<(f64, f64)> {
     let override_ = responsive(node, breakpoint);
-    (
-        override_.and_then(|item| item.x).unwrap_or(node.layout.x),
-        override_.and_then(|item| item.y).unwrap_or(node.layout.y),
-    )
+    let x = match override_.and_then(|item| item.x) {
+        Some(x) => x,
+        None => context.number(node, "/layout/x", node.layout.x)?.0,
+    };
+    let y = match override_.and_then(|item| item.y) {
+        Some(y) => y,
+        None => context.number(node, "/layout/y", node.layout.y)?.0,
+    };
+    Ok((x, y))
 }
 
-fn dimension(node: &Node, axis: Axis, breakpoint: Option<f64>) -> (f64, Option<SizeMode>) {
+fn dimension(
+    node: &Node,
+    axis: Axis,
+    breakpoint: Option<f64>,
+    context: &LayoutContext<'_>,
+) -> Result<(f64, Option<SizeMode>)> {
     let override_ = responsive(node, breakpoint);
-    match axis {
+    let (value, mode, explicit, path) = match axis {
         Axis::Horizontal => (
-            override_.and_then(|item| item.w).unwrap_or(node.layout.w),
+            node.layout.w,
             node.layout.width_mode,
+            override_.and_then(|item| item.w),
+            "/layout/w",
         ),
         Axis::Vertical => (
-            override_.and_then(|item| item.h).unwrap_or(node.layout.h),
+            node.layout.h,
             node.layout.height_mode,
+            override_.and_then(|item| item.h),
+            "/layout/h",
         ),
+    };
+    if let Some(explicit) = explicit {
+        return Ok((explicit, Some(SizeMode::Fixed)));
     }
+    let (value, bound) = context.number(node, path, value)?;
+    if bound && matches!(mode, Some(SizeMode::Hug | SizeMode::Fill)) {
+        return Err(CoreError::unsupported(format!(
+            "Bound {path} with hug or fill is ambiguous on node {}",
+            node.id
+        )));
+    }
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CoreError::invalid(format!(
+            "Invalid {path} on node {}",
+            node.id
+        )));
+    }
+    Ok((value, mode))
 }
 
-// Intrinsic text uses shaped font metrics; other intrinsic leaf kinds remain unsupported.
+// Text and raster images have measurable intrinsic dimensions; other leaf kinds
+// remain unsupported until their renderer defines intrinsic metrics.
 fn measured_size(
     id: Uuid,
     axis: Axis,
     nodes: &HashMap<Uuid, &Node>,
     breakpoint: Option<f64>,
     sizes: &mut HashMap<(Uuid, Axis), f64>,
-    text: &mut TextEngine<'_>,
+    text: &mut LayoutContext<'_>,
+) -> Result<f64> {
+    let initial = text.active_stack.len();
+    let result = measured_size_inner(id, axis, nodes, breakpoint, sizes, text);
+    while text.active_stack.len() > initial {
+        let key = text.active_stack.pop().expect("active length was checked");
+        text.active.remove(&key);
+    }
+    result
+}
+
+fn measured_size_inner(
+    id: Uuid,
+    axis: Axis,
+    nodes: &HashMap<Uuid, &Node>,
+    breakpoint: Option<f64>,
+    sizes: &mut HashMap<(Uuid, Axis), f64>,
+    text: &mut LayoutContext<'_>,
 ) -> Result<f64> {
     let mut pending = vec![(id, false)];
     while let Some((id, finish)) = pending.pop() {
         if sizes.contains_key(&(id, axis)) {
             continue;
         }
+        if !finish {
+            if !text.active.insert((id, axis)) {
+                return Err(CoreError::unsupported(format!(
+                    "Cyclic layout size on node {id}"
+                )));
+            }
+            text.active_stack.push((id, axis));
+        }
         let node = nodes[&id];
-        let (fixed, mode) = dimension(node, axis, breakpoint);
+        let (fixed, mode) = dimension(node, axis, breakpoint, text)?;
         match mode {
             None | Some(SizeMode::Fixed) => {
                 sizes.insert((id, axis), fixed);
@@ -65,13 +214,22 @@ fn measured_size(
             Some(SizeMode::Hug) => {
                 if matches!(node.kind, NodeKind::Text) {
                     let width = if axis == Axis::Vertical
-                        && !matches!(node.layout.width_mode, Some(SizeMode::Hug))
-                    {
-                        Some(actual_text_width(id, nodes, breakpoint, sizes, text)?)
+                        && !matches!(
+                            dimension(node, Axis::Horizontal, breakpoint, text)?.1,
+                            Some(SizeMode::Hug)
+                        ) {
+                        Some(actual_axis_size(
+                            id,
+                            Axis::Horizontal,
+                            nodes,
+                            breakpoint,
+                            sizes,
+                            text,
+                        )?)
                     } else {
                         None
                     };
-                    let measured = text.measure(node, width)?;
+                    let measured = text.text.measure(node, width)?;
                     sizes.insert(
                         (id, axis),
                         if axis == Axis::Horizontal {
@@ -80,6 +238,31 @@ fn measured_size(
                             measured.1
                         },
                     );
+                    continue;
+                }
+                if matches!(node.kind, NodeKind::Image) {
+                    let (width, height) = text.image_size(node)?;
+                    let (natural, other_natural, other_axis) = if axis == Axis::Horizontal {
+                        (width, height, Axis::Vertical)
+                    } else {
+                        (height, width, Axis::Horizontal)
+                    };
+                    let size = if matches!(
+                        dimension(node, other_axis, breakpoint, text)?.1,
+                        Some(SizeMode::Hug)
+                    ) {
+                        natural
+                    } else {
+                        let other =
+                            actual_axis_size(id, other_axis, nodes, breakpoint, sizes, text)?;
+                        natural / other_natural * other
+                    };
+                    if !size.is_finite() {
+                        return Err(CoreError::invalid(format!(
+                            "Layout size overflow on node {id}"
+                        )));
+                    }
+                    sizes.insert((id, axis), size);
                     continue;
                 }
                 let flow = node.layout.flow.as_ref().ok_or_else(|| {
@@ -124,25 +307,31 @@ fn measured_size(
     Ok(sizes[&(id, axis)])
 }
 
-fn actual_text_width(
+fn actual_axis_size(
     id: Uuid,
+    axis: Axis,
     nodes: &HashMap<Uuid, &Node>,
     breakpoint: Option<f64>,
     sizes: &mut HashMap<(Uuid, Axis), f64>,
-    text: &mut TextEngine<'_>,
+    text: &mut LayoutContext<'_>,
 ) -> Result<f64> {
     let mut current = nodes[&id];
     let mut pending = Vec::new();
     loop {
-        let mode = dimension(current, Axis::Horizontal, breakpoint).1;
+        let mode = dimension(current, axis, breakpoint, text)?.1;
         let parent = current
             .parent_id
             .and_then(|parent| nodes.get(&parent).copied());
         let flow = parent.and_then(|parent| parent.layout.flow.as_ref());
+        let cross_axis = |direction| {
+            matches!(
+                (direction, axis),
+                (FlowDirection::Column, Axis::Horizontal) | (FlowDirection::Row, Axis::Vertical)
+            )
+        };
         let stretch = mode.is_none()
             && flow.is_some_and(|flow| {
-                matches!(flow.direction, FlowDirection::Column)
-                    && matches!(flow.align, Alignment::Stretch)
+                cross_axis(flow.direction) && matches!(flow.align, Alignment::Stretch)
             });
         if !matches!(mode, Some(SizeMode::Fill)) && !stretch {
             break;
@@ -151,46 +340,53 @@ fn actual_text_width(
             .filter(|parent| parent.layout.flow.is_some())
             .ok_or_else(|| {
                 CoreError::unsupported(format!(
-                    "Fill width requires a flow parent for node {}",
+                    "Fill size requires a flow parent for node {}",
                     current.id
                 ))
             })?;
         if pending.len() >= nodes.len() {
-            return Err(CoreError::invalid("Cycle while resolving text width"));
+            return Err(CoreError::invalid("Cycle while resolving fill size"));
         }
         pending.push((parent, current));
         current = parent;
     }
-    let mut width = measured_size(current.id, Axis::Horizontal, nodes, breakpoint, sizes, text)?;
+    let mut size = measured_size(current.id, axis, nodes, breakpoint, sizes, text)?;
     while let Some((parent, child)) = pending.pop() {
         let flow = parent.layout.flow.as_ref().expect("flow parent");
-        let inner = (width - flow.padding.left - flow.padding.right).max(0.0);
-        width = if matches!(flow.direction, FlowDirection::Column) {
+        let padding = match axis {
+            Axis::Horizontal => flow.padding.left + flow.padding.right,
+            Axis::Vertical => flow.padding.top + flow.padding.bottom,
+        };
+        let inner = (size - padding).max(0.0);
+        let cross = matches!(
+            (flow.direction, axis),
+            (FlowDirection::Column, Axis::Horizontal) | (FlowDirection::Row, Axis::Vertical)
+        );
+        size = if cross {
             inner
         } else {
             let mut occupied = flow.gap * parent.children.len().saturating_sub(1) as f64;
             let mut fills = 0usize;
             for sibling in &parent.children {
                 if matches!(
-                    dimension(nodes[sibling], Axis::Horizontal, breakpoint).1,
+                    dimension(nodes[sibling], axis, breakpoint, text)?.1,
                     Some(SizeMode::Fill)
                 ) {
                     fills += 1;
                 } else {
-                    occupied +=
-                        measured_size(*sibling, Axis::Horizontal, nodes, breakpoint, sizes, text)?;
+                    occupied += measured_size(*sibling, axis, nodes, breakpoint, sizes, text)?;
                 }
             }
             if fills == 0 || !occupied.is_finite() {
                 return Err(CoreError::invalid(format!(
-                    "Invalid fill width on node {}",
+                    "Invalid fill size on node {}",
                     child.id
                 )));
             }
             (inner - occupied).max(0.0) / fills as f64
         };
     }
-    Ok(width)
+    Ok(size)
 }
 
 // CSS flex subset: fixed/hug items do not shrink; fill is flex: 1 1 0 with
@@ -202,7 +398,7 @@ fn flow_child(
     nodes: &HashMap<Uuid, &Node>,
     breakpoint: Option<f64>,
     sizes: &mut HashMap<(Uuid, Axis), f64>,
-    text: &mut TextEngine<'_>,
+    text: &mut LayoutContext<'_>,
 ) -> Result<((f64, f64), (f64, f64))> {
     let flow = parent.layout.flow.as_ref().expect("flow parent");
     let row = matches!(flow.direction, FlowDirection::Row);
@@ -244,7 +440,7 @@ fn flow_child(
     let mut fills = 0usize;
     for id in &parent.children {
         if matches!(
-            dimension(nodes[id], main_axis, breakpoint).1,
+            dimension(nodes[id], main_axis, breakpoint, text)?.1,
             Some(SizeMode::Fill)
         ) {
             fills += 1;
@@ -271,7 +467,7 @@ fn flow_child(
             break;
         }
         main_position += if matches!(
-            dimension(nodes[id], main_axis, breakpoint).1,
+            dimension(nodes[id], main_axis, breakpoint, text)?.1,
             Some(SizeMode::Fill)
         ) {
             fill
@@ -280,14 +476,14 @@ fn flow_child(
         } + flow.gap;
     }
     let child_main = if matches!(
-        dimension(child, main_axis, breakpoint).1,
+        dimension(child, main_axis, breakpoint, text)?.1,
         Some(SizeMode::Fill)
     ) {
         fill
     } else {
         measured_size(child.id, main_axis, nodes, breakpoint, sizes, text)?
     };
-    let cross_mode = dimension(child, cross_axis, breakpoint).1;
+    let cross_mode = dimension(child, cross_axis, breakpoint, text)?.1;
     let child_cross = if matches!(cross_mode, Some(SizeMode::Fill))
         || (cross_mode.is_none() && matches!(flow.align, Alignment::Stretch))
     {
@@ -412,9 +608,9 @@ impl Document {
         }
         chain.reverse();
         let root = chain[0];
-        let mut offset = position(root, breakpoint);
         let mut sizes = HashMap::new();
-        let mut text = TextEngine::new(self, project_path);
+        let mut text = LayoutContext::new(self, project_path);
+        let mut offset = position(root, breakpoint, &text)?;
         let mut size = if chain.len() > 1 && root.layout.flow.is_some() {
             (
                 measured_size(
@@ -446,7 +642,7 @@ impl Document {
                 )?
             } else {
                 (
-                    position(child, breakpoint),
+                    position(child, breakpoint, &text)?,
                     if index + 2 < chain.len() && child.layout.flow.is_some() {
                         (
                             measured_size(

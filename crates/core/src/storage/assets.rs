@@ -8,7 +8,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use image::{ImageFormat, ImageReader};
+use image::{metadata::Orientation, ImageDecoder, ImageFormat, ImageReader};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -152,6 +152,62 @@ pub(crate) fn font_asset(root: &Path, relative: &str) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+pub(crate) fn image_dimensions(root: &Path, relative: &str) -> Result<(u32, u32)> {
+    let path = super::safe_path(root, relative)?;
+    let bytes = read_bounded(&path).map_err(|error| {
+        if !path.exists() {
+            CoreError::new("MISSING_ASSET", format!("Missing image asset {relative}"))
+        } else {
+            error
+        }
+    })?;
+    let expected = relative
+        .strip_prefix("assets/")
+        .and_then(|name| name.split_once('.'))
+        .map(|(digest, _)| digest)
+        .ok_or_else(|| CoreError::invalid("Invalid image asset path"))?;
+    if super::hash(&bytes) != expected {
+        return Err(CoreError::conflict(format!(
+            "Image asset changed: {relative}"
+        )));
+    }
+    let format = image::guess_format(&bytes).map_err(|_| {
+        CoreError::unsupported(format!("Intrinsic image size is unavailable: {relative}"))
+    })?;
+    if !matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
+    ) {
+        return Err(CoreError::unsupported(format!(
+            "Intrinsic image size is unavailable: {relative}"
+        )));
+    }
+    let mut decoder = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_decoder()
+        .map_err(image_error)?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(CoreError::invalid("Image dimensions must be positive"));
+    }
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(CoreError::import_limit(
+            "Image dimensions exceed the supported limit of 64 Mi pixels",
+        ));
+    }
+    let orientation = decoder.orientation().map_err(image_error)?;
+    if matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    ) {
+        Ok((height, width))
+    } else {
+        Ok((width, height))
+    }
 }
 
 fn read_asset(path: &Path) -> Result<(Vec<u8>, &'static str)> {

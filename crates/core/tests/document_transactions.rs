@@ -1801,3 +1801,902 @@ fn text_hug_collection_requires_a_family_and_never_uses_unselected_faces() {
     f.set(f.text, "/content/text", json!("🇪🇨"));
     assert_eq!(error(), "MISSING_GLYPH");
 }
+
+#[test]
+fn user_edits_are_protected_until_explicitly_unlocked() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "User protection").unwrap();
+    let root = root(&session);
+    let edit = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "User"}]),
+    );
+    session.apply_transaction(&edit.to_string()).unwrap();
+    session.save().unwrap();
+    drop(session);
+
+    let session = open_project(&path).unwrap();
+    let before = snapshot(&session);
+    assert_eq!(
+        before["document"]["nodes"][0]["propertyMeta"]["/name"]["agentLocked"],
+        true
+    );
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "Agent"}]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+
+    let unlock = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/propertyMeta/~1name/agentLocked", "value": false}]),
+    );
+    session.apply_transaction(&unlock.to_string()).unwrap();
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "Agent"}]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    assert_eq!(snapshot(&session)["document"]["nodes"][0]["name"], "Agent");
+}
+
+#[test]
+fn undo_and_redo_of_user_edits_keep_restored_values_protected() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Undo protection").unwrap();
+    let root = root(&session);
+    let edit = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "User"}]),
+    );
+    session.apply_transaction(&edit.to_string()).unwrap();
+    for redo in [false, true] {
+        if redo {
+            session.redo().unwrap();
+        } else {
+            session.undo().unwrap();
+        }
+        let before = snapshot(&session);
+        let mut agent = transaction(
+            &session,
+            &[root],
+            json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "Agent"}]),
+        );
+        agent["origin"] = json!("agent");
+        assert_eq!(
+            session
+                .apply_transaction(&agent.to_string())
+                .unwrap_err()
+                .code,
+            "LOCKED_PROPERTY"
+        );
+        assert_eq!(snapshot(&session), before);
+    }
+}
+
+#[test]
+fn vector_primitives_round_trip_and_invalid_geometry_is_atomic() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Vector primitives").unwrap();
+    let root = root(&session);
+    let vector_id = Uuid::new_v4();
+    let shapes = json!([
+        {"type": "rect", "x": 1.0, "y": 2.0, "w": 30.0, "h": 40.0, "rx": 2.0, "ry": 3.0},
+        {"type": "circle", "cx": 5.0, "cy": 6.0, "r": 4.0},
+        {"type": "ellipse", "cx": 7.0, "cy": 8.0, "rx": 4.0, "ry": 2.0},
+        {"type": "line", "x1": 0.0, "y1": 1.0, "x2": 3.0, "y2": 4.0},
+        {"type": "polyline", "points": [{"x": 0.0, "y": 1.0}, {"x": 2.0, "y": 3.0}]},
+        {"type": "polygon", "points": [{"x": 0.0, "y": 0.0}, {"x": 3.0, "y": 0.0}, {"x": 1.0, "y": 2.0}]}
+    ]);
+    let mut vector = node(vector_id, root, "vector");
+    vector["content"]["vector"] = json!({"paths": [[{"type": "moveTo", "x": 0, "y": 0},
+        {"type": "lineTo", "x": 1, "y": 1}]], "shapes": shapes.clone()});
+    let insert = transaction(
+        &session,
+        &[root, vector_id],
+        json!([{"type": "insertNode", "parentId": root, "index": 0, "node": vector}]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    session.save().unwrap();
+    drop(session);
+
+    let session = open_project(&path).unwrap();
+    let before = snapshot(&session);
+    assert_eq!(
+        before["document"]["nodes"][1]["content"]["vector"]["shapes"],
+        shapes
+    );
+    let invalid = transaction(
+        &session,
+        &[vector_id],
+        json!([{"type": "setProperty", "nodeId": vector_id, "path": "/content/vector",
+            "value": {"paths": [], "shapes": [{"type": "rect", "x": 0, "y": 0, "w": -1, "h": 1}]}}]),
+    );
+    assert_eq!(
+        session
+            .apply_transaction(&invalid.to_string())
+            .unwrap_err()
+            .code,
+        "INVALID_DOCUMENT"
+    );
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn unknown_vector_shapes_remain_read_only_and_are_not_rewritten() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Unknown vector").unwrap();
+    let mut document = snapshot(&session)["document"].clone();
+    let root = root(&session);
+    drop(session);
+    let vector_id = Uuid::new_v4();
+    let mut vector = node(vector_id, root, "vector");
+    vector["content"]["vector"] = json!({
+        "paths": [],
+        "shapes": [{"type": "futureStar", "points": [1, 2, 3], "extra": {"keep": true}}]
+    });
+    document["nodes"][0]["children"] = json!([vector_id]);
+    document["nodes"].as_array_mut().unwrap().push(vector);
+    write_document_fixture(&path, &document);
+    let original = std::fs::read(path.join("document.json")).unwrap();
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(snapshot(&reopened)["readOnly"], true);
+    assert_eq!(snapshot(&reopened)["document"], document);
+    assert!(reopened.save().is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), original);
+}
+
+#[test]
+fn unknown_polygon_point_fields_remain_read_only_and_are_not_rewritten() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Extended vector").unwrap();
+    let mut document = snapshot(&session)["document"].clone();
+    let root = root(&session);
+    drop(session);
+    let vector_id = Uuid::new_v4();
+    let mut vector = node(vector_id, root, "vector");
+    vector["content"]["vector"] = json!({
+        "paths": [],
+        "shapes": [{"type": "polygon", "points": [
+            {"x": 0, "y": 0, "futurePressure": 0.5}, {"x": 1, "y": 0}, {"x": 0, "y": 1}
+        ]}]
+    });
+    document["nodes"][0]["children"] = json!([vector_id]);
+    document["nodes"].as_array_mut().unwrap().push(vector);
+    write_document_fixture(&path, &document);
+    let original = std::fs::read(path.join("document.json")).unwrap();
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(snapshot(&reopened)["readOnly"], true);
+    assert_eq!(snapshot(&reopened)["document"], document);
+    assert!(reopened.save().is_err());
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), original);
+}
+
+#[test]
+fn undo_restores_an_explicit_ancestor_lock_alongside_child_edits() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Ancestor lock").unwrap();
+    let root = root(&session);
+    let lock = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root,
+            "path": "/propertyMeta/~1layout/agentLocked", "value": true}]),
+    );
+    session.apply_transaction(&lock.to_string()).unwrap();
+    let unlock_and_edit = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root,
+                "path": "/propertyMeta/~1layout/agentLocked", "value": false},
+            {"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 700}
+        ]),
+    );
+    session
+        .apply_transaction(&unlock_and_edit.to_string())
+        .unwrap();
+    session.undo().unwrap();
+    let before = snapshot(&session);
+    assert_eq!(
+        before["document"]["nodes"][0]["propertyMeta"]["/layout"]["agentLocked"],
+        true
+    );
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/layout/h", "value": 700}]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn redo_restores_an_explicit_unlock_in_the_same_batch_as_a_value_edit() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Explicit unlock").unwrap();
+    let root = root(&session);
+    let edit_and_unlock = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 700},
+            {"type": "setProperty", "nodeId": root,
+                "path": "/propertyMeta/~1layout~1w/agentLocked", "value": false}
+        ]),
+    );
+    session
+        .apply_transaction(&edit_and_unlock.to_string())
+        .unwrap();
+    session.undo().unwrap();
+    session.redo().unwrap();
+    let after = snapshot(&session);
+    assert_eq!(
+        after["document"]["nodes"][0]["propertyMeta"]["/layout/w"]["agentLocked"],
+        false
+    );
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/layout/w", "value": 800}]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    assert_eq!(
+        snapshot(&session)["document"]["nodes"][0]["layout"]["w"],
+        800.0
+    );
+}
+
+#[test]
+fn undo_of_user_edit_protects_an_earlier_agent_value() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Undo agent value").unwrap();
+    let root = root(&session);
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "Agent"}]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    let user = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "User"}]),
+    );
+    session.apply_transaction(&user.to_string()).unwrap();
+    session.undo().unwrap();
+    let before = snapshot(&session);
+    assert_eq!(before["document"]["nodes"][0]["name"], "Agent");
+    assert_eq!(
+        before["document"]["nodes"][0]["propertyMeta"]["/name"]["agentLocked"],
+        true
+    );
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/name", "value": "Overwrite"}]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn raster_hug_uses_intrinsic_ratio_and_explicit_breakpoints() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let source = temp.path().join("image.png");
+    image::RgbaImage::new(40, 20).save(&source).unwrap();
+    let session = create_project(&path, "Image hug").unwrap();
+    let asset: Value = serde_json::from_str(&session.import_asset(&source).unwrap()).unwrap();
+    let root = root(&session);
+    let image_id = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut image = node(image_id, root, "image");
+    image["content"]["assetId"] = asset["id"].clone();
+    image["layout"] = json!({
+        "x": 0, "y": 0, "w": 100, "h": 50, "widthMode": "hug", "heightMode": "hug"
+    });
+    image["responsive"] = json!([{"breakpoint": 500, "w": 80}]);
+    let row = json!({"direction":"row","gap":0,
+        "padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"});
+    let insert = transaction(
+        &session,
+        &[root, image_id, marker],
+        json!([
+            {"type":"setViewport","nodeId":root,"width":300,"height":100},
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":row},
+            {"type":"insertNode","parentId":root,"index":0,"node":image},
+            {"type":"insertNode","parentId":root,"index":1,"node":node(marker, root, "group")}
+        ]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    let point = |breakpoint: Option<f64>| -> Value {
+        let value = if let Some(width) = breakpoint {
+            session.transform_point_at_breakpoint_json(
+                &marker.to_string(),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                false,
+                false,
+                width,
+            )
+        } else {
+            session.transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+        };
+        serde_json::from_str(&value.unwrap()).unwrap()
+    };
+    assert_eq!(point(None)["x"], 40.0);
+    assert_eq!(point(Some(500.0))["x"], 80.0);
+    assert_eq!(point(None)["x"], 40.0);
+    let fixed = transaction(
+        &session,
+        &[image_id],
+        json!([
+            {"type":"setProperty","nodeId":image_id,"path":"/layout/heightMode","value":"fixed"}
+        ]),
+    );
+    session.apply_transaction(&fixed.to_string()).unwrap();
+    assert_eq!(point(None)["x"], 100.0);
+    let height = Uuid::new_v4();
+    let bound = transaction(
+        &session,
+        &[image_id],
+        json!([
+            {"type":"setToken","token":{"id":height,"name":"Height","value":100}},
+            {"type":"setBinding","nodeId":image_id,"path":"/layout/h","binding":{"type":"token","tokenId":height}}
+        ]),
+    );
+    session.apply_transaction(&bound.to_string()).unwrap();
+    assert_eq!(point(None)["x"], 200.0);
+    let ambiguous = transaction(
+        &session,
+        &[image_id],
+        json!([
+            {"type":"setBinding","nodeId":image_id,"path":"/layout/w","binding":{"type":"token","tokenId":height}}
+        ]),
+    );
+    session.apply_transaction(&ambiguous.to_string()).unwrap();
+    assert_eq!(
+        session
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code,
+        "UNSUPPORTED_FEATURE"
+    );
+    let unbind = transaction(
+        &session,
+        &[image_id],
+        json!([
+            {"type":"setBinding","nodeId":image_id,"path":"/layout/w","binding":null},
+            {"type":"setBinding","nodeId":image_id,"path":"/layout/h","binding":null}
+        ]),
+    );
+    session.apply_transaction(&unbind.to_string()).unwrap();
+    let fill = transaction(
+        &session,
+        &[image_id],
+        json!([
+            {"type":"setProperty","nodeId":image_id,"path":"/layout/heightMode","value":"fill"}
+        ]),
+    );
+    session.apply_transaction(&fill.to_string()).unwrap();
+    assert_eq!(point(None)["x"], 200.0);
+    let column = transaction(
+        &session,
+        &[root, image_id],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":{
+                "direction":"column","gap":0,
+                "padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"}},
+            {"type":"setProperty","nodeId":image_id,"path":"/layout/widthMode","value":"fill"},
+            {"type":"setProperty","nodeId":image_id,"path":"/layout/heightMode","value":"hug"}
+        ]),
+    );
+    session.apply_transaction(&column.to_string()).unwrap();
+    assert_eq!(point(None)["y"], 150.0);
+    std::fs::write(
+        path.join(asset["path"].as_str().unwrap()),
+        b"external change",
+    )
+    .unwrap();
+    assert_eq!(
+        session
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+}
+
+#[test]
+fn raster_hug_respects_exif_orientation() {
+    use image::ImageEncoder;
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("rotated.jpg");
+    let mut jpeg = Vec::new();
+    {
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg);
+        encoder
+            .set_exif_metadata(vec![
+                b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0,
+                0, 0, 0,
+            ])
+            .unwrap();
+        encoder.encode_image(&image::RgbImage::new(40, 20)).unwrap();
+    }
+    std::fs::write(&source, jpeg).unwrap();
+    let session = create_project(temp.path().join("project"), "Rotated image").unwrap();
+    let asset: Value = serde_json::from_str(&session.import_asset(&source).unwrap()).unwrap();
+    let root = root(&session);
+    let image_id = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut image = node(image_id, root, "image");
+    image["content"]["assetId"] = asset["id"].clone();
+    image["layout"]["widthMode"] = json!("hug");
+    image["layout"]["heightMode"] = json!("hug");
+    let insert = transaction(
+        &session,
+        &[root, image_id, marker],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":{
+                "direction":"row","gap":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"}},
+            {"type":"insertNode","parentId":root,"index":0,"node":image},
+            {"type":"insertNode","parentId":root,"index":1,"node":node(marker, root, "group")}
+        ]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    let point: Value = serde_json::from_str(
+        &session
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(point["x"], 20.0);
+}
+
+#[test]
+fn cross_axis_hug_fill_cycle_is_reported_without_recursing_forever() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("image.png");
+    image::RgbaImage::new(40, 20).save(&source).unwrap();
+    let session = create_project(temp.path().join("project"), "Cyclic sizing").unwrap();
+    let asset: Value = serde_json::from_str(&session.import_asset(&source).unwrap()).unwrap();
+    let root = root(&session);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut first_image = node(first, root, "image");
+    first_image["content"]["assetId"] = asset["id"].clone();
+    first_image["layout"]["widthMode"] = json!("hug");
+    first_image["layout"]["heightMode"] = json!("fill");
+    let mut second_image = node(second, root, "image");
+    second_image["content"]["assetId"] = asset["id"].clone();
+    second_image["layout"]["widthMode"] = json!("fill");
+    second_image["layout"]["heightMode"] = json!("hug");
+    let tx = transaction(
+        &session,
+        &[root, first, second],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/heightMode","value":"hug"},
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":{
+                "direction":"row","gap":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"}},
+            {"type":"insertNode","parentId":root,"index":0,"node":first_image},
+            {"type":"insertNode","parentId":root,"index":1,"node":second_image}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let error = session
+        .transform_point_json(&second.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+        .unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_FEATURE");
+}
+
+#[test]
+fn bound_layout_values_are_used_for_flow_and_breakpoint_geometry() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Bound geometry").unwrap();
+    let root = root(&session);
+    let first = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let token = Uuid::new_v4();
+    let mut first_node = node(first, root, "group");
+    first_node["responsive"] = json!([{"breakpoint": 500, "w": 50}]);
+    let tx = transaction(
+        &session,
+        &[root, first, marker],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":{
+                "direction":"row","gap":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"}},
+            {"type":"insertNode","parentId":root,"index":0,"node":first_node},
+            {"type":"insertNode","parentId":root,"index":1,"node":node(marker, root, "group")},
+            {"type":"setToken","token":{"id":token,"name":"Width","value":123}},
+            {"type":"setBinding","nodeId":first,"path":"/layout/w","binding":{"type":"token","tokenId":token}}
+        ]),
+    );
+    session.apply_transaction(&tx.to_string()).unwrap();
+    let point = |breakpoint: Option<f64>| -> Value {
+        let result = if let Some(width) = breakpoint {
+            session.transform_point_at_breakpoint_json(
+                &marker.to_string(),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                false,
+                false,
+                width,
+            )
+        } else {
+            session.transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+        };
+        serde_json::from_str(&result.unwrap()).unwrap()
+    };
+    assert_eq!(point(None)["x"], 123.0);
+    assert_eq!(point(Some(500.0))["x"], 50.0);
+    let update = transaction(
+        &session,
+        &[first],
+        json!([
+            {"type":"setToken","token":{"id":token,"name":"Width","value":80}}
+        ]),
+    );
+    session.apply_transaction(&update.to_string()).unwrap();
+    assert_eq!(point(None)["x"], 80.0);
+    let invalid = transaction(
+        &session,
+        &[first],
+        json!([
+            {"type":"setToken","token":{"id":token,"name":"Width","value":-1}}
+        ]),
+    );
+    let before_invalid = snapshot(&session);
+    assert_eq!(
+        session
+            .apply_transaction(&invalid.to_string())
+            .unwrap_err()
+            .code,
+        "INVALID_DOCUMENT"
+    );
+    assert_eq!(snapshot(&session), before_invalid);
+    assert_eq!(point(None)["x"], 80.0);
+    assert_eq!(point(Some(500.0))["x"], 50.0);
+    let absolute = transaction(
+        &session,
+        &[root, first, marker],
+        json!([
+            {"type":"setToken","token":{"id":token,"name":"Width","value":80}},
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":null},
+            {"type":"setBinding","nodeId":marker,"path":"/layout/x","binding":{"type":"token","tokenId":token}}
+        ]),
+    );
+    session.apply_transaction(&absolute.to_string()).unwrap();
+    assert_eq!(point(None)["x"], 80.0);
+}
+
+#[test]
+fn undo_restores_explicit_unlock_when_both_history_states_were_unlocked() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Historical unlock").unwrap();
+    let root = root(&session);
+    for width in [700, 800] {
+        let edit = transaction(
+            &session,
+            &[root],
+            json!([
+                {"type":"setProperty","nodeId":root,"path":"/layout/w","value":width},
+                {"type":"setProperty","nodeId":root,"path":"/propertyMeta/~1layout~1w/agentLocked","value":false}
+            ]),
+        );
+        session.apply_transaction(&edit.to_string()).unwrap();
+    }
+    session.undo().unwrap();
+    let before = snapshot(&session);
+    assert_eq!(before["document"]["nodes"][0]["layout"]["w"], 700.0);
+    assert_eq!(
+        before["document"]["nodes"][0]["propertyMeta"]["/layout/w"]["agentLocked"],
+        false
+    );
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/w","value":701}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+}
+
+#[test]
+fn undoing_user_removal_protects_restored_agent_node_unless_explicitly_unlocked() {
+    for explicit_unlock in [false, true] {
+        let temp = tempdir().unwrap();
+        let session = create_project(temp.path().join("project"), "Restored node").unwrap();
+        let root = root(&session);
+        let child = Uuid::new_v4();
+        let mut insert = transaction(
+            &session,
+            &[root, child],
+            json!([
+                {"type":"insertNode","parentId":root,"index":0,"node":node(child, root, "group")}
+            ]),
+        );
+        insert["origin"] = json!("agent");
+        session.apply_transaction(&insert.to_string()).unwrap();
+        if explicit_unlock {
+            let unlock = transaction(
+                &session,
+                &[child],
+                json!([
+                    {"type":"setProperty","nodeId":child,"path":"/propertyMeta/~1name/agentLocked","value":false}
+                ]),
+            );
+            session.apply_transaction(&unlock.to_string()).unwrap();
+        }
+        let remove = transaction(
+            &session,
+            &[root, child],
+            json!([
+                {"type":"removeNode","nodeId":child}
+            ]),
+        );
+        session.apply_transaction(&remove.to_string()).unwrap();
+        session.undo().unwrap();
+        let before = snapshot(&session);
+        let mut agent = transaction(
+            &session,
+            &[child],
+            json!([
+                {"type":"setProperty","nodeId":child,"path":"/name","value":"Agent override"}
+            ]),
+        );
+        agent["origin"] = json!("agent");
+        let result = session.apply_transaction(&agent.to_string());
+        if explicit_unlock {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, "LOCKED_PROPERTY");
+            assert_eq!(snapshot(&session), before);
+        }
+    }
+}
+
+#[test]
+fn static_variable_binding_sets_absolute_position() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Variable geometry").unwrap());
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let variable = Uuid::new_v4();
+    document["variables"] = json!([{"id":variable,"name":"Offset","value":-20}]);
+    document["nodes"][0]["bindings"]["/layout/x"] =
+        json!({"type":"variable","variableId":variable});
+    write_document_fixture(&path, &document);
+    let session = open_project(&path).unwrap();
+    let root = root(&session);
+    let point: Value = serde_json::from_str(
+        &session
+            .transform_point_json(&root.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(point["x"], -20.0);
+}
+
+#[test]
+fn checkpoint_restore_does_not_mistake_missing_ancestor_lock_for_explicit_unlock() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Checkpoint protection").unwrap();
+    let root = root(&session);
+    let checkpoint = session.create_checkpoint().unwrap();
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/w","value":700}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    session.save().unwrap();
+    let lock = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/propertyMeta/~1layout/agentLocked","value":true}
+        ]),
+    );
+    session.apply_transaction(&lock.to_string()).unwrap();
+    session.save().unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
+    let before = snapshot(&session);
+    assert_eq!(before["document"]["nodes"][0]["layout"]["w"], 1440.0);
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/w","value":800}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+    assert!(before["document"]["nodes"][0]["propertyMeta"]["/layout"].is_null());
+    let second = session.create_checkpoint().unwrap();
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/h","value":500}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    session.save().unwrap();
+    session.restore_checkpoint(&second).unwrap();
+    let before = snapshot(&session);
+    assert_eq!(before["document"]["nodes"][0]["layout"]["h"], 900.0);
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/h","value":600}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn checkpoint_restore_removes_later_explicit_unlock_absent_from_target() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Rewind unlock").unwrap();
+    let root = root(&session);
+    let checkpoint = session.create_checkpoint().unwrap();
+    let unlock = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/propertyMeta/~1layout/agentLocked","value":false}
+        ]),
+    );
+    session.apply_transaction(&unlock.to_string()).unwrap();
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/w","value":700}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    session.apply_transaction(&agent.to_string()).unwrap();
+    session.save().unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
+    let before = snapshot(&session);
+    assert!(before["document"]["nodes"][0]["propertyMeta"]["/layout"].is_null());
+    let mut agent = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/w","value":800}
+        ]),
+    );
+    agent["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&agent.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn historical_invalid_bound_size_opens_without_rewriting_and_can_be_repaired() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Legacy binding").unwrap());
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = Uuid::parse_str(document["nodes"][0]["id"].as_str().unwrap()).unwrap();
+    let child = Uuid::new_v4();
+    let token = Uuid::new_v4();
+    document["tokens"] = json!([{"id":token,"name":"Width","value":-1}]);
+    document["nodes"][0]["bindings"]["/layout/w"] = json!({"type":"token","tokenId":token});
+    document["nodes"][0]["layout"]["flow"] = json!({
+        "direction":"row","gap":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"
+    });
+    document["nodes"][0]["responsive"] = json!([{"breakpoint":500,"w":300}]);
+    document["nodes"][0]["children"] = json!([child]);
+    document["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(node(child, root, "group"));
+    write_document_fixture(&path, &document);
+    let original = std::fs::read(path.join("document.json")).unwrap();
+    let session = open_project(&path).unwrap();
+    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), original);
+    assert_eq!(
+        session
+            .transform_point_json(&child.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+            .unwrap_err()
+            .code,
+        "INVALID_DOCUMENT"
+    );
+    session
+        .transform_point_at_breakpoint_json(
+            &child.to_string(),
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            500.0,
+        )
+        .unwrap();
+    let repair = transaction(
+        &session,
+        &[root],
+        json!([
+            {"type":"setToken","token":{"id":token,"name":"Width","value":300}}
+        ]),
+    );
+    session.apply_transaction(&repair.to_string()).unwrap();
+    session
+        .transform_point_json(&child.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+        .unwrap();
+}

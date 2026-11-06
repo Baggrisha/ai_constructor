@@ -23,7 +23,7 @@ mod recovery_choice;
 pub(crate) mod retention;
 mod services;
 
-pub(crate) use assets::font_asset;
+pub(crate) use assets::{font_asset, image_dimensions};
 pub(crate) use diagnostics::capture_external;
 pub(crate) use services::rewrite_chats;
 const EXTERNAL_CHANGE_REASON: &str =
@@ -1022,21 +1022,250 @@ pub fn validate_current(root: &Path, expected_manifest: &[u8]) -> Result<()> {
 }
 
 pub fn snapshot_inputs(root: &Path, expected_manifest: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
-    snapshot_selected(root, expected_manifest, false)
+    Ok(snapshot_selected(root, expected_manifest, false)?.files)
 }
 
-pub fn snapshot_all_inputs(
+pub(super) struct DuplicateSnapshot {
+    pub(super) files: BTreeMap<String, Vec<u8>>,
+    pub(super) blocked_generated: BTreeMap<String, String>,
+}
+
+pub(super) fn snapshot_all_inputs(
     root: &Path,
     expected_manifest: &[u8],
-) -> Result<BTreeMap<String, Vec<u8>>> {
+) -> Result<DuplicateSnapshot> {
     snapshot_selected(root, expected_manifest, true)
+}
+
+fn portable_conflict_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
+    let directory = safe_path(root, "conflicts")?;
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(CoreError::invalid(
+                "Conflict directory is not a real directory",
+            ))
+        }
+    }
+    let mut result = BTreeMap::new();
+    for entry in WalkDir::new(directory).min_depth(1).follow_links(false) {
+        control::check()?;
+        let entry = entry.map_err(|error| CoreError::io(error.to_string()))?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(CoreError::invalid(
+                "Conflict archive contains a non-regular file",
+            ));
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| CoreError::invalid(error.to_string()))?
+            .to_str()
+            .ok_or_else(|| CoreError::invalid("Non-UTF-8 conflict path"))?;
+        result.insert(relative.to_owned(), hash_file(entry.path())?);
+    }
+    Ok(result)
+}
+
+fn check_portable_conflicts(
+    root: &Path,
+    state: &crate::State,
+    observed: &BTreeMap<String, String>,
+) -> Result<()> {
+    let (_, conflicts) = conflicts::external_diagnostics(
+        root,
+        state,
+        observed,
+        Some(state.manifest_bytes.as_slice()),
+    )?;
+    if !conflicts.is_empty() {
+        return Err(CoreError::conflict(
+            "Resolve preserved conflicts before creating a snapshot",
+        ));
+    }
+    if !conflicts::blocked_generated(root, &state.manifest)?.is_empty() {
+        return Err(CoreError::conflict(
+            "A generated file has an unresolved external change; its protection cannot be transferred",
+        ));
+    }
+    Ok(())
+}
+
+fn archive_portable_mismatch(root: &Path, state: &crate::State) -> Result<()> {
+    let observed = scan(root)?;
+    let marker = file_bytes(root, "project.json")?;
+    conflicts::external_diagnostics(root, state, &observed, marker.as_deref())?;
+    Ok(())
+}
+
+fn copy_portable_file(root: &Path, stage: &Path, path: &str, expected: &str) -> Result<()> {
+    let source = safe_path(root, path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut input = options.open(&source).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::conflict(format!("Missing {path}"))
+        } else {
+            error.into()
+        }
+    })?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() {
+        return Err(CoreError::invalid(format!(
+            "Snapshot source is not a regular file: {path}"
+        )));
+    }
+    let destination = safe_path(stage, path)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| CoreError::invalid("Invalid snapshot path"))?;
+    create_destination_parent(stage, parent)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        control::check()?;
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+    }
+    if format!("{:x}", digest.finalize()) != expected {
+        return Err(CoreError::conflict(format!("External edit of {path}")));
+    }
+    #[cfg(unix)]
+    if path.starts_with("src/") || path.starts_with("assets/") {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o111;
+        if checkpoint_executable_mode(root, path)? != mode {
+            return Err(CoreError::conflict(format!(
+                "File mode changed while copying {path}"
+            )));
+        }
+        let mut permissions = output.metadata()?.permissions();
+        permissions.set_mode((permissions.mode() & !0o111) | mode);
+        output.set_permissions(permissions)?;
+    }
+    control::check()?;
+    output.sync_all()?;
+    sync_dir(parent)
+}
+
+pub(super) fn write_portable_snapshot(
+    root: &Path,
+    stage: &Path,
+    state: &crate::State,
+) -> Result<()> {
+    let _lock = lock(root)?;
+    if recover(root)?.is_some() {
+        return Err(CoreError::conflict("Project requires recovery"));
+    }
+    let observed = scan(root)?;
+    if observed != state.manifest.files
+        || file_bytes(root, "project.json")?.as_deref() != Some(state.manifest_bytes.as_slice())
+    {
+        archive_portable_mismatch(root, state)?;
+        return Err(CoreError::conflict(
+            "Project changed while making a snapshot",
+        ));
+    }
+    check_portable_conflicts(root, state, &observed)?;
+    let conflict_hashes = portable_conflict_hashes(root)?;
+    for directory in [
+        "src/user",
+        "src/generated",
+        "assets",
+        "chats",
+        "agent/runs",
+        "agent/proposals",
+        "history/transactions",
+        "checkpoints",
+        "conflicts",
+    ] {
+        control::check()?;
+        let destination = safe_path(stage, directory)?;
+        create_destination_parent(stage, &destination)?;
+        sync_dir(&destination)?;
+    }
+    for (path, expected) in &state.manifest.files {
+        if let Err(error) = copy_portable_file(root, stage, path, expected) {
+            if error.code == "REVISION_CONFLICT" {
+                archive_portable_mismatch(root, state)?;
+            }
+            return Err(error);
+        }
+    }
+    for (path, expected) in &conflict_hashes {
+        copy_portable_file(root, stage, path, expected)?;
+    }
+    if scan(root)? != observed
+        || file_bytes(root, "project.json")?.as_deref() != Some(state.manifest_bytes.as_slice())
+    {
+        archive_portable_mismatch(root, state)?;
+        return Err(CoreError::conflict(
+            "Project changed while making a snapshot",
+        ));
+    }
+    check_portable_conflicts(root, state, &observed)?;
+    if portable_conflict_hashes(root)? != conflict_hashes {
+        return Err(CoreError::conflict(
+            "Conflict archives changed while making a snapshot",
+        ));
+    }
+    durable_write(&stage.join("project.json"), &state.manifest_bytes)?;
+    sync_dir(stage)
+}
+
+pub(super) fn write_duplicate_safety(
+    root: &Path,
+    archives: &BTreeMap<String, Vec<u8>>,
+    blocked: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (path, bytes) in archives {
+        control::check()?;
+        if !path.starts_with("conflicts/") {
+            return Err(CoreError::invalid("Invalid conflict archive path"));
+        }
+        let destination = safe_path(root, path)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| CoreError::invalid("Invalid archive path"))?;
+        create_destination_parent(root, parent)?;
+        durable_write(&destination, bytes)?;
+        sync_dir(parent)?;
+    }
+    for (path, expected) in blocked {
+        control::check()?;
+        if hash_file(&safe_path(root, path)?)? != *expected {
+            return Err(CoreError::conflict(format!(
+                "Generated source changed in duplicate: {path}"
+            )));
+        }
+        conflicts::write_generated_block(root, path, expected)?;
+    }
+    Ok(())
 }
 
 fn snapshot_selected(
     root: &Path,
     expected_manifest: &[u8],
     all: bool,
-) -> Result<BTreeMap<String, Vec<u8>>> {
+) -> Result<DuplicateSnapshot> {
     let _lock = lock(root)?;
     if recover(root)?.is_some() {
         return Err(CoreError::conflict("Project requires recovery"));
@@ -1049,17 +1278,28 @@ fn snapshot_selected(
     if scan(root)? != manifest.files {
         return Err(CoreError::conflict("Project files changed on disk"));
     }
+    let conflict_hashes = if all {
+        portable_conflict_hashes(root)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut blocked_generated = BTreeMap::new();
+    if all {
+        for path in conflicts::blocked_generated(root, &manifest)? {
+            let digest = manifest
+                .files
+                .get(&path)
+                .ok_or_else(|| CoreError::invalid("Missing blocked generated file"))?;
+            blocked_generated.insert(path, digest.clone());
+        }
+    }
     let mut result = BTreeMap::new();
     for (path, expected) in &manifest.files {
-        if path == "document.json"
+        if all
+            || path == "document.json"
             || path.starts_with("src/user/")
             || path.starts_with("src/generated/")
             || path.starts_with("assets/")
-            || (all
-                && (path == ".gitignore"
-                    || path.starts_with("chats/")
-                    || path.starts_with("agent/")
-                    || path.starts_with("checkpoints/")))
         {
             let bytes = file_bytes(root, path)?
                 .ok_or_else(|| CoreError::conflict(format!("Missing {path}")))?;
@@ -1069,12 +1309,39 @@ fn snapshot_selected(
             result.insert(path.clone(), bytes);
         }
     }
+    for (path, expected) in &conflict_hashes {
+        let bytes = file_bytes(root, path)?
+            .ok_or_else(|| CoreError::conflict(format!("Missing conflict archive {path}")))?;
+        if hash(&bytes) != *expected {
+            return Err(CoreError::conflict(format!(
+                "Conflict archive changed: {path}"
+            )));
+        }
+        result.insert(path.clone(), bytes);
+    }
     if scan(root)? != manifest.files || fs::read(root.join("project.json"))? != expected_manifest {
         return Err(CoreError::conflict(
             "Project changed while making a snapshot",
         ));
     }
-    Ok(result)
+    if all && portable_conflict_hashes(root)? != conflict_hashes {
+        return Err(CoreError::conflict(
+            "Conflict archives changed while making a snapshot",
+        ));
+    }
+    if all
+        && !conflicts::blocked_generated(root, &manifest)?
+            .iter()
+            .eq(blocked_generated.keys())
+    {
+        return Err(CoreError::conflict(
+            "Generated source protection changed while making a snapshot",
+        ));
+    }
+    Ok(DuplicateSnapshot {
+        files: result,
+        blocked_generated,
+    })
 }
 
 pub fn checkpoint_dependency_path(path: &str) -> bool {

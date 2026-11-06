@@ -39,10 +39,11 @@ fn unlocked(node: &Node, path: &str, origin: Origin) -> Result<()> {
 }
 
 fn mark(node: &mut Node, path: &str, origin: Origin, revision: u64) {
-    let agent_locked = node
-        .property_meta
-        .get(path)
-        .is_some_and(|meta| meta.agent_locked);
+    let agent_locked = matches!(origin, Origin::User)
+        || node
+            .property_meta
+            .get(path)
+            .is_some_and(|meta| meta.agent_locked);
     node.property_meta.insert(
         path.to_owned(),
         PropertyMeta {
@@ -709,7 +710,7 @@ impl Document {
             ));
         }
         self.revision = revision;
-        self.validate()?;
+        self.validate_transaction()?;
         if !self.editable() {
             return Err(CoreError::unsupported(
                 "Transaction creates content not supported for editing",
@@ -735,27 +736,78 @@ impl Document {
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .filter_map(|path| {
-                        let old_locked =
-                            old.property_meta.get(path).is_some_and(|m| m.agent_locked);
-                        let new_locked =
-                            node.property_meta.get(path).is_some_and(|m| m.agent_locked);
-                        (old_locked != new_locked)
-                            .then(|| (String::from(path.as_str()), new_locked))
+                        let current = old.property_meta.get(path);
+                        let target = node.property_meta.get(path);
+                        let explicit_unlock =
+                            target.is_some_and(|meta| {
+                                !meta.agent_locked && matches!(meta.origin, Origin::User)
+                            }) && paths.iter().any(|changed| related_path(path, changed));
+                        let state = |meta: Option<&PropertyMeta>| {
+                            meta.map(|meta| {
+                                (meta.agent_locked, std::mem::discriminant(&meta.origin))
+                            })
+                        };
+                        let exact_changed = paths.iter().any(|changed| changed == path.as_str());
+                        (explicit_unlock || (!exact_changed && state(current) != state(target)))
+                            .then(|| {
+                                (
+                                    String::from(path.as_str()),
+                                    target.cloned(),
+                                    explicit_unlock,
+                                )
+                            })
                     })
                     .collect();
                 node.property_meta = old.property_meta.clone();
                 for path in paths {
-                    mark(node, &path, Origin::User, self.revision);
+                    if !lock_changes
+                        .iter()
+                        .any(|(unlocked, _, explicit)| *explicit && related_path(unlocked, &path))
+                    {
+                        mark(node, &path, Origin::User, self.revision);
+                    }
                 }
-                for (path, agent_locked) in lock_changes {
-                    node.property_meta.insert(
-                        path,
-                        PropertyMeta {
-                            origin: Origin::User,
-                            last_revision: self.revision,
-                            agent_locked,
-                        },
-                    );
+                for (path, target, _) in lock_changes {
+                    if let Some(mut meta) = target {
+                        if meta.agent_locked || matches!(meta.origin, Origin::User) {
+                            meta.origin = Origin::User;
+                            meta.last_revision = self.revision;
+                        }
+                        node.property_meta.insert(path, meta);
+                    } else {
+                        node.property_meta.remove(&path);
+                    }
+                }
+            } else {
+                let unlocked: Vec<_> = node
+                    .property_meta
+                    .iter()
+                    .filter(|(_, meta)| !meta.agent_locked && matches!(meta.origin, Origin::User))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                let mut paths: HashSet<String> = node.property_meta.keys().cloned().collect();
+                let value = serde_json::to_value(&*node).expect("Node serialization is infallible");
+                for (key, value) in value.as_object().expect("Node serializes as an object") {
+                    if key == "id" || key == "propertyMeta" || value.is_null() {
+                        continue;
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "layout" | "style" | "content" | "a11y" | "bindings" | "events"
+                    ) {
+                        if let Some(fields) = value.as_object() {
+                            for field in fields.keys() {
+                                paths.insert(format!("/{}/{}", escaped(key), escaped(field)));
+                            }
+                        }
+                    } else {
+                        paths.insert(format!("/{}", escaped(key)));
+                    }
+                }
+                for path in paths {
+                    if !unlocked.iter().any(|item| related_path(item, &path)) {
+                        mark(node, &path, Origin::User, self.revision);
+                    }
                 }
             }
         }

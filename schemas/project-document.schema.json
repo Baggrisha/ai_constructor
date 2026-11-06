@@ -51,7 +51,7 @@
       "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 } }
     },
     "flow": {
-      "description": "Computed as a CSS-flex subset: fixed and measured hug items do not shrink, fill items share remaining main-axis space, and unspecified cross-axis sizes stretch only when align is stretch. Text hug uses the specified font metrics; other intrinsic leaf content is not yet measurable.",
+      "description": "Computed as a CSS-flex subset: fixed and measured hug items do not shrink, fill items share remaining main-axis space, and unspecified cross-axis sizes stretch only when align is stretch. Text hug uses specified font metrics; raster image hug uses oriented intrinsic dimensions and aspect ratio. Cyclic size dependencies return UNSUPPORTED_FEATURE. Other intrinsic leaf content is not yet measurable.",
       "type": "object", "additionalProperties": false, "required": ["direction", "gap", "padding", "align"],
       "properties": {
         "direction": { "enum": ["row", "column"] }, "gap": { "type": "number", "minimum": 0 },
@@ -63,7 +63,7 @@
       }
     },
     "layout": {
-      "description": "Coordinates and dimensions are logical CSS pixels. Source bounds and source density describe the separate original image; they are not substituted for layout.",
+      "description": "Coordinates and dimensions are logical CSS pixels. Static geometry resolves numeric token/variable bindings on x, y, w and h; bound width and height must be positive. A bound dimension combined with hug or fill on that axis is not yet supported. Source bounds and source density describe the separate original image; they are not substituted for layout.",
       "type": "object", "additionalProperties": false, "required": ["x", "y", "w", "h"],
       "properties": {
         "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 },
@@ -71,7 +71,7 @@
       }
     },
     "responsive": {
-      "description": "An override applies only when its exact breakpoint is explicitly selected; missing properties use the base layout without changing it.",
+      "description": "An override applies only when its exact breakpoint is explicitly selected and takes precedence over the corresponding bound base value. A provided width or height fixes that axis at the selected breakpoint; missing properties use the base layout.",
       "type": "object", "additionalProperties": false, "required": ["breakpoint"],
       "properties": {
         "breakpoint": { "type": "number", "exclusiveMinimum": 0 }, "x": { "type": ["number", "null"] }, "y": { "type": ["number", "null"] },
@@ -91,9 +91,27 @@
         { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "close" } } }
       ]
     },
+    "vectorPoint": {
+      "type": "object", "additionalProperties": false, "required": ["x", "y"],
+      "properties": { "x": { "type": "number" }, "y": { "type": "number" } }
+    },
+    "vectorShape": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "x", "y", "w", "h"], "properties": { "type": { "const": "rect" }, "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number", "exclusiveMinimum": 0 }, "h": { "type": "number", "exclusiveMinimum": 0 }, "rx": { "type": ["number", "null"], "minimum": 0 }, "ry": { "type": ["number", "null"], "minimum": 0 } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "cx", "cy", "r"], "properties": { "type": { "const": "circle" }, "cx": { "type": "number" }, "cy": { "type": "number" }, "r": { "type": "number", "exclusiveMinimum": 0 } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "cx", "cy", "rx", "ry"], "properties": { "type": { "const": "ellipse" }, "cx": { "type": "number" }, "cy": { "type": "number" }, "rx": { "type": "number", "exclusiveMinimum": 0 }, "ry": { "type": "number", "exclusiveMinimum": 0 } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "x1", "y1", "x2", "y2"], "properties": { "type": { "const": "line" }, "x1": { "type": "number" }, "y1": { "type": "number" }, "x2": { "type": "number" }, "y2": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "points"], "properties": { "type": { "const": "polyline" }, "points": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/vectorPoint" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "points"], "properties": { "type": { "const": "polygon" }, "points": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/vectorPoint" } } } }
+      ]
+    },
     "vector": {
       "type": "object", "additionalProperties": false, "required": ["paths"],
-      "properties": { "paths": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/vectorCommand" } } } }
+      "description": "Editable paths and optional native geometric figures in node-local CSS pixels.",
+      "properties": {
+        "paths": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/vectorCommand" } } },
+        "shapes": { "type": "array", "items": { "$ref": "#/$defs/vectorShape" } }
+      }
     },
     "node": {
       "type": "object", "additionalProperties": false,
@@ -119,6 +137,7 @@
         "bindings": { "type": "object", "additionalProperties": { "$ref": "#/$defs/binding" } },
         "events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/id" } },
         "propertyMeta": {
+          "description": "User edits lock the changed property against agent edits; the user can explicitly unlock it. Existing schema-1 lock values are preserved.",
           "type": "object", "propertyNames": { "pattern": "^/(?:[^~]|~[01])*$" },
           "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["origin", "lastRevision", "agentLocked"], "properties": { "origin": { "enum": ["import", "user", "agent"] }, "lastRevision": { "type": "integer", "minimum": 0 }, "agentLocked": { "type": "boolean" } } }
         }

@@ -126,6 +126,13 @@ impl ProjectSession {
     ) -> Result<String> {
         self.edit_and_save_controlled(control, || self.rename(name))
     }
+    pub fn create_portable_snapshot_controlled(
+        &self,
+        destination: impl AsRef<Path>,
+        control: Arc<OperationControl>,
+    ) -> Result<()> {
+        run(control, || self.create_portable_snapshot(destination))
+    }
     pub fn duplicate_to_controlled(
         &self,
         destination: impl AsRef<Path>,

@@ -171,7 +171,7 @@ private struct Snapshot: Decodable {
             let id: String
             let path: String
         }
-        let projectId: String
+        var projectId: String
         let revision: UInt64
         let pages: [Page]
         let nodes: [Node]
@@ -187,7 +187,7 @@ private struct Snapshot: Decodable {
             assets = (try? values.decode([Asset].self, forKey: .assets)) ?? []
         }
     }
-    let document: Document
+    var document: Document
     let fingerprint: String
     let name: String
     let readOnly: Bool
@@ -407,17 +407,17 @@ private final class ProjectLibrary: ObservableObject {
     }
 
     func setPanel(_ panel: WorkspacePanel, for projectId: String) {
-        guard panelsReadable else {
-            error = "Настройки панелей недоступны для записи. Исправьте или восстановите panel-settings.json."
-            return
-        }
         var next = panels
         next[projectId] = panel
+        panels = next
+        guard panelsReadable else {
+            error = "Настройки панелей недоступны для записи. Выбор действует до закрытия приложения; исправьте или восстановите panel-settings.json."
+            return
+        }
         do {
             try write(next, to: "panel-settings.json")
-            panels = next
         } catch {
-            self.error = "Не удалось сохранить настройки панелей: \(error.localizedDescription)"
+            self.error = "Не удалось сохранить настройки панелей. Выбор действует до закрытия приложения: \(error.localizedDescription)"
         }
     }
 
@@ -520,10 +520,20 @@ private func decodeJSON<T: Decodable>(_ type: T.Type, _ text: String) throws -> 
 
 private func readableError(_ error: Error) -> String {
     if let coreError = error as? CoreError, case let .Failure(code, message) = coreError {
-        if code == "IMPORT_LIMIT_EXCEEDED" {
-            return "Ресурс превышает допустимый размер или разрешение.\n\(message)\nКод: \(code)"
+        let summary: String
+        switch code {
+        case "INVALID_DOCUMENT": summary = "Документ или изменение не прошло проверку."
+        case "REVISION_CONFLICT": summary = "Состояние проекта изменилось. Проверьте диагностику и выберите версию."
+        case "LOCKED_PROPERTY": summary = "Свойство защищено от этого изменения."
+        case "UNSAVED_CHANGES": summary = "Сохраните изменения проекта перед созданием снимка."
+        case "MISSING_ASSET": summary = "Не найден необходимый ресурс."
+        case "UNSUPPORTED_FEATURE": summary = "Действие или формат не поддерживается этой версией."
+        case "IO_ERROR": summary = "Ошибка чтения или записи файлов проекта."
+        case "IMPORT_LIMIT_EXCEEDED": summary = "Ресурс превышает допустимый размер или разрешение."
+        case "CANCELED": summary = "Операция отменена."
+        default: summary = "Операция завершилась ошибкой."
         }
-        return "\(message)\nКод: \(code)"
+        return "\(summary)\nДетали: \(message)\nКод: \(code)"
     }
     return error.localizedDescription
 }
@@ -542,8 +552,13 @@ private struct LoadedProject {
     let snapshot: Snapshot
 }
 
-private func loadProject(_ session: ProjectSession) throws -> LoadedProject {
-    let snapshot = try decodeJSON(Snapshot.self, session.snapshotJson())
+private func loadProject(_ session: ProjectSession, at url: URL) throws -> LoadedProject {
+    var snapshot = try decodeJSON(Snapshot.self, session.snapshotJson())
+    if snapshot.document.projectId.isEmpty,
+       let data = try? Data(contentsOf: url.appendingPathComponent("project.json")),
+       let identity = try? JSONDecoder().decode(ProjectIdentity.self, from: data) {
+        snapshot.document.projectId = identity.projectId
+    }
     return LoadedProject(session: session, snapshot: snapshot)
 }
 
@@ -556,8 +571,14 @@ private func editAndSaveSnapshot(_ session: ProjectSession, work: () throws -> S
     do {
         return SaveResult(snapshot: try decodeJSON(Snapshot.self, work()), error: nil)
     } catch {
-        if wasCanceled(error) { throw error }
-        return SaveResult(snapshot: try decodeJSON(Snapshot.self, session.snapshotJson()), error: readableError(error))
+        let operationError = error
+        do {
+            return SaveResult(snapshot: try decodeJSON(Snapshot.self, session.snapshotJson()), error: readableError(operationError))
+        } catch {
+            throw NSError(domain: "AIConstructor", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "\(readableError(operationError))\nНе удалось получить состояние проекта: \(readableError(error))"
+            ])
+        }
     }
 }
 
@@ -594,6 +615,12 @@ private struct FrameDraft: Equatable {
     }
 }
 
+private struct DeferredFrameDraft {
+    let draft: FrameDraft
+    let base: FrameDraft
+    let rootId: String
+}
+
 @MainActor
 private final class WorkspaceModel: ObservableObject {
     @Published var snapshot: Snapshot?
@@ -607,6 +634,7 @@ private final class WorkspaceModel: ObservableObject {
     @Published var diagnostics: ProjectDiagnostics?
     @Published var diagnosticsError: String?
     @Published var error: String?
+    @Published var notice: String?
     @Published var watchWarning: String?
     @Published var search = ""
     @Published private(set) var operation: String?
@@ -614,8 +642,11 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var cancellationMessage: String?
     @Published private(set) var diagnosticsInFlight = false
     @Published var conflictReviewPresented = false
+    @Published var chatEditorPresented = false
     @Published private(set) var frameDraft: FrameDraft?
     @Published private(set) var frameAutosaving = false
+    @Published private(set) var frameDraftNeedsReview = false
+    @Published private(set) var deferredFrameDraft: DeferredFrameDraft?
     private var operationControl: OperationControl?
     private var diagnosticControl: OperationControl?
     private var possibleUnsaved = false
@@ -623,8 +654,16 @@ private final class WorkspaceModel: ObservableObject {
     private var frameSavePending = false
     private var frameFocused = false
 
+    var writesBlocked: Bool { snapshot?.readOnly == true || diagnostics?.readOnly == true }
+
+    var hasBlockingFrameDraft: Bool {
+        guard let frameDraft else { return false }
+        guard let root = snapshot?.root else { return true }
+        return frameDraftNeedsReview || frameDraft != FrameDraft(root) || snapshot?.dirty == true || possibleUnsaved
+    }
+
     var hasUnsavedData: Bool {
-        if snapshot?.dirty == true || possibleUnsaved { return true }
+        if snapshot?.dirty == true || possibleUnsaved || deferredFrameDraft != nil || frameDraftNeedsReview { return true }
         guard let frameDraft else { return false }
         guard let root = snapshot?.root else { return true }
         return !frameDraft.matches(root)
@@ -633,6 +672,12 @@ private final class WorkspaceModel: ObservableObject {
     var closeBlockReason: String? {
         if operation != nil { return "Дождитесь завершения операции перед закрытием окна или приложения." }
         if diagnosticsInFlight { return "Проверка проекта завершается. Дождитесь результата и повторите закрытие." }
+        if deferredFrameDraft != nil {
+            return "Верните отложенный черновик фрейма и завершите ввод перед закрытием."
+        }
+        if frameDraftNeedsReview {
+            return "Проверьте и примените отложенный черновик фрейма либо явно отбросьте его перед закрытием."
+        }
         if let frameDraft, snapshot?.root.map({ frameDraft != FrameDraft($0) }) ?? true {
             return "Завершите ввод или явно отбросьте черновик фрейма перед закрытием."
         }
@@ -821,7 +866,7 @@ private final class WorkspaceModel: ObservableObject {
     private func select(_ url: URL, expected: RecentProject? = nil, create: Bool = false) {
         guard operation == nil else { return }
         clearSavedFrameDraft()
-        if frameDraft != nil {
+        if frameDraft != nil || deferredFrameDraft != nil {
             error = "Дождитесь сохранения фрейма или исправьте его поля перед переключением проекта."
             return
         }
@@ -848,9 +893,17 @@ private final class WorkspaceModel: ObservableObject {
         perform(create ? "Создание проекта…" : "Открытие проекта…", control: control,
                 errorContext: create ? "Не удалось создать проект. Можно выбрать другое расположение." : nil, work: {
             if let expected {
-                let manifest = try Data(contentsOf: url.appendingPathComponent("project.json"))
-                let identity = try JSONDecoder().decode(ProjectIdentity.self, from: manifest)
-                guard let expectedId = expected.projectId, identity.projectId == expectedId else {
+                guard let expectedId = expected.projectId, !expectedId.isEmpty else {
+                    throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Идентификатор записи неизвестен. Откройте папку через «Открыть», чтобы подтвердить проект."])
+                }
+                let identity: ProjectIdentity
+                do {
+                    let manifest = try Data(contentsOf: url.appendingPathComponent("project.json"))
+                    identity = try JSONDecoder().decode(ProjectIdentity.self, from: manifest)
+                } catch {
+                    throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Не удалось проверить идентификатор по манифесту. Для восстановления откройте папку непосредственно через «Открыть»: \(readableError(error))"])
+                }
+                guard identity.projectId == expectedId else {
                     throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Идентификатор проекта не совпадает; исходная запись сохранена."])
                 }
             }
@@ -866,7 +919,7 @@ private final class WorkspaceModel: ObservableObject {
             } else {
                 throw CocoaError(.fileReadUnknown)
             }
-            let loaded = try loadProject(next)
+            let loaded = try loadProject(next, at: url)
             if let expected, expected.projectId != loaded.snapshot.document.projectId {
                 throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Идентификатор проекта не совпадает; исходная запись сохранена."])
             }
@@ -913,7 +966,9 @@ private final class WorkspaceModel: ObservableObject {
         select(url)
     }
 
-    func open(_ url: URL) { select(url) }
+    func open(_ project: RecentProject) {
+        select(URL(fileURLWithPath: project.path), expected: project)
+    }
 
     func locate(_ project: RecentProject) {
         guard operation == nil else { return }
@@ -977,7 +1032,7 @@ private final class WorkspaceModel: ObservableObject {
         guard operation == nil, let path = project.map({ URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path }) ?? currentPath?.path,
               let closing = sessions[path] else { return }
         clearSavedFrameDraft()
-        if currentPath?.path == path && frameDraft != nil {
+        if currentPath?.path == path && (frameDraft != nil || deferredFrameDraft != nil) {
             error = "Дождитесь сохранения фрейма или исправьте его поля перед закрытием проекта."
             return
         }
@@ -998,7 +1053,7 @@ private final class WorkspaceModel: ObservableObject {
             let control = newOperationControl()
             perform("Сохранение перед закрытием…", control: control, work: { try saveSnapshot(closing, control: control) }) { result in
                 self.snapshot = result.snapshot
-                self.possibleUnsaved = result.snapshot.dirty || result.error != nil
+                self.possibleUnsaved = result.snapshot.dirty
                 if let error = result.error {
                     self.error = "Проект не закрыт: изменения не сохранены. \(error)"
                 } else {
@@ -1059,24 +1114,25 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func accept(_ result: SaveResult) {
+    private func accept(_ result: SaveResult, context: String? = nil) {
         snapshot = result.snapshot
-        possibleUnsaved = result.snapshot.dirty || result.error != nil
+        possibleUnsaved = result.snapshot.dirty
         if let error = result.error {
-            self.error = "Не сохранено: \(error)\nИзменения остаются в памяти. Сохраните проект перед закрытием."
+            self.error = [context, "Операция не завершена: \(error)\nСостояние редактора сохранено в памяти."].compactMap { $0 }.joined(separator: "\n")
         } else if let currentPath {
             remember(currentPath)
         }
     }
 
     func updateFrameDraft(_ field: WritableKeyPath<FrameDraft, String>, value: String) {
-        guard let snapshot, !snapshot.readOnly, let root = snapshot.root else { return }
+        guard deferredFrameDraft == nil, let snapshot, !snapshot.readOnly, let root = snapshot.root else { return }
         var draft = frameDraft ?? FrameDraft(root)
         draft[keyPath: field] = value
         frameAutosaveTask?.cancel()
         frameSavePending = false
         frameDraft = draft
-        guard draft.dimensions != nil else { return }
+        if writesBlocked { frameDraftNeedsReview = true }
+        guard draft.dimensions != nil, !writesBlocked, !frameDraftNeedsReview else { return }
         frameAutosaveTask = Task {
             do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
             guard !Task.isCancelled else { return }
@@ -1093,6 +1149,32 @@ private final class WorkspaceModel: ObservableObject {
         guard operation == nil else { return }
         stopFrameAutosaveRetries()
         frameDraft = nil
+        frameDraftNeedsReview = false
+    }
+
+    func deferFrameDraft() {
+        guard operation == nil, deferredFrameDraft == nil, let draft = frameDraft,
+              let root = snapshot?.root else { return }
+        stopFrameAutosaveRetries()
+        deferredFrameDraft = DeferredFrameDraft(draft: draft, base: FrameDraft(root), rootId: root.id)
+        frameDraft = nil
+        frameDraftNeedsReview = false
+    }
+
+    func restoreDeferredFrameDraft() {
+        guard operation == nil, frameDraft == nil, let deferred = deferredFrameDraft else { return }
+        guard snapshot?.root?.id == deferred.rootId else {
+            error = "Исходный фрейм больше недоступен. Скопируйте значения отложенного черновика в диагностике."
+            return
+        }
+        frameDraft = deferred.draft
+        frameDraftNeedsReview = true
+        deferredFrameDraft = nil
+    }
+
+    func discardDeferredFrameDraft() {
+        guard operation == nil else { return }
+        deferredFrameDraft = nil
     }
 
     private func clearSavedFrameDraft() {
@@ -1107,17 +1189,19 @@ private final class WorkspaceModel: ObservableObject {
         frameSavePending = false
     }
 
-    func commitFrameDraft() {
+    func commitFrameDraft(reviewed: Bool = false) {
         frameAutosaveTask?.cancel()
         frameSavePending = false
         guard let draft = frameDraft, let (width, height) = draft.dimensions else { return }
+        guard !writesBlocked, !frameDraftNeedsReview || reviewed else { return }
         guard operation == nil else { frameSavePending = true; return }
         guard let session, let snapshot, let root = snapshot.root, !snapshot.readOnly else { return }
+        frameDraftNeedsReview = false
         if draft.matches(root) {
             if snapshot.dirty || possibleUnsaved {
                 let control = newOperationControl()
                 frameAutosaving = true
-                perform("Сохранение изменений…", control: control, work: {
+                perform("Сохранение изменений…", control: control, errorContext: "Фрейм «\(root.name)» · \(root.id)", work: {
                     try saveSnapshot(session, control: control)
                 }, failure: { _ in
                     self.frameAutosaving = false
@@ -1125,7 +1209,7 @@ private final class WorkspaceModel: ObservableObject {
                 }) { result in
                     self.frameAutosaving = false
                     if result.error != nil { self.stopFrameAutosaveRetries() }
-                    self.accept(result)
+                    self.accept(result, context: "Фрейм «\(root.name)» · \(root.id)")
                     if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft && !self.frameFocused {
                         self.frameDraft = nil
                     }
@@ -1163,7 +1247,7 @@ private final class WorkspaceModel: ObservableObject {
             possibleUnsaved = true
             let control = newOperationControl()
             frameAutosaving = true
-            perform("Сохранение изменений…", control: control, work: {
+            perform("Сохранение изменений…", control: control, errorContext: "Фрейм «\(root.name)» · \(root.id)", work: {
                 try editAndSaveSnapshot(session) {
                     try session.applyTransactionAndSaveControlled(transactionJson: json, control: control)
                 }
@@ -1174,7 +1258,7 @@ private final class WorkspaceModel: ObservableObject {
             }) { result in
                 self.frameAutosaving = false
                 if result.error != nil { self.stopFrameAutosaveRetries() }
-                self.accept(result)
+                self.accept(result, context: "Фрейм «\(root.name)» · \(root.id)")
                 if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft && !self.frameFocused {
                     self.frameDraft = nil
                 }
@@ -1183,7 +1267,11 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func save() {
-        guard operation == nil, let session else { return }
+        guard operation == nil, !writesBlocked, deferredFrameDraft == nil, let session else { return }
+        if frameDraftNeedsReview {
+            error = "Проверьте отложенный черновик и нажмите «Применить»."
+            return
+        }
         if let draft = frameDraft {
             guard draft.dimensions != nil else {
                 error = "Исправьте название и размеры фрейма перед сохранением."
@@ -1197,7 +1285,9 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func undo() {
-        guard operation == nil, frameDraft == nil, let session else { return }
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
         let previousUnsaved = possibleUnsaved
         possibleUnsaved = true
         let control = newOperationControl()
@@ -1209,7 +1299,9 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func redo() {
-        guard operation == nil, frameDraft == nil, let session else { return }
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
         let previousUnsaved = possibleUnsaved
         possibleUnsaved = true
         let control = newOperationControl()
@@ -1221,30 +1313,34 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func createCheckpoint() {
-        guard operation == nil, let session else { return }
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
         let previousUnsaved = possibleUnsaved
         possibleUnsaved = true
         let control = newOperationControl()
         perform("Создание контрольной точки…", control: control, work: {
-            _ = try session.createCheckpointControlled(control: control)
-            return try decodeJSON(Snapshot.self, session.snapshotJson())
+            try editAndSaveSnapshot(session) {
+                _ = try session.createCheckpointControlled(control: control)
+                return try session.snapshotJson()
+            }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { snapshot in
-            self.snapshot = snapshot
-            self.possibleUnsaved = snapshot.dirty
-            self.refreshCheckpoints()
+        }) { result in
+            self.accept(result)
+            if result.error == nil { self.refreshCheckpoints() }
         }
     }
 
     func restoreCheckpoint(_ checkpoint: Checkpoint) {
-        guard operation == nil, let session else { return }
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
         let previousUnsaved = possibleUnsaved
         possibleUnsaved = true
         let control = newOperationControl()
         perform("Восстановление контрольной точки…", control: control, work: {
-            let snapshot = try decodeJSON(Snapshot.self, session.restoreCheckpointControlled(id: checkpoint.id, control: control))
-            return SaveResult(snapshot: snapshot, error: nil)
+            try editAndSaveSnapshot(session) { try session.restoreCheckpointControlled(id: checkpoint.id, control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
         }) { self.accept($0) }
@@ -1259,7 +1355,9 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func duplicate() {
-        guard operation == nil, let session, let snapshot else { return }
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session, let snapshot else { return }
         let panel = NSSavePanel()
         panel.title = "Дублировать проект"
         panel.directoryURL = currentPath?.deletingLastPathComponent()
@@ -1274,14 +1372,37 @@ private final class WorkspaceModel: ObservableObject {
         let control = newOperationControl()
         perform("Дублирование проекта…", control: control, work: {
             let next = try session.duplicateToControlled(destination: url.path, name: url.lastPathComponent, control: control)
-            return try loadProject(next)
+            return try loadProject(next, at: url)
         }, failure: { _ in self.library.release(url.path) }) {
             self.install($0, at: url, reserved: true)
         }
     }
 
-    func rename(_ name: String) {
-        guard operation == nil, frameDraft == nil, let session else { return }
+    func createPortableSnapshot() {
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, !hasUnsavedData, frameDraft == nil, deferredFrameDraft == nil,
+              diagnostics?.blockedGenerated?.isEmpty != false, let session, let snapshot else { return }
+        let panel = NSSavePanel()
+        panel.title = "Переносимый снимок проекта"
+        panel.message = "Выберите новое расположение снимка."
+        panel.directoryURL = currentPath?.deletingLastPathComponent()
+        panel.nameFieldStringValue = "\(snapshot.name) — снимок"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let selected = panel.url else { return }
+        let url = selected.standardizedFileURL.resolvingSymlinksInPath()
+        let control = newOperationControl()
+        perform("Создание переносимого снимка…", control: control, work: {
+            try session.createPortableSnapshotControlled(destination: url.path, control: control)
+        }) {
+            self.notice = "Снимок сохранён в \(url.path)."
+        }
+    }
+
+    func rename(_ name: String, completion: @escaping () -> Void) {
+        guard operation == nil else { return }
+        clearSavedFrameDraft()
+        guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
         let previousUnsaved = possibleUnsaved
         possibleUnsaved = true
         let control = newOperationControl()
@@ -1289,7 +1410,10 @@ private final class WorkspaceModel: ObservableObject {
             try editAndSaveSnapshot(session) { try session.renameAndSaveControlled(name: name, control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.accept($0) }
+        }) { result in
+            self.accept(result)
+            if result.error == nil { completion() }
+        }
     }
 
     func refreshChats(select chatId: String? = nil) {
@@ -1317,8 +1441,8 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func createChat(title: String, mode: String) {
-        guard let session else { return }
+    func createChat(title: String, mode: String, completion: @escaping () -> Void) {
+        guard !writesBlocked, let session else { return }
         let control = newOperationControl()
         perform("Создание чата…", control: control, work: {
             try decodeJSON(Chat.self, session.createChatControlled(title: title, mode: mode, control: control))
@@ -1327,19 +1451,23 @@ private final class WorkspaceModel: ObservableObject {
             self.selectedChatId = chat.id
             self.messages = []
             self.chatSearchResults = nil
+            completion()
         }
     }
 
-    func renameChat(_ chat: Chat, title: String) {
-        guard let session else { return }
+    func renameChat(_ chat: Chat, title: String, completion: @escaping () -> Void) {
+        guard !writesBlocked, let session else { return }
         let control = newOperationControl()
         perform("Переименование чата…", control: control, work: {
             try decodeJSON(Chat.self, session.renameChatControlled(chatId: chat.id, title: title, control: control))
-        }) { self.replaceChat($0) }
+        }) { chat in
+            self.replaceChat(chat)
+            completion()
+        }
     }
 
     func archiveChat(_ chat: Chat, archived: Bool) {
-        guard let session else { return }
+        guard !writesBlocked, let session else { return }
         let control = newOperationControl()
         perform("Обновление чата…", control: control, work: {
             try decodeJSON(Chat.self, session.archiveChatControlled(chatId: chat.id, archived: archived, control: control))
@@ -1347,7 +1475,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func setChatMode(_ chat: Chat, mode: String) {
-        guard let session else { return }
+        guard !writesBlocked, let session else { return }
         let control = newOperationControl()
         perform("Обновление режима чата…", control: control, work: {
             try decodeJSON(Chat.self, session.setChatModeControlled(chatId: chat.id, mode: mode, control: control))
@@ -1362,8 +1490,8 @@ private final class WorkspaceModel: ObservableObject {
         }) { self.chatSearchResults = $0 }
     }
 
-    func forkChat(_ chat: Chat, through message: ChatMessage, title: String) {
-        guard let session else { return }
+    func forkChat(_ chat: Chat, through message: ChatMessage, title: String, completion: @escaping () -> Void) {
+        guard !writesBlocked, let session else { return }
         let control = newOperationControl()
         perform("Ответвление чата…", control: control, work: {
             try decodeJSON(Chat.self, session.forkChatControlled(chatId: chat.id, messageId: message.id, title: title, control: control))
@@ -1372,12 +1500,13 @@ private final class WorkspaceModel: ObservableObject {
             self.selectedChatId = chat.id
             self.messages = []
             self.chatSearchResults = nil
+            completion()
             self.refreshChats(select: chat.id)
         }
     }
 
     func deleteChat(_ chat: Chat) {
-        guard let session else { return }
+        guard !writesBlocked, let session else { return }
         let draftKey = "\(snapshot?.document.projectId ?? ""):\(chat.id)"
         let control = newOperationControl()
         perform("Удаление чата…", control: control, work: { try session.deleteChatControlled(chatId: chat.id, control: control) }) {
@@ -1394,7 +1523,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func appendMessage(_ text: String, attachmentIds: [String], completion: @escaping () -> Void) {
-        guard let session, let chatId = selectedChatId else { return }
+        guard !writesBlocked, let session, let chatId = selectedChatId else { return }
         do {
             let input: [String: Any] = [
                 "role": "user",
@@ -1413,7 +1542,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func importAsset() {
-        guard operation == nil, let session else { return }
+        guard operation == nil, !writesBlocked, let session else { return }
         let panel = NSOpenPanel()
         panel.title = "Добавить ресурс"
         panel.canChooseFiles = true
@@ -1423,7 +1552,10 @@ private final class WorkspaceModel: ObservableObject {
         perform("Импорт ресурса…", control: control, work: {
             _ = try session.importAssetControlled(path: url.path, control: control)
             return try decodeJSON(Snapshot.self, session.snapshotJson())
-        }) { self.snapshot = $0 }
+        }) {
+            self.snapshot = $0
+            self.watchChanged()
+        }
     }
 
     func relinkAsset(_ asset: Snapshot.Document.Asset) {
@@ -1438,7 +1570,10 @@ private final class WorkspaceModel: ObservableObject {
         perform("Перепривязка ресурса…", control: control, work: {
             _ = try session.relinkAssetControlled(id: asset.id, path: url.path, control: control)
             return try decodeJSON(Snapshot.self, session.snapshotJson())
-        }) { self.snapshot = $0 }
+        }) {
+            self.snapshot = $0
+            self.watchChanged()
+        }
     }
 
     func resolveConflict(_ review: ConflictReview, selections: [String: String], completion: @escaping () -> Void) {
@@ -1471,6 +1606,8 @@ private final class WorkspaceModel: ObservableObject {
             let control = newOperationControl()
             perform("Разрешение конфликта…", control: control, work: {
                 try decodeJSON(Snapshot.self, session.resolveExternalConflictControlled(requestJson: json, control: control))
+            }, failure: { _ in
+                self.watchChanged()
             }) { snapshot in
                 self.applyResolvedSnapshot(snapshot, completion: completion)
             }
@@ -1501,6 +1638,8 @@ private final class WorkspaceModel: ObservableObject {
             let control = newOperationControl()
             perform("Восстановление снимка…", control: control, work: {
                 try decodeJSON(Snapshot.self, session.resolveRecoveryConflictControlled(requestJson: json, control: control))
+            }, failure: { _ in
+                self.watchChanged()
             }) { snapshot in
                 self.applyResolvedSnapshot(snapshot, completion: completion)
             }
@@ -1510,13 +1649,24 @@ private final class WorkspaceModel: ObservableObject {
     private func applyResolvedSnapshot(_ snapshot: Snapshot, completion: () -> Void) {
         self.snapshot = snapshot
         possibleUnsaved = snapshot.dirty
+        diagnostics = nil
+        diagnosticsError = nil
+        if let deferred = deferredFrameDraft, let root = snapshot.root, root.id == deferred.rootId {
+            var draft = FrameDraft(root)
+            if deferred.draft.name != deferred.base.name { draft.name = deferred.draft.name }
+            if deferred.draft.width != deferred.base.width { draft.width = deferred.draft.width }
+            if deferred.draft.height != deferred.base.height { draft.height = deferred.draft.height }
+            frameDraft = draft
+            frameDraftNeedsReview = true
+            deferredFrameDraft = nil
+        }
         checkpoints = []
         chats = []
         messages = []
         selectedChatId = nil
         completion()
         if !snapshot.readOnly { refreshCheckpoints() }
-        Task { await pollDiagnostics() }
+        watchChanged()
     }
 
     func revealConflictVersion(_ relativePath: String) {
@@ -1554,6 +1704,13 @@ private final class WorkspaceModel: ObservableObject {
             })
             guard self.session === session, operation == nil, !Task.isCancelled else { return }
             diagnostics = result
+            if result.readOnly {
+                clearSavedFrameDraft()
+                if frameDraft != nil {
+                    stopFrameAutosaveRetries()
+                    frameDraftNeedsReview = true
+                }
+            }
             diagnosticsError = nil
         } catch {
             guard self.session === session, operation == nil, !Task.isCancelled else { return }
@@ -1569,6 +1726,8 @@ private struct WorkspaceView: View {
     @StoredState private var renameProject = false
     @StoredState private var projectName = ""
     @StoredState private var trashProject: RecentProject?
+    @StoredState private var checkpointToRestore: Checkpoint?
+    @StoredState private var confirmPortableSnapshot = false
 
     @ViewBuilder
     private func projectActions(_ project: RecentProject) -> some View {
@@ -1587,7 +1746,7 @@ private struct WorkspaceView: View {
     private func projectRow(_ project: RecentProject) -> some View {
         HStack {
             Button {
-                model.open(URL(fileURLWithPath: project.path))
+                model.open(project)
             } label: {
                 VStack(alignment: .leading) {
                     Text(project.name)
@@ -1658,32 +1817,35 @@ private struct WorkspaceView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(snapshot.name).font(.headline)
-                            Text(snapshot.readOnly ? "Только чтение" : model.hasUnsavedData ? "Не сохранено" : "Сохранено")
+                            Text(model.hasUnsavedData ? "Не сохранено" : snapshot.readOnly ? "Только чтение" : model.diagnostics?.readOnly == true ? "Внешние изменения" : model.diagnosticsError != nil ? "Проверка не выполнена" : "Сохранено")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Отменить", systemImage: "arrow.uturn.backward") { model.undo() }.disabled(snapshot.readOnly || model.frameDraft != nil)
-                        Button("Повторить", systemImage: "arrow.uturn.forward") { model.redo() }.disabled(snapshot.readOnly || model.frameDraft != nil)
-                        Button("Сохранить", systemImage: "square.and.arrow.down") { model.save() }.disabled(snapshot.readOnly)
+                        Button("Отменить", systemImage: "arrow.uturn.backward") { model.undo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                        Button("Повторить", systemImage: "arrow.uturn.forward") { model.redo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                        Button("Сохранить", systemImage: "square.and.arrow.down") { model.save() }.disabled(model.writesBlocked || model.deferredFrameDraft != nil)
                         Menu {
                             Button("Закрыть проект") { model.closeProject() }
                             Button("Переименовать проект…") { projectName = snapshot.name; renameProject = true }
-                                .disabled(snapshot.readOnly || model.frameDraft != nil)
+                                .disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                             Button("В архив") { model.archiveCurrent() }
-                            Button("Дублировать проект…") { model.duplicate() }.disabled(snapshot.readOnly || model.frameDraft != nil)
-                            Button("Создать контрольную точку") { model.createCheckpoint() }.disabled(snapshot.readOnly || model.frameDraft != nil)
+                            Button("Дублировать проект…") { model.duplicate() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                            Button("Создать переносимый снимок…") { confirmPortableSnapshot = true }
+                                .disabled(model.writesBlocked || model.hasUnsavedData || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil || model.diagnostics?.blockedGenerated?.isEmpty == false)
+                            Button("Создать контрольную точку") { model.createCheckpoint() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                             Button("Обновить список контрольных точек") { model.refreshCheckpoints() }
-                                .disabled(snapshot.readOnly)
+                                .disabled(model.writesBlocked)
                             Menu("Восстановить контрольную точку") {
                                 ForEach(model.checkpoints) { checkpoint in
                                     Button("Ревизия \(checkpoint.revision) · \(checkpoint.id.prefix(8))") {
-                                        model.restoreCheckpoint(checkpoint)
+                                        checkpointToRestore = checkpoint
                                     }
                                 }
                             }
-                            .disabled(snapshot.readOnly || model.checkpoints.isEmpty || model.frameDraft != nil)
+                            .disabled(model.writesBlocked || model.checkpoints.isEmpty || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                         } label: { Image(systemName: "ellipsis.circle") }
                         .accessibilityLabel("Действия с проектом")
+                        .accessibilityIdentifier("project-actions")
                     }
                     .disabled(model.frameAutosaving)
                     .padding(20)
@@ -1692,10 +1854,23 @@ private struct WorkspaceView: View {
                         Text(reason).frame(maxWidth: .infinity, alignment: .leading).padding().background(.orange.opacity(0.12))
                     }
                     if let diagnostics = model.diagnostics, diagnostics.manifestChanged || !diagnostics.files.isEmpty || !diagnostics.conflicts.isEmpty || diagnostics.blockedGenerated?.isEmpty == false {
-                        Label("Обнаружены внешние изменения или конфликты. Откройте диагностику перед продолжением.", systemImage: "exclamationmark.triangle")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(.orange.opacity(0.12))
+                        HStack {
+                            Label("Обнаружены внешние изменения или конфликты.", systemImage: "exclamationmark.triangle")
+                            Spacer()
+                            Button("Открыть диагностику") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
+                                .accessibilityIdentifier("open-diagnostics")
+                        }
+                        .padding(10)
+                        .background(.orange.opacity(0.12))
+                    }
+                    if model.diagnosticsError != nil || model.watchWarning != nil {
+                        HStack {
+                            Label(model.diagnosticsError ?? model.watchWarning ?? "", systemImage: "exclamationmark.triangle")
+                            Spacer()
+                            Button("Открыть диагностику") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
+                        }
+                        .padding(10)
+                        .background(.orange.opacity(0.12))
                     }
                     Picker("Панель", selection: Binding(
                         get: { library.panels[snapshot.document.projectId] ?? .inspector },
@@ -1754,10 +1929,10 @@ private struct WorkspaceView: View {
         .task(id: model.snapshot?.document.projectId) {
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 30_000_000_000) } catch { break }
-                if model.watchWarning != nil { await model.pollDiagnostics() }
+                await model.pollDiagnostics()
             }
         }
-        .alert("Ошибка", isPresented: Binding(get: { model.error != nil || library.error != nil }, set: {
+        .alert("Ошибка", isPresented: Binding(get: { !renameProject && !model.chatEditorPresented && !model.conflictReviewPresented && (model.error != nil || library.error != nil) }, set: {
             if !$0 { model.error = nil; library.error = nil }
         })) {
             Button("OK") { model.error = nil; library.error = nil }
@@ -1770,22 +1945,51 @@ private struct WorkspaceView: View {
         } message: { project in
             Text("Папка \(project.path) будет перемещена в Корзину. Это отдельное действие и не совпадает с удалением записи из списка.")
         }
+        .alert("Восстановить контрольную точку?", isPresented: Binding(get: { checkpointToRestore != nil }, set: {
+            if !$0 { checkpointToRestore = nil }
+        }), presenting: checkpointToRestore) { checkpoint in
+            Button("Восстановить", role: .destructive) { model.restoreCheckpoint(checkpoint); checkpointToRestore = nil }
+            Button("Отмена", role: .cancel) { checkpointToRestore = nil }
+        } message: { checkpoint in
+            Text("Будет восстановлена ревизия \(checkpoint.revision) вместе с файлами снимка. Текущие файлы проекта могут измениться.")
+        }
+        .alert("Создать переносимый снимок?", isPresented: $confirmPortableSnapshot) {
+            Button("Продолжить") { model.createPortableSnapshot() }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Снимок включает файлы проекта, чаты, визуальные образцы и архивы конфликтов со старыми версиями файлов. Они могут содержать приватные данные. Проверьте содержимое перед публикацией или передачей. Несохранённые черновики чатов не включаются.")
+        }
+        .alert("Переносимый снимок создан", isPresented: Binding(get: { model.notice != nil }, set: {
+            if !$0 { model.notice = nil }
+        })) {
+            Button("OK") { model.notice = nil }
+        } message: { Text(model.notice ?? "") }
         .sheet(isPresented: $renameProject) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Переименовать проект").font(.headline)
-                TextField("Название", text: $projectName)
+                TextField("Название", text: $projectName).disabled(model.operation != nil)
+                if model.writesBlocked { Text("Сначала разрешите внешние изменения в диагностике.").foregroundStyle(.orange) }
+                if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                if let operation = model.operation {
+                    HStack {
+                        ProgressView(operation)
+                        if let message = model.cancellationMessage { Text(message).font(.caption) }
+                        if model.canCancelOperation { Button("Отменить операцию") { model.cancelOperation() } }
+                    }
+                }
                 HStack {
                     Spacer()
-                    Button("Отмена") { renameProject = false }
+                    Button("Отмена") { model.error = nil; renameProject = false }.disabled(model.operation != nil)
                     Button("Сохранить") {
                         guard model.operation == nil else { return }
-                        model.rename(projectName)
-                        renameProject = false
+                        model.error = nil
+                        model.rename(projectName) { renameProject = false }
                     }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(model.operation != nil || projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(model.operation != nil || model.writesBlocked || projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-            }.padding(24).frame(width: 360)
+            }.padding(24).frame(width: 420)
+                .interactiveDismissDisabled(model.operation != nil)
         }
     }
 }
@@ -1827,7 +2031,7 @@ private struct ChatPanel: View {
                     mode = "discuss"
                     showChatSheet = true
                 }
-                .disabled(snapshot.readOnly)
+                .disabled(model.writesBlocked)
                 if let selected {
                     Menu("Действия с чатом") {
                         Button("Переименовать…") {
@@ -1849,7 +2053,7 @@ private struct ChatPanel: View {
                         Divider()
                         Button("Удалить чат…", role: .destructive) { deleteCandidate = selected }
                     }
-                    .disabled(snapshot.readOnly)
+                    .disabled(model.writesBlocked)
                 }
             }
             Text("Локальная история чата. Ответы ИИ в этом этапе не подключены.")
@@ -1895,7 +2099,7 @@ private struct ChatPanel: View {
                                         title = "\(selected.title) — ответвление"
                                         showChatSheet = true
                                     }
-                                    .disabled(snapshot.readOnly)
+                                    .disabled(model.writesBlocked)
                                     .accessibilityLabel("Ответвить чат с этого сообщения")
                                 }
                                 ForEach(Array(message.content.enumerated()), id: \.offset) { item in
@@ -1926,7 +2130,7 @@ private struct ChatPanel: View {
                     .frame(minHeight: 75, maxHeight: 120)
                     .accessibilityLabel("Текст сообщения")
                     .accessibilityIdentifier("chat-message")
-                    .disabled(snapshot.readOnly)
+                    .disabled(model.writesBlocked)
                     HStack {
                         Picker("Вложение", selection: Binding(
                             get: { model.chatAttachmentDrafts[draftKey, default: ""] },
@@ -1946,7 +2150,7 @@ private struct ChatPanel: View {
                             }
                         }
                         .accessibilityIdentifier("save-chat-message")
-                        .disabled(snapshot.readOnly || (model.chatDrafts[draftKey, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.chatAttachmentDrafts[draftKey, default: ""].isEmpty))
+                        .disabled(model.writesBlocked || (model.chatDrafts[draftKey, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.chatAttachmentDrafts[draftKey, default: ""].isEmpty))
                     }
                 } else {
                     Text("Чат в архиве. Верните его из архива, чтобы добавлять сообщения.")
@@ -1958,36 +2162,49 @@ private struct ChatPanel: View {
         }
         .padding(20)
         .onAppear { model.requestChats(select: model.selectedChatId) }
+        .onChange(of: showChatSheet) { _, presented in model.chatEditorPresented = presented }
+        .onDisappear { model.chatEditorPresented = false }
         .sheet(isPresented: $showChatSheet) {
             VStack(alignment: .leading, spacing: 16) {
                 Text(forkOrigin != nil ? "Ответвить чат" : editingChat == nil ? "Новый чат" : "Переименовать чат").font(.headline)
-                TextField("Название", text: $title).accessibilityIdentifier("chat-title")
+                TextField("Название", text: $title).accessibilityIdentifier("chat-title").disabled(model.operation != nil)
                 if editingChat == nil && forkOrigin == nil {
                     Picker("Режим", selection: $mode) {
                         Text("Обсудить").tag("discuss")
                         Text("План").tag("plan")
                         Text("Изменить").tag("edit")
                     }
+                    .disabled(model.operation != nil)
+                }
+                if model.writesBlocked { Text("Сначала разрешите внешние изменения в диагностике.").foregroundStyle(.orange) }
+                if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                if let operation = model.operation {
+                    HStack {
+                        ProgressView(operation)
+                        if let message = model.cancellationMessage { Text(message).font(.caption) }
+                        if model.canCancelOperation { Button("Отменить операцию") { model.cancelOperation() } }
+                    }
                 }
                 HStack {
                     Spacer()
-                    Button("Отмена") { showChatSheet = false }
+                    Button("Отмена") { model.error = nil; showChatSheet = false }.disabled(model.operation != nil)
                     Button("Сохранить") {
                         guard model.operation == nil else { return }
+                        model.error = nil
                         if let forkOrigin, let forkMessage {
-                            model.forkChat(forkOrigin, through: forkMessage, title: title)
+                            model.forkChat(forkOrigin, through: forkMessage, title: title) { showChatSheet = false }
                         } else if let editingChat {
-                            model.renameChat(editingChat, title: title)
+                            model.renameChat(editingChat, title: title) { showChatSheet = false }
                         } else {
-                            model.createChat(title: title, mode: mode)
+                            model.createChat(title: title, mode: mode) { showChatSheet = false }
                         }
-                        showChatSheet = false
                     }
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("confirm-chat")
-                    .disabled(model.operation != nil || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(model.operation != nil || model.writesBlocked || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-            }.padding(24).frame(width: 360)
+            }.padding(24).frame(width: 420)
+                .interactiveDismissDisabled(model.operation != nil)
         }
         .alert("Удалить чат?", isPresented: Binding(get: { deleteCandidate != nil }, set: {
             if !$0 { deleteCandidate = nil }
@@ -2027,7 +2244,7 @@ private struct AssetsPanel: View {
                 Spacer()
                 Button("Добавить ресурс…") { model.importAsset() }
                     .accessibilityIdentifier("import-asset")
-                    .disabled(snapshot.readOnly)
+                    .disabled(model.writesBlocked)
             }
             if snapshot.document.assets.isEmpty {
                 ContentUnavailableView("Нет ресурсов", systemImage: "photo")
@@ -2074,6 +2291,7 @@ private struct DiagnosticsPanel: View {
     @ObservedObject var model: WorkspaceModel
     @StoredState private var review: ConflictReview?
     @StoredState private var confirmDiscardFrame = false
+    @StoredState private var confirmDiscardDeferred = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2088,10 +2306,27 @@ private struct DiagnosticsPanel: View {
                 }
             }
             if model.frameDraft != nil {
-                Label("Есть неразрешённый черновик фрейма. Завершите ввод или явно отбросьте его до выбора версии.", systemImage: "exclamationmark.triangle")
+                Label("Есть неразрешённый черновик фрейма. Отложите его или явно отбросьте до выбора версии.", systemImage: "exclamationmark.triangle")
+                Button("Отложить черновик до разрешения") { model.deferFrameDraft() }
+                    .accessibilityIdentifier("defer-frame-draft")
+                    .disabled(model.operation != nil)
                 Button("Отбросить черновик фрейма…") { confirmDiscardFrame = true }
                     .accessibilityIdentifier("discard-frame-draft")
                     .disabled(model.operation != nil)
+            }
+            if let deferred = model.deferredFrameDraft {
+                Label("Черновик отложен в памяти. После выбора версии проверьте его перед применением.", systemImage: "doc.text")
+                VStack(alignment: .leading) {
+                    Text("Название: \(deferred.draft.name)")
+                    Text("Ширина: \(deferred.draft.width)")
+                    Text("Высота: \(deferred.draft.height)")
+                }
+                .textSelection(.enabled)
+                HStack {
+                    Button("Вернуть черновик") { model.restoreDeferredFrameDraft() }
+                    Button("Отбросить отложенный черновик…") { confirmDiscardDeferred = true }
+                }
+                .disabled(model.operation != nil)
             }
             if let warning = model.watchWarning {
                 Label(warning, systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
@@ -2120,7 +2355,7 @@ private struct DiagnosticsPanel: View {
                             .textSelection(.enabled)
                         }
                         if let blocked = diagnostics.blockedGenerated, !blocked.isEmpty {
-                            Label("Внешний сгенерированный код не синхронизирован с документом; повторная генерация заблокирована.", systemImage: "exclamationmark.triangle")
+                            Label("Внешний сгенерированный код не синхронизирован с документом; повторная генерация и создание переносимого снимка заблокированы до снятия блокировки.", systemImage: "exclamationmark.triangle")
                             ForEach(blocked, id: \.self) { path in Text(path).textSelection(.enabled) }
                         }
                         ForEach(diagnostics.conflicts) { conflict in
@@ -2184,6 +2419,13 @@ private struct DiagnosticsPanel: View {
             Button("Отмена", role: .cancel) {}
         } message: {
             Text("Не применённый ввод в полях фрейма будет потерян. Уже применённые изменения документа не отменяются.")
+        }
+        .alert("Отбросить отложенный черновик?", isPresented: $confirmDiscardDeferred) {
+            Button("Отбросить черновик", role: .destructive) { model.discardDeferredFrameDraft() }
+                .disabled(model.operation != nil)
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Отложенный ввод будет потерян. При необходимости сначала скопируйте значения из диагностики.")
         }
     }
 }
@@ -2468,15 +2710,19 @@ private struct FrameEditor: View {
                     Text("Укажите название и положительные размеры.")
                         .font(.caption).foregroundStyle(.red)
                 }
-                Button("Применить") { model.commitFrameDraft() }
+                if model.frameDraftNeedsReview {
+                    Text("Проверьте отложенный черновик и нажмите «Применить».")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Button("Применить") { model.commitFrameDraft(reviewed: true) }
                     .accessibilityIdentifier("apply-frame")
                     .buttonStyle(.borderedProminent)
                     .clipShape(Capsule())
-                    .disabled(snapshot.readOnly || (model.frameDraft.map { $0.dimensions == nil } ?? false))
+                    .disabled(model.writesBlocked || model.deferredFrameDraft != nil || (model.frameDraft.map { $0.dimensions == nil } ?? false))
             }
             .formStyle(.grouped)
             .frame(width: 270)
-            .disabled(snapshot.readOnly)
+            .disabled(snapshot.readOnly || model.deferredFrameDraft != nil || (model.writesBlocked && model.frameDraft == nil))
         }
         .padding(24)
         .onChange(of: focus) { previous, next in

@@ -307,6 +307,39 @@ final class AIConstructorUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Новый чат"].exists)
     }
 
+    func testRecentProjectRejectsDifferentIdentityAtSamePath() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-identity-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+
+        let project = base.appendingPathComponent("projects/Новый проект").standardizedFileURL.resolvingSymlinksInPath()
+        let manifest = project.appendingPathComponent("project.json")
+        var replacement = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any])
+        replacement["projectId"] = UUID().uuidString.lowercased()
+        let changed = try JSONSerialization.data(withJSONObject: replacement, options: [.prettyPrinted, .sortedKeys])
+        try changed.write(to: manifest, options: .atomic)
+        let row = app.descendants(matching: .any)["recent-project-\(project.path)"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(row))
+        row.click()
+        let alert = app.alerts["Ошибка"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Идентификатор проекта не совпадает")).firstMatch.exists)
+        XCTAssertEqual(try Data(contentsOf: manifest), changed)
+    }
+
     func testExternalChangeRequiresExplicitVersionChoice() throws {
         continueAfterFailure = false
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-ui-\(UUID().uuidString)", isDirectory: true)
@@ -553,5 +586,242 @@ final class AIConstructorUITests: XCTestCase {
             return entries.filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("completed.json").path) }.count == 2
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [limited], timeout: 10), .completed)
+    }
+
+    func testDeferredFrameDraftSurvivesExternalResolution() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-draft-conflict-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        let width = app.textFields["frame-width"]
+        XCTAssertTrue(width.waitForExistence(timeout: 10))
+        width.click()
+        width.typeKey("a", modifierFlags: .command)
+        width.typeText("0")
+
+        let project = base.appendingPathComponent("projects/Новый проект")
+        let path = project.appendingPathComponent("document.json")
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        var nodes = try XCTUnwrap(document["nodes"] as? [[String: Any]])
+        nodes[0]["name"] = "External"
+        document["nodes"] = nodes
+        let external = try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+        try external.write(to: path, options: .atomic)
+        app.descendants(matching: .any)["panel-diagnostics"].firstMatch.click()
+        let review = app.buttons["Просмотреть и разрешить…"]
+        XCTAssertTrue(review.waitForExistence(timeout: 20))
+        XCTAssertFalse(review.isEnabled)
+        let deferDraft = app.buttons["defer-frame-draft"]
+        XCTAssertTrue(deferDraft.waitForExistence(timeout: 5))
+        deferDraft.click()
+        XCTAssertTrue(waitUntilEnabled(review))
+        review.click()
+        let picker = app.popUpButtons["Использовать"].firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 10))
+        picker.click()
+        app.menuItems["Версия на диске"].click()
+        app.buttons["Применить выбор…"].click()
+        let confirm = app.buttons["Применить"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        confirm.click()
+        XCTAssertTrue(waitForFrame(project, name: "External", width: 1440, height: 900))
+        app.descendants(matching: .any)["panel-inspector"].firstMatch.click()
+        XCTAssertEqual(app.textFields["frame-name"].value as? String, "External")
+        XCTAssertEqual(width.value as? String, "0")
+        XCTAssertTrue(app.staticTexts["Проверьте отложенный черновик и нажмите «Применить»."].exists)
+        XCTAssertTrue(waitForFrame(project, name: "External", width: 1440, height: 900))
+        width.click()
+        width.typeKey("a", modifierFlags: .command)
+        width.typeText("800")
+        let pause = expectation(description: "a rebased draft is not autosaved before review")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { pause.fulfill() }
+        wait(for: [pause], timeout: 3)
+        XCTAssertTrue(waitForFrame(project, name: "External", width: 1440, height: 900))
+        app.buttons["apply-frame"].click()
+        XCTAssertTrue(waitForFrame(project, name: "External", width: 800, height: 900))
+    }
+
+    func testUnreadablePanelSettingsDoNotBlockNavigationOrGetOverwritten() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-panel-settings-ui-\(UUID().uuidString)", isDirectory: true)
+        let support = base.appendingPathComponent("support/AIConstructor", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let settings = support.appendingPathComponent("panel-settings.json")
+        let original = Data("{invalid settings".utf8)
+        try original.write(to: settings)
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        let initialAlert = app.alerts["Ошибка"]
+        XCTAssertTrue(initialAlert.waitForExistence(timeout: 10))
+        initialAlert.buttons["OK"].click()
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        app.descendants(matching: .any)["panel-diagnostics"].firstMatch.click()
+        let warning = app.alerts["Ошибка"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 10))
+        warning.buttons["OK"].click()
+        XCTAssertTrue(app.staticTexts["Диагностика проекта"].waitForExistence(timeout: 10))
+        XCTAssertEqual(try Data(contentsOf: settings), original)
+    }
+
+    func testRejectedUndoReportsErrorWithoutMarkingCleanProjectDirty() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-undo-error-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        let undo = app.buttons["Отменить"]
+        XCTAssertTrue(waitUntilEnabled(undo))
+        undo.click()
+        let alert = app.alerts["Ошибка"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "UNSUPPORTED_FEATURE")).firstMatch.exists)
+        alert.buttons["OK"].click()
+        XCTAssertTrue(app.staticTexts["Сохранено"].waitForExistence(timeout: 10))
+    }
+
+    func testFutureManifestOpensReadOnlyWithoutDowngrade() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-future-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        app.terminate()
+
+        let project = base.appendingPathComponent("projects/Новый проект").standardizedFileURL.resolvingSymlinksInPath()
+        let manifest = project.appendingPathComponent("project.json")
+        var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any])
+        fields["schemaVersion"] = 999
+        let future = try JSONSerialization.data(withJSONObject: fields, options: [.prettyPrinted, .sortedKeys])
+        try future.write(to: manifest, options: .atomic)
+        app.launch()
+        let row = app.descendants(matching: .any)["recent-project-\(project.path)"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        XCTAssertTrue(app.staticTexts["Только чтение"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.textFields["frame-name"].isEnabled)
+        XCTAssertEqual(try Data(contentsOf: manifest), future)
+    }
+
+    func testPortableSnapshotPreservesIdentityAndChatsWithoutLocalState() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-portable-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        app.descendants(matching: .any)["panel-chats"].firstMatch.click()
+        let newChat = app.buttons["Новый чат"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(newChat))
+        newChat.click()
+        let title = app.textFields["chat-title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.click()
+        title.typeText("Portable notes")
+        app.buttons["confirm-chat"].click()
+        let message = app.textViews["chat-message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(message))
+        message.click()
+        message.typeText("Portable message")
+        app.buttons["save-chat-message"].click()
+        XCTAssertTrue(app.staticTexts["Portable message"].waitForExistence(timeout: 10))
+
+        let actions = app.descendants(matching: .any)["project-actions"].firstMatch
+        XCTAssertTrue(actions.waitForExistence(timeout: 10))
+        actions.click()
+        app.menuItems["Создать переносимый снимок…"].click()
+        let warning = app.alerts["Создать переносимый снимок?"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 5))
+        XCTAssertTrue(warning.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "приватные")).firstMatch.exists)
+        XCTAssertTrue(warning.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "архивы конфликтов")).firstMatch.exists)
+        warning.buttons["Продолжить"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        let completed = app.alerts["Переносимый снимок создан"]
+        XCTAssertTrue(completed.waitForExistence(timeout: 20))
+        completed.buttons["OK"].click()
+
+        let original = base.appendingPathComponent("projects/Новый проект")
+        let portable = base.appendingPathComponent("projects/Новый проект — снимок")
+        let source = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: original.appendingPathComponent("project.json"))) as? [String: Any])
+        let copy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: portable.appendingPathComponent("project.json"))) as? [String: Any])
+        XCTAssertEqual(source["projectId"] as? String, copy["projectId"] as? String)
+        for name in [".git", ".aic-local", ".cache"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: portable.appendingPathComponent(name).path))
+        }
+        let chats = try FileManager.default.contentsOfDirectory(at: portable.appendingPathComponent("chats"), includingPropertiesForKeys: nil)
+        let texts = try chats.map { try String(contentsOf: $0.appendingPathComponent("messages.jsonl"), encoding: .utf8) }
+        XCTAssertTrue(texts.contains { $0.contains("Portable message") })
+    }
+
+    func testSavedFocusedFrameDoesNotDisableProjectActions() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-focused-actions-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        let name = app.textFields["frame-name"]
+        XCTAssertTrue(name.waitForExistence(timeout: 10))
+        name.click()
+        name.typeKey("a", modifierFlags: .command)
+        name.typeText("Saved focused frame")
+        XCTAssertTrue(waitForFrame(base.appendingPathComponent("projects/Новый проект"), name: "Saved focused frame"))
+        XCTAssertTrue(app.staticTexts["Сохранено"].waitForExistence(timeout: 10))
+        app.descendants(matching: .any)["project-actions"].firstMatch.click()
+        XCTAssertTrue(app.menuItems["Дублировать проект…"].isEnabled)
+        XCTAssertTrue(app.menuItems["Создать переносимый снимок…"].isEnabled)
+        XCTAssertTrue(app.menuItems["Создать контрольную точку"].isEnabled)
     }
 }

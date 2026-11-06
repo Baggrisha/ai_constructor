@@ -1016,3 +1016,276 @@ fn fifo_assets_are_rejected_before_any_blocking_open() {
     worker.join().unwrap();
     assert_eq!(snapshot(&session), before);
 }
+
+#[test]
+fn portable_snapshot_preserves_project_history_and_chats_without_local_files() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    rename(&session, "Saved frame");
+    session.save().unwrap();
+    let chat: Value =
+        serde_json::from_str(&session.create_chat("Private", "discuss").unwrap()).unwrap();
+    let chat_id = chat["id"].as_str().unwrap();
+    let input = json!({"role":"user","content":[{"type":"text","text":"Private message"}],"attachments":[]});
+    session
+        .append_chat_message(chat_id, &input.to_string())
+        .unwrap();
+    session.create_checkpoint().unwrap();
+    std::fs::create_dir(path.join(".git")).unwrap();
+    std::fs::write(path.join(".aic-local/secret"), b"local").unwrap();
+    std::fs::write(path.join(".cache/secret"), b"cached").unwrap();
+
+    let copy = dir.path().join("portable");
+    session.create_portable_snapshot(&copy).unwrap();
+    for excluded in [".git", ".aic-local", ".cache"] {
+        assert!(!copy.join(excluded).exists());
+    }
+    let marker: Value =
+        serde_json::from_slice(&std::fs::read(path.join("project.json")).unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read(copy.join("project.json")).unwrap(),
+        std::fs::read(path.join("project.json")).unwrap()
+    );
+    for tracked in marker["files"].as_object().unwrap().keys() {
+        assert_eq!(
+            std::fs::read(copy.join(tracked)).unwrap(),
+            std::fs::read(path.join(tracked)).unwrap(),
+            "{tracked}"
+        );
+    }
+    let restored = open_project(&copy).unwrap();
+    assert_eq!(
+        snapshot(&restored)["document"],
+        snapshot(&session)["document"]
+    );
+    assert_eq!(
+        restored.chats_json().unwrap(),
+        session.chats_json().unwrap()
+    );
+    assert_eq!(
+        restored.chat_messages_json(chat_id).unwrap(),
+        session.chat_messages_json(chat_id).unwrap()
+    );
+}
+
+#[test]
+fn portable_snapshot_rejects_unsaved_stale_and_occupied_destinations() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    let destination = dir.path().join("portable");
+    let control = std::sync::Arc::new(aic_core::cancellation::OperationControl::new());
+    control.request_cancel();
+    assert_eq!(
+        session
+            .create_portable_snapshot_controlled(&destination, control)
+            .unwrap_err()
+            .code,
+        "CANCELED"
+    );
+    assert!(!destination.exists());
+    rename(&session, "Unsaved");
+    assert_eq!(
+        session
+            .create_portable_snapshot(&destination)
+            .unwrap_err()
+            .code,
+        "UNSAVED_CHANGES"
+    );
+    assert!(!destination.exists());
+    session.save().unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("keep"), b"existing").unwrap();
+    assert!(session.create_portable_snapshot(&destination).is_err());
+    assert_eq!(
+        std::fs::read(destination.join("keep")).unwrap(),
+        b"existing"
+    );
+    let stale_destination = dir.path().join("stale");
+    std::fs::write(path.join(".gitignore"), b"external").unwrap();
+    assert_eq!(
+        session
+            .create_portable_snapshot(&stale_destination)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    assert!(!stale_destination.exists());
+    let diagnostics: Value = serde_json::from_str(&session.diagnostics_json().unwrap()).unwrap();
+    assert!(diagnostics["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|conflict| conflict["kind"] == "externalChange"));
+}
+
+#[test]
+fn duplicate_preserves_undo_redo_and_original_audit_records() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    rename(&session, "A");
+    session.save().unwrap();
+    rename(&session, "B");
+    session.save().unwrap();
+    session.undo().unwrap();
+    session.save().unwrap();
+    let source_id = snapshot(&session)["document"]["projectId"].clone();
+    let copy_path = dir.path().join("copy");
+    let copy = session.duplicate_to(&copy_path, "Copy").unwrap();
+    let copy_id = snapshot(&copy)["document"]["projectId"].clone();
+    assert_ne!(source_id, copy_id);
+    for entry in std::fs::read_dir(path.join("history/transactions")).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            std::fs::read(entry.path()).unwrap(),
+            std::fs::read(
+                copy_path
+                    .join("history/transactions")
+                    .join(entry.file_name())
+            )
+            .unwrap()
+        );
+    }
+    let history: Value =
+        serde_json::from_slice(&std::fs::read(copy_path.join("history/state.json")).unwrap())
+            .unwrap();
+    for doc in history["undo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(history["redo"].as_array().unwrap())
+    {
+        assert_eq!(doc["projectId"], copy_id);
+    }
+    copy.redo().unwrap();
+    assert_eq!(snapshot(&copy)["document"]["nodes"][0]["name"], "B");
+    copy.undo().unwrap();
+    copy.undo().unwrap();
+    assert_eq!(snapshot(&copy)["document"]["nodes"][0]["name"], "Frame");
+    assert_eq!(snapshot(&session)["document"]["nodes"][0]["name"], "A");
+    copy.save().unwrap();
+    drop(copy);
+    let reopened = open_project(&copy_path).unwrap();
+    assert_eq!(snapshot(&reopened)["document"]["nodes"][0]["name"], "Frame");
+}
+
+#[test]
+fn duplicate_preserves_tracked_source_files_outside_user_and_generated() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    std::fs::write(path.join("src/extra.ts"), b"export const source = 42;\n").unwrap();
+    let diagnostics: Value = serde_json::from_str(&session.diagnostics_json().unwrap()).unwrap();
+    let conflict = diagnostics["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "externalChange")
+        .unwrap();
+    let selections: Vec<_> = conflict["paths"].as_array().unwrap().iter().map(|entry| {
+        json!({"path": entry["path"], "take": if entry["path"] == "src/extra.ts" {"disk"} else {"local"}})
+    }).collect();
+    let request = json!({
+        "schemaVersion": 1, "conflictId": conflict["id"],
+        "expectedDiskToken": diagnostics["observedDiskToken"],
+        "expectedLocalGeneration": diagnostics["localGeneration"],
+        "selections": selections,
+    });
+    session
+        .resolve_external_conflict(&request.to_string())
+        .unwrap();
+    let destination = dir.path().join("copy");
+    let copy = session.duplicate_to(&destination, "Copy").unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("src/extra.ts")).unwrap(),
+        b"export const source = 42;\n"
+    );
+    let archive = format!(
+        "conflicts/{}/metadata.json",
+        conflict["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        std::fs::read(destination.join(&archive)).unwrap(),
+        std::fs::read(path.join(&archive)).unwrap()
+    );
+    drop(copy);
+    open_project(&destination).unwrap();
+}
+
+#[test]
+fn duplicate_refuses_unknown_history_without_rewriting_it() {
+    use sha2::{Digest, Sha256};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    rename(&session, "Saved");
+    session.save().unwrap();
+    drop(session);
+    let history_path = path.join("history/state.json");
+    let mut history: Value =
+        serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
+    history["futureHistory"] = json!({"preserve": [1, 2, 3]});
+    let mut history_bytes = serde_json::to_vec_pretty(&history).unwrap();
+    history_bytes.push(b'\n');
+    std::fs::write(&history_path, &history_bytes).unwrap();
+    let marker_path = path.join("project.json");
+    let mut marker: Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+    marker["files"]["history/state.json"] = json!(format!("{:x}", Sha256::digest(&history_bytes)));
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
+    marker_bytes.push(b'\n');
+    std::fs::write(marker_path, marker_bytes).unwrap();
+    let source = open_project(&path).unwrap();
+    let destination = dir.path().join("copy");
+    assert_eq!(
+        source
+            .duplicate_to(&destination, "Copy")
+            .err()
+            .unwrap()
+            .code,
+        "UNSUPPORTED_FEATURE"
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(history_path).unwrap(), history_bytes);
+}
+
+#[test]
+fn duplicate_refuses_unrecognized_agent_records_without_data_loss() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("source");
+    let session = create_project(&path, "Original").unwrap();
+    let run_id = Uuid::new_v4();
+    let relative = format!("agent/runs/{run_id}.json");
+    let bytes = br#"{"futureAgentData":{"preserve":[1,2,3]}}"#;
+    std::fs::write(path.join(&relative), bytes).unwrap();
+    let diagnostics: Value = serde_json::from_str(&session.diagnostics_json().unwrap()).unwrap();
+    let conflict = diagnostics["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "externalChange")
+        .unwrap();
+    let selections: Vec<_> = conflict["paths"].as_array().unwrap().iter().map(|entry| {
+        json!({"path":entry["path"],"take":if entry["path"] == relative {"disk"} else {"local"}})
+    }).collect();
+    let request = json!({
+        "schemaVersion":1, "conflictId":conflict["id"],
+        "expectedDiskToken":diagnostics["observedDiskToken"],
+        "expectedLocalGeneration":diagnostics["localGeneration"], "selections":selections
+    });
+    session
+        .resolve_external_conflict(&request.to_string())
+        .unwrap();
+    let destination = dir.path().join("copy");
+    assert_eq!(
+        session
+            .duplicate_to(&destination, "Copy")
+            .err()
+            .unwrap()
+            .code,
+        "UNSUPPORTED_FEATURE"
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(path.join(relative)).unwrap(), bytes);
+}

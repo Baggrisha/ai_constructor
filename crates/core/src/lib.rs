@@ -74,6 +74,29 @@ struct History {
     file_restore_barrier: Option<usize>,
 }
 
+fn duplicate_history(bytes: &[u8], source_project: Uuid, target_project: Uuid) -> Result<History> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| CoreError::invalid(format!("Invalid history: {error}")))?;
+    let fields = ["undo", "redo", "transaction_ids", "file_restore_barrier"];
+    if value
+        .as_object()
+        .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
+    {
+        return Err(CoreError::unsupported(
+            "Cannot duplicate history with unknown fields",
+        ));
+    }
+    let mut history: History = serde_json::from_value(value)
+        .map_err(|error| CoreError::invalid(format!("Invalid history: {error}")))?;
+    for document in history.undo.iter_mut().chain(history.redo.iter_mut()) {
+        if document.project_id != source_project {
+            return Err(CoreError::invalid("History belongs to another project"));
+        }
+        document.project_id = target_project;
+    }
+    Ok(history)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Checkpoint {
@@ -571,6 +594,9 @@ impl ProjectSession {
     fn travel(&self, redo: bool) -> Result<String> {
         let mut state = self.state()?;
         state.ensure_writable()?;
+        if let Err(error) = storage::validate_current(&self.path, &state.manifest_bytes) {
+            return Err(self.preserve_conflict_error(&state, error));
+        }
         if !redo
             && state
                 .history
@@ -644,6 +670,9 @@ impl ProjectSession {
         }
         let mut state = self.state()?;
         state.ensure_writable()?;
+        if let Err(error) = storage::validate_current(&self.path, &state.manifest_bytes) {
+            return Err(self.preserve_conflict_error(&state, error));
+        }
         if state.manifest.name != name {
             storage::control::begin_commit()?;
             state.bump()?;
@@ -651,6 +680,35 @@ impl ProjectSession {
             state.dirty = true;
         }
         Ok(())
+    }
+
+    /// Export a saved, conflict-free revision, preserving tracked files and
+    /// conflict archives but excluding machine-local state and access grants.
+    pub fn create_portable_snapshot(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let state = self.state()?;
+        if state.dirty {
+            return Err(CoreError::new(
+                "UNSAVED_CHANGES",
+                "Save the project before creating a snapshot",
+            ));
+        }
+        let destination = destination.as_ref();
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if parent
+            .canonicalize()?
+            .starts_with(self.path.canonicalize()?)
+        {
+            return Err(CoreError::invalid(
+                "A snapshot cannot be placed inside the source project",
+            ));
+        }
+        let stage = StagedProject::new(destination)?;
+        storage::write_portable_snapshot(&self.path, stage.path(), &state)?;
+        state.ensure_writable()?;
+        stage.publish(destination)
     }
 
     pub fn duplicate_to(
@@ -674,7 +732,9 @@ impl ProjectSession {
                 "A duplicate cannot be placed inside the source project",
             ));
         }
-        let inputs = storage::snapshot_all_inputs(&self.path, &state.manifest_bytes)?;
+        let snapshot = storage::snapshot_all_inputs(&self.path, &state.manifest_bytes)?;
+        let inputs = snapshot.files;
+        let blocked_generated = snapshot.blocked_generated;
         if inputs.keys().any(|path| path.starts_with("agent/")) {
             return Err(CoreError::unsupported(
                 "Duplicating projects with agent records is not supported by this version",
@@ -690,6 +750,7 @@ impl ProjectSession {
         let stage = StagedProject::new(destination)?;
         let duplicate = storage::control::staging(|| {
             let duplicate = create_in_place(stage.path(), name)?;
+            let mut archives = BTreeMap::new();
             {
                 let mut target = duplicate.state()?;
                 target.bump()?;
@@ -703,13 +764,32 @@ impl ProjectSession {
                 document.validate()?;
                 target.document = serde_json::to_value(document)
                     .map_err(|e| CoreError::invalid(e.to_string()))?;
+                let history = inputs
+                    .get("history/state.json")
+                    .map(|bytes| {
+                        duplicate_history(
+                            bytes,
+                            state.manifest.project_id,
+                            target.manifest.project_id,
+                        )
+                    })
+                    .transpose()?;
                 for (path, bytes) in inputs {
-                    if path == ".gitignore"
+                    if path.starts_with("conflicts/") {
+                        archives.insert(path, bytes);
+                    } else if path == ".gitignore"
                         || path.starts_with("src/")
                         || path.starts_with("assets/")
+                        || (path.starts_with("history/") && path != "history/state.json")
                     {
                         target.pending.insert(path, bytes);
                     }
+                }
+                if let Some(history) = history {
+                    target
+                        .pending
+                        .insert("history/state.json".into(), storage::json(&history)?);
+                    target.history = history;
                 }
                 for (path, bytes) in chats.into_files(target.manifest.project_id)? {
                     target.pending.insert(path, bytes);
@@ -719,6 +799,7 @@ impl ProjectSession {
             }
             duplicate.save()?;
             storage::copy_executable_modes(&self.path, stage.path(), &modes)?;
+            storage::write_duplicate_safety(stage.path(), &archives, &blocked_generated)?;
             Ok(duplicate)
         })?;
         drop(duplicate);

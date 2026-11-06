@@ -1056,7 +1056,7 @@ struct GeneratedBlock {
     hash: String,
 }
 
-fn write_generated_block(root: &Path, path: &str, digest: &str) -> Result<()> {
+pub(super) fn write_generated_block(root: &Path, path: &str, digest: &str) -> Result<()> {
     if !path.starts_with("src/generated/") {
         return Err(CoreError::invalid("Invalid generated source path"));
     }
@@ -2048,7 +2048,10 @@ mod tests {
         );
         let info = diagnostics(&session);
         let request = resolution(&info, "externalChange", ".gitignore");
-        session.undo().unwrap();
+        session
+            .resolve_external_conflict(&request.to_string())
+            .unwrap();
+        let after_resolution = snapshot(&session);
         assert_eq!(
             session
                 .resolve_external_conflict(&request.to_string())
@@ -2056,7 +2059,7 @@ mod tests {
                 .code,
             "REVISION_CONFLICT"
         );
-        assert_eq!(snapshot(&session)["document"]["nodes"][0]["name"], "Frame");
+        assert_eq!(snapshot(&session), after_resolution);
     }
 
     #[test]
@@ -2150,6 +2153,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("project");
         let session = crate::create_project(&root, "Example").unwrap();
+        let checkpoint = session.create_checkpoint().unwrap();
         fs::write(root.join("src/generated/external.tsx"), b"external source").unwrap();
         let info = diagnostics(&session);
         let request = resolution(&info, "externalChange", "src/generated/external.tsx");
@@ -2164,6 +2168,28 @@ mod tests {
             .unwrap()
             .iter()
             .any(|path| path == "src/generated/external.tsx"));
+        let portable = temporary.path().join("portable");
+        assert_eq!(
+            reopened
+                .create_portable_snapshot(&portable)
+                .unwrap_err()
+                .code,
+            "REVISION_CONFLICT"
+        );
+        assert!(!portable.exists());
+        let duplicate_path = temporary.path().join("duplicate");
+        let duplicate = reopened.duplicate_to(&duplicate_path, "Copy").unwrap();
+        let copy_info = diagnostics(&duplicate);
+        assert!(copy_info["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
+        assert!(duplicate.restore_checkpoint(&checkpoint).is_err());
+        assert_eq!(
+            fs::read(duplicate_path.join("src/generated/external.tsx")).unwrap(),
+            b"external source"
+        );
         let state = reopened.state().unwrap();
         let changes =
             BTreeMap::from([("src/generated/external.tsx".into(), b"replacement".to_vec())]);
@@ -2197,6 +2223,18 @@ mod tests {
         old.write_all(&bytes).unwrap();
         old.sync_all().unwrap();
         let info = diagnostics(&session);
+        assert_eq!(info["readOnly"], true);
+        assert_eq!(info["manifestChanged"], false);
+        assert!(info["files"].as_array().unwrap().is_empty());
+        let portable = temporary.path().join("portable");
+        assert_eq!(
+            session
+                .create_portable_snapshot(&portable)
+                .unwrap_err()
+                .code,
+            "REVISION_CONFLICT"
+        );
+        assert!(!portable.exists());
         let request = resolution(&info, "retainedWrite", "document.json");
         session
             .resolve_external_conflict(&request.to_string())
@@ -2205,12 +2243,20 @@ mod tests {
             snapshot(&session)["document"]["nodes"][0]["name"],
             "Late external"
         );
+        session.create_portable_snapshot(&portable).unwrap();
+        let id = request["conflictId"].as_str().unwrap();
+        let archive = format!("conflicts/{id}/metadata.json");
+        assert_eq!(
+            fs::read(portable.join(&archive)).unwrap(),
+            fs::read(root.join(&archive)).unwrap()
+        );
         drop(session);
         let reopened = crate::open_project(&root).unwrap();
         assert_eq!(
             snapshot(&reopened)["document"]["nodes"][0]["name"],
             "Late external"
         );
+        assert_eq!(diagnostics(&reopened)["readOnly"], false);
         assert!(diagnostics(&reopened)["conflicts"]
             .as_array()
             .unwrap()

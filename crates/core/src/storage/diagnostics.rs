@@ -35,6 +35,7 @@ impl ProjectSession {
             current_manifest.as_deref(),
             &disk_token,
         )?;
+        let unresolved = !external_conflicts.is_empty() || !recovery_conflicts.is_empty();
         let mut files = Vec::new();
         let paths: BTreeSet<_> = state.manifest.files.keys().chain(observed.keys()).collect();
         for path in paths {
@@ -93,13 +94,21 @@ impl ProjectSession {
                 conflicts.push(external);
             }
         }
-        let read_only = state.read_only_reason.is_some() || manifest_changed || !files.is_empty();
+        let reason = state.read_only_reason.as_deref().or({
+            if manifest_changed || !files.is_empty() {
+                Some(super::EXTERNAL_CHANGE_REASON)
+            } else if unresolved {
+                Some("A preserved external or recovery conflict requires a choice")
+            } else {
+                None
+            }
+        });
         serde_json::to_string(&json!({
             "schemaVersion": 1,
             "baseManifestHash": super::hash(&state.manifest_bytes),
             "localGeneration": state.local_generation,
-            "readOnly": read_only,
-            "readOnlyReason": state.read_only_reason,
+            "readOnly": reason.is_some(),
+            "readOnlyReason": reason,
             "manifestChanged": manifest_changed,
             "files": files,
             "conflicts": conflicts,

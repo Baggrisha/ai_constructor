@@ -254,6 +254,15 @@ impl ProjectSession {
             .inner
             .rename_and_save_controlled(&name, control.inner.clone())?)
     }
+    pub fn create_portable_snapshot_controlled(
+        &self,
+        destination: String,
+        control: Arc<OperationControl>,
+    ) -> Result<(), CoreError> {
+        Ok(self
+            .inner
+            .create_portable_snapshot_controlled(destination, control.inner.clone())?)
+    }
     pub fn duplicate_to_controlled(
         &self,
         destination: String,

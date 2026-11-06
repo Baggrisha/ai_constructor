@@ -694,7 +694,7 @@ fn editing_reports_too_late_after_memory_publication_and_keeps_failed_save() {
 }
 
 #[test]
-fn controlled_undo_preserves_local_state_when_external_change_blocks_save() {
+fn controlled_undo_rejects_a_stale_disk_without_mutating_local_state() {
     use crate::cancellation::{OperationControl, OperationStatus};
     use std::sync::Arc;
     let temp = tempfile::tempdir().unwrap();
@@ -702,6 +702,7 @@ fn controlled_undo_preserves_local_state_when_external_change_blocks_save() {
     let session = create_project(&path, "Example").unwrap();
     change(&session);
     session.save().unwrap();
+    let before = snapshot(&session);
     std::fs::write(path.join(".gitignore"), b"external change\n").unwrap();
     let control = Arc::new(OperationControl::new());
     let error = session
@@ -709,13 +710,38 @@ fn controlled_undo_preserves_local_state_when_external_change_blocks_save() {
         .unwrap_err();
     assert_eq!(error.code, "REVISION_CONFLICT");
     assert_eq!(control.status(), OperationStatus::Failed);
-    let after = snapshot(&session);
-    assert_eq!(after["dirty"], true);
-    assert_eq!(after["document"]["nodes"][0]["name"], "Frame");
+    assert_eq!(snapshot(&session), before);
     assert_eq!(
         std::fs::read(path.join(".gitignore")).unwrap(),
         b"external change\n"
     );
+}
+
+#[test]
+fn redo_and_rename_reject_a_stale_disk_without_mutating_local_state() {
+    for operation in ["redo", "rename"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project");
+        let session = create_project(&path, "Example").unwrap();
+        change(&session);
+        session.save().unwrap();
+        session.undo().unwrap();
+        session.save().unwrap();
+        let before = snapshot(&session);
+        std::fs::write(path.join(".gitignore"), b"external change\n").unwrap();
+        let error = match operation {
+            "redo" => session.redo().map(|_| ()),
+            "rename" => session.rename("Changed"),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert_eq!(error.code, "REVISION_CONFLICT", "{operation}");
+        assert_eq!(snapshot(&session), before, "{operation}");
+        assert_eq!(
+            std::fs::read(path.join(".gitignore")).unwrap(),
+            b"external change\n"
+        );
+    }
 }
 
 #[test]

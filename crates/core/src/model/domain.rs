@@ -369,6 +369,87 @@ pub struct ResponsiveOverride {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorData {
     pub paths: Vec<Vec<VectorCommand>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<VectorShape>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum VectorShape {
+    Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rx: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ry: Option<f64>,
+    },
+    Circle {
+        cx: f64,
+        cy: f64,
+        r: f64,
+    },
+    Ellipse {
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+    },
+    Line {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+    Polyline {
+        points: Vec<VectorPoint>,
+    },
+    Polygon {
+        points: Vec<VectorPoint>,
+    },
+}
+
+impl VectorShape {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Rect { x, y, w, h, rx, ry } => {
+                [*x, *y, *w, *h].into_iter().all(f64::is_finite)
+                    && *w > 0.0
+                    && *h > 0.0
+                    && [*rx, *ry]
+                        .into_iter()
+                        .flatten()
+                        .all(|r| r.is_finite() && r >= 0.0)
+            }
+            Self::Circle { cx, cy, r } => {
+                [*cx, *cy, *r].into_iter().all(f64::is_finite) && *r > 0.0
+            }
+            Self::Ellipse { cx, cy, rx, ry } => {
+                [*cx, *cy, *rx, *ry].into_iter().all(f64::is_finite) && *rx > 0.0 && *ry > 0.0
+            }
+            Self::Line { x1, y1, x2, y2 } => [*x1, *y1, *x2, *y2].into_iter().all(f64::is_finite),
+            Self::Polyline { points } | Self::Polygon { points } => {
+                let minimum = if matches!(self, Self::Polygon { .. }) {
+                    3
+                } else {
+                    2
+                };
+                points.len() >= minimum
+                    && points
+                        .iter()
+                        .all(|point| point.x.is_finite() && point.y.is_finite())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
