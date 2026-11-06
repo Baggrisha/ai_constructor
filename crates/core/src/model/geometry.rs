@@ -5,7 +5,7 @@ use std::{
 
 use uuid::Uuid;
 
-use super::domain::{Alignment, Binding, FlowDirection, Scalar, SizeMode};
+use super::domain::{Alignment, Binding, FeatureItem, FlowDirection, Scalar, SizeMode};
 use super::{text::TextEngine, CoreError, Document, Node, NodeKind, Result};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,6 +19,7 @@ struct LayoutContext<'a> {
     document: &'a Document,
     project_path: &'a Path,
     images: HashMap<Uuid, (f64, f64)>,
+    vectors: HashMap<Uuid, (f64, f64)>,
     active: HashSet<(Uuid, Axis)>,
     active_stack: Vec<(Uuid, Axis)>,
 }
@@ -30,6 +31,7 @@ impl<'a> LayoutContext<'a> {
             document,
             project_path,
             images: HashMap::new(),
+            vectors: HashMap::new(),
             active: HashSet::new(),
             active_stack: Vec::new(),
         }
@@ -97,6 +99,24 @@ impl<'a> LayoutContext<'a> {
         self.images.insert(id, size);
         Ok(size)
     }
+
+    fn vector_size(&mut self, node: &Node) -> Result<(f64, f64)> {
+        if let Some(size) = self.vectors.get(&node.id) {
+            return Ok(*size);
+        }
+        let vector = node
+            .content
+            .known()
+            .and_then(|content| content.vector.as_ref())
+            .ok_or_else(|| {
+                CoreError::unsupported(format!("No supported vector geometry on node {}", node.id))
+            })?;
+        let size = super::vector::intrinsic_size(vector).map_err(|error| {
+            CoreError::new(error.code, format!("{} on node {}", error.message, node.id))
+        })?;
+        self.vectors.insert(node.id, size);
+        Ok(size)
+    }
 }
 
 fn responsive(node: &Node, breakpoint: Option<f64>) -> Option<&super::ResponsiveOverride> {
@@ -160,8 +180,8 @@ fn dimension(
     Ok((value, mode))
 }
 
-// Text and raster images have measurable intrinsic dimensions; other leaf kinds
-// remain unsupported until their renderer defines intrinsic metrics.
+// Intrinsic sizes come from text, raster images, vector geometry, flow children,
+// or a component's template. Other leaves need renderer-defined metrics.
 fn measured_size(
     id: Uuid,
     axis: Axis,
@@ -263,6 +283,47 @@ fn measured_size_inner(
                         )));
                     }
                     sizes.insert((id, axis), size);
+                    continue;
+                }
+                if matches!(node.kind, NodeKind::Vector) {
+                    let (width, height) = text.vector_size(node)?;
+                    sizes.insert(
+                        (id, axis),
+                        if axis == Axis::Horizontal {
+                            width
+                        } else {
+                            height
+                        },
+                    );
+                    continue;
+                }
+                if matches!(node.kind, NodeKind::ComponentInstance) && node.children.is_empty() {
+                    let component_id = node
+                        .content
+                        .known()
+                        .and_then(|content| content.component_id)
+                        .ok_or_else(|| {
+                            CoreError::invalid(format!("Missing component on node {id}"))
+                        })?;
+                    let root = text
+                        .document
+                        .components
+                        .iter()
+                        .find_map(|component| match component {
+                            FeatureItem::Known(component) if component.id == component_id => {
+                                Some(component.root_id)
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            CoreError::invalid(format!("Missing component {component_id}"))
+                        })?;
+                    if !finish {
+                        pending.push((id, true));
+                        pending.push((root, false));
+                    } else {
+                        sizes.insert((id, axis), sizes[&(root, axis)]);
+                    }
                     continue;
                 }
                 let flow = node.layout.flow.as_ref().ok_or_else(|| {

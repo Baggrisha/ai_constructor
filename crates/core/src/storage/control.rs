@@ -151,6 +151,13 @@ impl ProjectSession {
     ) -> Result<String> {
         run(control, || self.restore_checkpoint(id))
     }
+    pub fn restore_checkpoint_with_missing_modes_controlled(
+        &self,
+        id: &str,
+        control: Arc<OperationControl>,
+    ) -> Result<String> {
+        run(control, || self.restore_checkpoint_with_missing_modes(id))
+    }
     pub fn import_asset_controlled(
         &self,
         path: impl AsRef<Path>,

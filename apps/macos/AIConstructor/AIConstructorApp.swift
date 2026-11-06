@@ -565,15 +565,22 @@ private func loadProject(_ session: ProjectSession, at url: URL) throws -> Loade
 private struct SaveResult {
     let snapshot: Snapshot
     let error: String?
+    let errorCode: String?
 }
 
 private func editAndSaveSnapshot(_ session: ProjectSession, work: () throws -> String) throws -> SaveResult {
     do {
-        return SaveResult(snapshot: try decodeJSON(Snapshot.self, work()), error: nil)
+        return SaveResult(snapshot: try decodeJSON(Snapshot.self, work()), error: nil, errorCode: nil)
     } catch {
         let operationError = error
+        let code: String?
+        if let coreError = operationError as? CoreError, case let .Failure(errorCode, _) = coreError {
+            code = errorCode
+        } else {
+            code = nil
+        }
         do {
-            return SaveResult(snapshot: try decodeJSON(Snapshot.self, session.snapshotJson()), error: readableError(operationError))
+            return SaveResult(snapshot: try decodeJSON(Snapshot.self, session.snapshotJson()), error: readableError(operationError), errorCode: code)
         } catch {
             throw NSError(domain: "AIConstructor", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "\(readableError(operationError))\nНе удалось получить состояние проекта: \(readableError(error))"
@@ -625,6 +632,7 @@ private struct DeferredFrameDraft {
 private final class WorkspaceModel: ObservableObject {
     @Published var snapshot: Snapshot?
     @Published var checkpoints: [Checkpoint] = []
+    @Published var checkpointAwaitingModeConfirmation: Checkpoint?
     @Published var chats: [Chat] = []
     @Published var messages: [ChatMessage] = []
     @Published var chatSearchResults: [ChatSearchHit]?
@@ -647,6 +655,7 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var frameAutosaving = false
     @Published private(set) var frameDraftNeedsReview = false
     @Published private(set) var deferredFrameDraft: DeferredFrameDraft?
+    @Published private(set) var frameEditorId = UUID()
     private var operationControl: OperationControl?
     private var diagnosticControl: OperationControl?
     private var possibleUnsaved = false
@@ -847,9 +856,11 @@ private final class WorkspaceModel: ObservableObject {
         sessions[url.path] = loaded.session
         sessionProjectIds[url.path] = loaded.snapshot.document.projectId
         currentPath = url
+        invalidateFrameEditor()
         snapshot = loaded.snapshot
         possibleUnsaved = loaded.snapshot.dirty
         checkpoints = []
+        checkpointAwaitingModeConfirmation = nil
         deferredChatLoad = false
         deferredChatId = nil
         chats = []
@@ -1016,9 +1027,11 @@ private final class WorkspaceModel: ObservableObject {
             observationPending = false
             watchWarning = nil
             currentPath = nil
+            invalidateFrameEditor()
             snapshot = nil
             possibleUnsaved = false
             checkpoints = []
+            checkpointAwaitingModeConfirmation = nil
             chats = []
             messages = []
             chatSearchResults = nil
@@ -1122,6 +1135,19 @@ private final class WorkspaceModel: ObservableObject {
         } else if let currentPath {
             remember(currentPath)
         }
+    }
+
+    private func invalidateFrameEditor() {
+        stopFrameAutosaveRetries()
+        frameFocused = false
+        frameEditorId = UUID()
+    }
+
+    private func acceptHistoryChange(_ result: SaveResult) {
+        frameDraft = nil
+        frameDraftNeedsReview = false
+        invalidateFrameEditor()
+        accept(result)
     }
 
     func updateFrameDraft(_ field: WritableKeyPath<FrameDraft, String>, value: String) {
@@ -1295,7 +1321,7 @@ private final class WorkspaceModel: ObservableObject {
             try editAndSaveSnapshot(session) { try session.undoAndSaveControlled(control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.accept($0) }
+        }) { self.acceptHistoryChange($0) }
     }
 
     func redo() {
@@ -1309,7 +1335,7 @@ private final class WorkspaceModel: ObservableObject {
             try editAndSaveSnapshot(session) { try session.redoAndSaveControlled(control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.accept($0) }
+        }) { self.acceptHistoryChange($0) }
     }
 
     func createCheckpoint() {
@@ -1332,7 +1358,7 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func restoreCheckpoint(_ checkpoint: Checkpoint) {
+    func restoreCheckpoint(_ checkpoint: Checkpoint, allowMissingModes: Bool = false) {
         guard operation == nil else { return }
         clearSavedFrameDraft()
         guard !writesBlocked, frameDraft == nil, deferredFrameDraft == nil, let session else { return }
@@ -1340,10 +1366,23 @@ private final class WorkspaceModel: ObservableObject {
         possibleUnsaved = true
         let control = newOperationControl()
         perform("Восстановление контрольной точки…", control: control, work: {
-            try editAndSaveSnapshot(session) { try session.restoreCheckpointControlled(id: checkpoint.id, control: control) }
+            try editAndSaveSnapshot(session) {
+                if allowMissingModes {
+                    return try session.restoreCheckpointWithMissingModesControlled(id: checkpoint.id, control: control)
+                }
+                return try session.restoreCheckpointControlled(id: checkpoint.id, control: control)
+            }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.accept($0) }
+        }) { result in
+            if !allowMissingModes && result.errorCode == "CHECKPOINT_MODE_CONFIRMATION_REQUIRED" {
+                self.snapshot = result.snapshot
+                self.possibleUnsaved = result.snapshot.dirty
+                self.checkpointAwaitingModeConfirmation = checkpoint
+            } else {
+                self.acceptHistoryChange(result)
+            }
+        }
     }
 
     func refreshCheckpoints() {
@@ -1382,7 +1421,7 @@ private final class WorkspaceModel: ObservableObject {
         guard operation == nil else { return }
         clearSavedFrameDraft()
         guard !writesBlocked, !hasUnsavedData, frameDraft == nil, deferredFrameDraft == nil,
-              diagnostics?.blockedGenerated?.isEmpty != false, let session, let snapshot else { return }
+              let session, let snapshot else { return }
         let panel = NSSavePanel()
         panel.title = "Переносимый снимок проекта"
         panel.message = "Выберите новое расположение снимка."
@@ -1571,7 +1610,9 @@ private final class WorkspaceModel: ObservableObject {
             _ = try session.relinkAssetControlled(id: asset.id, path: url.path, control: control)
             return try decodeJSON(Snapshot.self, session.snapshotJson())
         }) {
+            let wasReadOnly = self.snapshot?.readOnly == true
             self.snapshot = $0
+            if wasReadOnly && !$0.readOnly { self.refreshCheckpoints() }
             self.watchChanged()
         }
     }
@@ -1647,6 +1688,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     private func applyResolvedSnapshot(_ snapshot: Snapshot, completion: () -> Void) {
+        invalidateFrameEditor()
         self.snapshot = snapshot
         possibleUnsaved = snapshot.dirty
         diagnostics = nil
@@ -1661,6 +1703,7 @@ private final class WorkspaceModel: ObservableObject {
             deferredFrameDraft = nil
         }
         checkpoints = []
+        checkpointAwaitingModeConfirmation = nil
         chats = []
         messages = []
         selectedChatId = nil
@@ -1768,8 +1811,8 @@ private struct WorkspaceView: View {
         switch library.panels[snapshot.document.projectId] ?? .inspector {
         case .inspector:
             if let root = snapshot.root {
-                FrameEditor(snapshot: snapshot, root: root, model: model)
-                    .id(snapshot.document.projectId)
+                FrameEditor(snapshot: snapshot, root: root, model: model, editorId: model.frameEditorId)
+                    .id(model.frameEditorId)
             } else {
                 ContentUnavailableView("Нет корневого фрейма", systemImage: "exclamationmark.triangle")
             }
@@ -1831,7 +1874,7 @@ private struct WorkspaceView: View {
                             Button("В архив") { model.archiveCurrent() }
                             Button("Дублировать проект…") { model.duplicate() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                             Button("Создать переносимый снимок…") { confirmPortableSnapshot = true }
-                                .disabled(model.writesBlocked || model.hasUnsavedData || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil || model.diagnostics?.blockedGenerated?.isEmpty == false)
+                                .disabled(model.writesBlocked || model.hasUnsavedData || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                             Button("Создать контрольную точку") { model.createCheckpoint() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
                             Button("Обновить список контрольных точек") { model.refreshCheckpoints() }
                                 .disabled(model.writesBlocked)
@@ -1952,6 +1995,17 @@ private struct WorkspaceView: View {
             Button("Отмена", role: .cancel) { checkpointToRestore = nil }
         } message: { checkpoint in
             Text("Будет восстановлена ревизия \(checkpoint.revision) вместе с файлами снимка. Текущие файлы проекта могут измениться.")
+        }
+        .alert("Восстановить файлы без права запуска?", isPresented: Binding(get: { model.checkpointAwaitingModeConfirmation != nil }, set: {
+            if !$0 { model.checkpointAwaitingModeConfirmation = nil }
+        }), presenting: model.checkpointAwaitingModeConfirmation) { checkpoint in
+            Button("Восстановить без права запуска", role: .destructive) {
+                model.checkpointAwaitingModeConfirmation = nil
+                model.restoreCheckpoint(checkpoint, allowMissingModes: true)
+            }
+            Button("Отмена", role: .cancel) { model.checkpointAwaitingModeConfirmation = nil }
+        } message: { _ in
+            Text("В этой контрольной точке не сохранены права запуска отсутствующих файлов. Восстановить их без права запуска? Права существующих файлов сохранятся.")
         }
         .alert("Создать переносимый снимок?", isPresented: $confirmPortableSnapshot) {
             Button("Продолжить") { model.createPortableSnapshot() }
@@ -2355,7 +2409,7 @@ private struct DiagnosticsPanel: View {
                             .textSelection(.enabled)
                         }
                         if let blocked = diagnostics.blockedGenerated, !blocked.isEmpty {
-                            Label("Внешний сгенерированный код не синхронизирован с документом; повторная генерация и создание переносимого снимка заблокированы до снятия блокировки.", systemImage: "exclamationmark.triangle")
+                            Label("Внешний сгенерированный код не синхронизирован с документом. Повторная генерация и восстановление, затрагивающее этот код, заблокированы; защита сохраняется в переносимом снимке.", systemImage: "exclamationmark.triangle")
                             ForEach(blocked, id: \.self) { path in Text(path).textSelection(.enabled) }
                         }
                         ForEach(diagnostics.conflicts) { conflict in
@@ -2660,18 +2714,20 @@ private struct FrameEditor: View {
     let snapshot: Snapshot
     let root: Snapshot.Document.Node
     @ObservedObject var model: WorkspaceModel
+    let editorId: UUID
     private enum Field: Hashable { case name, width, height }
     @FocusState private var focus: Field?
-    init(snapshot: Snapshot, root: Snapshot.Document.Node, model: WorkspaceModel) {
+    init(snapshot: Snapshot, root: Snapshot.Document.Node, model: WorkspaceModel, editorId: UUID) {
         self.snapshot = snapshot
         self.root = root
         self.model = model
+        self.editorId = editorId
     }
 
     private func binding(_ field: WritableKeyPath<FrameDraft, String>) -> Binding<String> {
         Binding(
             get: { (model.frameDraft ?? FrameDraft(root))[keyPath: field] },
-            set: { model.updateFrameDraft(field, value: $0) }
+            set: { if model.frameEditorId == editorId { model.updateFrameDraft(field, value: $0) } }
         )
     }
 
@@ -2726,10 +2782,12 @@ private struct FrameEditor: View {
         }
         .padding(24)
         .onChange(of: focus) { previous, next in
+            guard model.frameEditorId == editorId else { return }
             model.setFrameFocused(next != nil)
             if previous != nil && previous != next { model.commitFrameDraft() }
         }
         .onDisappear {
+            guard model.frameEditorId == editorId else { return }
             model.setFrameFocused(false)
             model.commitFrameDraft()
         }

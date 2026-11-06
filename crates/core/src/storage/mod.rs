@@ -24,8 +24,9 @@ pub(crate) mod retention;
 mod services;
 
 pub(crate) use assets::{font_asset, image_dimensions};
+pub(crate) use conflicts::generated_block;
 pub(crate) use diagnostics::capture_external;
-pub(crate) use services::rewrite_chats;
+pub(crate) use services::{chat_attachment_ids, rewrite_chats};
 const EXTERNAL_CHANGE_REASON: &str =
     "Project files were changed outside the editor; open read-only to avoid overwriting them";
 
@@ -101,6 +102,13 @@ pub(crate) fn manifest_has_unknown_fields(bytes: &[u8]) -> Result<bool> {
     Ok(fields.keys().any(|key| !KNOWN.contains(&key.as_str())))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ModeTransition {
+    pub(crate) before: Option<u32>,
+    pub(crate) after: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
@@ -109,6 +117,8 @@ struct Entry {
     new_hash: Option<String>,
     old_copy: Option<String>,
     new_copy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modes: Option<ModeTransition>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,12 +126,31 @@ struct ObservedMarker {
     hash: Option<String>,
 }
 
+// Older cores must not replay a journal that also changes file modes.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "camelCase")]
+enum JournalRevision {
+    Legacy(u64),
+    ModeAware { mode_aware_revision: u64 },
+}
+
+impl JournalRevision {
+    fn value(self) -> u64 {
+        match self {
+            Self::Legacy(value)
+            | Self::ModeAware {
+                mode_aware_revision: value,
+            } => value,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Journal {
     old_manifest_hash: String,
     new_manifest_hash: String,
-    old_revision: u64,
+    old_revision: JournalRevision,
     new_revision: u64,
     old_generation: u64,
     new_generation: u64,
@@ -270,6 +299,10 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    durable_write_mode(path, bytes, None)
+}
+
+fn durable_write_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -289,6 +322,20 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(chunk)?;
     }
     control::check()?;
+    if let Some(mode) = mode {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if mode & !0o7777 != 0 {
+                return Err(CoreError::invalid("Invalid file mode"));
+            }
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        return Err(CoreError::unsupported(
+            "File modes are unavailable on this platform",
+        ));
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -398,6 +445,54 @@ fn unexpected_retained(dir: &Path, old: Option<&str>, new: Option<&str>) -> Resu
     Ok(false)
 }
 
+fn entry_matches(root: &Path, entry: &Entry, after: bool) -> Result<bool> {
+    let (digest, mode) = if after {
+        (&entry.new_hash, entry.modes.as_ref().map(|m| m.after))
+    } else {
+        (&entry.old_hash, entry.modes.as_ref().map(|m| m.before))
+    };
+    if file_hash(root, &entry.path)? != *digest {
+        return Ok(false);
+    }
+    match mode {
+        Some(expected) => Ok(file_mode(root, &entry.path)? == expected),
+        None => Ok(true),
+    }
+}
+
+fn unexpected_retained_mode(dir: &Path, entry: &Entry) -> Result<bool> {
+    let Some(modes) = &entry.modes else {
+        return Ok(false);
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for item in entries {
+        let item = item?;
+        if !item.file_type()?.is_file() {
+            return Ok(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = Some(item.metadata()?.permissions().mode() & 0o7777);
+            let digest = hash_file(&item.path())?;
+            if !((entry.old_hash.as_ref() == Some(&digest) && modes.before == mode)
+                || (entry.new_hash.as_ref() == Some(&digest) && modes.after == mode))
+            {
+                return Ok(true);
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(CoreError::unsupported(
+            "File modes are unavailable on this platform",
+        ));
+    }
+    Ok(false)
+}
+
 fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut current = parent;
@@ -440,6 +535,27 @@ fn replace_with(
     bytes: Option<&[u8]>,
     retained: &Path,
 ) -> Result<()> {
+    replace_with_modes(root, relative, expected, bytes, retained, None)
+}
+
+fn replace_with_modes(
+    root: &Path,
+    relative: &str,
+    expected: Option<&str>,
+    bytes: Option<&[u8]>,
+    retained: &Path,
+    modes: Option<&ModeTransition>,
+) -> Result<()> {
+    if let Some(modes) = modes {
+        if modes.before.is_some() != expected.is_some()
+            || modes.after.is_some() != bytes.is_some()
+            || file_mode(root, relative)? != modes.before
+        {
+            return Err(CoreError::conflict(format!(
+                "File mode changed: {relative}"
+            )));
+        }
+    }
     let path = safe_path(root, relative)?;
     let parent = path
         .parent()
@@ -455,7 +571,7 @@ fn replace_with(
     if let Some(bytes) = bytes {
         let local = root.join(".aic-local");
         let temp = local.join(format!("replace-{}.tmp", Uuid::new_v4()));
-        durable_write(&temp, bytes)?;
+        durable_write_mode(&temp, bytes, modes.and_then(|mode| mode.after))?;
         sync_dir(&local)?;
         atomic::move_no_replace(&temp, &slot)?;
         sync_dir(&local)?;
@@ -482,6 +598,19 @@ fn replace_with(
                 "External edit of {relative} preserved at {}",
                 slot.display()
             )));
+        }
+        if let Some(modes) = modes {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if Some(fs::symlink_metadata(&slot)?.permissions().mode() & 0o7777) != modes.before
+                {
+                    return Err(CoreError::conflict(format!(
+                        "External mode change of {relative} preserved at {}",
+                        slot.display()
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -713,7 +842,7 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             serde_json::from_slice(&old_manifest).map_err(|e| CoreError::invalid(e.to_string()))?;
         let new: Manifest =
             serde_json::from_slice(&new_manifest).map_err(|e| CoreError::invalid(e.to_string()))?;
-        if old.revision != journal.old_revision
+        if old.revision != journal.old_revision.value()
             || new.revision != journal.new_revision
             || old.storage_generation != journal.old_generation
             || new.storage_generation != journal.new_generation
@@ -762,6 +891,9 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             )? {
                 reason = Some("External change retained in .aic-local/retained; resolve manually");
             }
+            if unexpected_retained_mode(&retained.join(format!("entry-{index}")), entry)? {
+                reason = Some("External file mode change retained; resolve manually");
+            }
             let allowed = entry.path == "document.json"
                 || entry.path == ".gitignore"
                 || [
@@ -794,14 +926,25 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             {
                 return Err(CoreError::invalid("Journal entry does not match manifests"));
             }
+            if let Some(modes) = &entry.modes {
+                if !checkpoint_dependency_path(&entry.path)
+                    || modes.before.is_some() != entry.old_hash.is_some()
+                    || modes.after.is_some() != entry.new_hash.is_some()
+                    || [modes.before, modes.after]
+                        .into_iter()
+                        .flatten()
+                        .any(|mode| mode & !0o7777 != 0)
+                {
+                    return Err(CoreError::invalid("Invalid journal file modes"));
+                }
+            }
             if let (Some(name), Some(expected)) = (&entry.old_copy, &entry.old_hash) {
                 verify_backup(&dir, name, expected)?;
             }
             if let (Some(name), Some(expected)) = (&entry.new_copy, &entry.new_hash) {
                 verify_backup(&dir, name, expected)?;
             }
-            let current = file_hash(root, &entry.path)?;
-            if current != entry.old_hash && current != entry.new_hash {
+            if !entry_matches(root, entry, false)? && !entry_matches(root, entry, true)? {
                 reason = Some("External change conflicts with recovery");
             }
         }
@@ -812,13 +955,14 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                 .iter()
                 .filter(|entry| &entry.path == path)
                 .count();
-            if changes
-                != if old_files.get(path) != new.files.get(path) {
-                    1
-                } else {
-                    0
-                }
-            {
+            let mode_changed = journal.entries.iter().any(|entry| {
+                &entry.path == path
+                    && entry
+                        .modes
+                        .as_ref()
+                        .is_some_and(|mode| mode.before != mode.after)
+            });
+            if changes != usize::from(old_files.get(path) != new.files.get(path) || mode_changed) {
                 return Err(CoreError::invalid(
                     "Journal does not describe all changed files",
                 ));
@@ -882,11 +1026,11 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
             } else {
                 &entry.old_hash
             };
-            if &file_hash(root, &entry.path)? == desired {
+            if entry_matches(root, entry, forward)? {
                 continue;
             }
             let current = file_hash(root, &entry.path)?;
-            if current != entry.old_hash && current != entry.new_hash {
+            if !entry_matches(root, entry, false)? && !entry_matches(root, entry, true)? {
                 preserve_conflict(root, &dir, &journal, "External change during recovery")?;
                 return Err(CoreError::conflict(
                     "External change during recovery; copies saved in conflicts",
@@ -902,18 +1046,23 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
                 .zip(desired.as_ref())
                 .map(|(name, hash)| verify_backup(&dir, name, hash))
                 .transpose()?;
+            let recovery_modes = entry.modes.as_ref().map(|modes| ModeTransition {
+                before: if forward { modes.before } else { modes.after },
+                after: if forward { modes.after } else { modes.before },
+            });
             #[cfg(test)]
             BEFORE_REPLACE.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().take() {
                     hook();
                 }
             });
-            replace_with(
+            replace_with_modes(
                 root,
                 &entry.path,
                 current.as_deref(),
                 bytes.as_deref(),
                 &retained.join(format!("entry-{index}")),
+                recovery_modes.as_ref(),
             )?;
         }
         let target: Manifest = serde_json::from_slice(if forward {
@@ -923,6 +1072,12 @@ fn recover(root: &Path) -> Result<Option<Loaded>> {
         })
         .map_err(|e| CoreError::invalid(e.to_string()))?;
         let target_files = if forward { &target.files } else { old_files };
+        for entry in &journal.entries {
+            if entry.modes.is_some() && !entry_matches(root, entry, forward)? {
+                preserve_conflict(root, &dir, &journal, "File mode changed during recovery")?;
+                return Err(CoreError::conflict("File mode changed during recovery"));
+            }
+        }
         if scan(root)? != *target_files
             || file_hash(root, "project.json")?.as_deref() != expected_marker
         {
@@ -977,6 +1132,39 @@ pub fn load(root: &Path) -> Result<Loaded> {
                 manifest = migrated.manifest;
                 manifest_bytes = migrated.manifest_bytes;
                 document = migrated.document_bytes;
+            }
+            // Earlier releases stored generated-file protection only locally.
+            // Promote those verified records through the normal file journal.
+            if manifest.schema_version == 1
+                && serde_json::from_slice::<crate::model::Document>(&document)
+                    .ok()
+                    .is_some_and(|model| model.editable() && model.validate().is_ok())
+            {
+                let mut additions = BTreeMap::new();
+                for (path, bytes) in conflicts::legacy_generated_blocks(root)? {
+                    match manifest.files.get(&path) {
+                        Some(expected) if *expected == hash(&bytes) => {}
+                        Some(_) => {
+                            return Err(CoreError::conflict("Generated source block differs"))
+                        }
+                        None => {
+                            additions.insert(path, bytes);
+                        }
+                    }
+                }
+                if !additions.is_empty() {
+                    manifest_bytes = commit_locked(
+                        root,
+                        &manifest_bytes,
+                        &manifest,
+                        &additions,
+                        &BTreeSet::new(),
+                        None,
+                        None,
+                    )?;
+                    manifest = serde_json::from_slice(&manifest_bytes)
+                        .map_err(|e| CoreError::invalid(e.to_string()))?;
+                }
             }
         }
         if !conflicts::bootstrap(root, &manifest_bytes, &manifest)? {
@@ -1088,10 +1276,18 @@ fn check_portable_conflicts(
             "Resolve preserved conflicts before creating a snapshot",
         ));
     }
-    if !conflicts::blocked_generated(root, &state.manifest)?.is_empty() {
-        return Err(CoreError::conflict(
-            "A generated file has an unresolved external change; its protection cannot be transferred",
-        ));
+    for path in conflicts::blocked_generated(root, &state.manifest)? {
+        let digest = state
+            .manifest
+            .files
+            .get(&path)
+            .ok_or_else(|| CoreError::invalid("Missing blocked generated file"))?;
+        let (record, bytes) = conflicts::generated_block(root, &path, digest)?;
+        if state.manifest.files.get(&record) != Some(&hash(&bytes)) {
+            return Err(CoreError::conflict(
+                "Reopen the project to transfer its local generated-file protection",
+            ));
+        }
     }
     Ok(())
 }
@@ -1256,7 +1452,17 @@ pub(super) fn write_duplicate_safety(
                 "Generated source changed in duplicate: {path}"
             )));
         }
-        conflicts::write_generated_block(root, path, expected)?;
+        let manifest: Manifest = serde_json::from_slice(
+            &file_bytes(root, "project.json")?
+                .ok_or_else(|| CoreError::invalid("Missing project manifest"))?,
+        )
+        .map_err(|e| CoreError::invalid(e.to_string()))?;
+        let (record, bytes) = conflicts::generated_block(root, path, expected)?;
+        if manifest.files.get(&record) != Some(&hash(&bytes)) {
+            return Err(CoreError::conflict(
+                "Duplicate is missing generated-file protection",
+            ));
+        }
     }
     Ok(())
 }
@@ -1278,11 +1484,6 @@ fn snapshot_selected(
     if scan(root)? != manifest.files {
         return Err(CoreError::conflict("Project files changed on disk"));
     }
-    let conflict_hashes = if all {
-        portable_conflict_hashes(root)?
-    } else {
-        BTreeMap::new()
-    };
     let mut blocked_generated = BTreeMap::new();
     if all {
         for path in conflicts::blocked_generated(root, &manifest)? {
@@ -1293,6 +1494,11 @@ fn snapshot_selected(
             blocked_generated.insert(path, digest.clone());
         }
     }
+    let conflict_hashes = if all {
+        portable_conflict_hashes(root)?
+    } else {
+        BTreeMap::new()
+    };
     let mut result = BTreeMap::new();
     for (path, expected) in &manifest.files {
         if all
@@ -1370,6 +1576,51 @@ pub fn checkpoint_executable_mode(root: &Path, path: &str) -> Result<u32> {
 pub fn checkpoint_executable_mode(_root: &Path, _path: &str) -> Result<u32> {
     Err(CoreError::unsupported(
         "Checkpoint file permissions are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn file_mode(root: &Path, path: &str) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::symlink_metadata(safe_path(root, path)?) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Ok(Some(metadata.permissions().mode() & 0o7777))
+        }
+        Ok(_) => Err(CoreError::unsupported(format!(
+            "Not a regular file: {path}"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_mode(_root: &Path, _path: &str) -> Result<Option<u32>> {
+    Err(CoreError::unsupported(
+        "File modes are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn default_file_mode(root: &Path) -> Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = safe_path(root, &format!(".aic-local/mode-probe-{}", Uuid::new_v4()))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let mode = file
+        .metadata()
+        .map(|metadata| metadata.permissions().mode() & 0o7777);
+    drop(file);
+    fs::remove_file(&path)?;
+    Ok(mode?)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn default_file_mode(_root: &Path) -> Result<u32> {
+    Err(CoreError::unsupported(
+        "File modes are unavailable on this platform",
     ))
 }
 
@@ -1511,6 +1762,7 @@ pub fn checkpoint_destination(
     root: &Path,
     path: &str,
     directories: &mut BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>,
+    mode_aware: bool,
 ) -> Result<()> {
     let mut current = root.to_path_buf();
     let mut parts = Path::new(path).components().peekable();
@@ -1555,7 +1807,7 @@ pub fn checkpoint_destination(
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        if meta.permissions().mode() & 0o111 != 0 {
+                        if !mode_aware && meta.permissions().mode() & 0o111 != 0 {
                             return Err(CoreError::unsupported(format!(
                                 "Cannot safely replace an executable file: {path}"
                             )));
@@ -1726,6 +1978,53 @@ fn commit_locked(
     expected_observed: Option<&BTreeMap<String, String>>,
     observed_marker: Option<Option<&[u8]>>,
 ) -> Result<Vec<u8>> {
+    commit_locked_modes(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        expected_observed,
+        observed_marker,
+        None,
+    )
+}
+
+pub(crate) fn commit_with_file_modes(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    modes: &BTreeMap<String, ModeTransition>,
+) -> Result<Vec<u8>> {
+    let _lock = lock(root)?;
+    commit_locked_modes(
+        root,
+        expected_manifest,
+        new_manifest,
+        changes,
+        deletions,
+        None,
+        None,
+        Some(modes),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The journal records both file and mode preconditions"
+)]
+fn commit_locked_modes(
+    root: &Path,
+    expected_manifest: &[u8],
+    new_manifest: &Manifest,
+    changes: &BTreeMap<String, Vec<u8>>,
+    deletions: &BTreeSet<String>,
+    expected_observed: Option<&BTreeMap<String, String>>,
+    observed_marker: Option<Option<&[u8]>>,
+    modes: Option<&BTreeMap<String, ModeTransition>>,
+) -> Result<Vec<u8>> {
     if recover(root)?.is_some() {
         return Err(CoreError::conflict("Project requires recovery"));
     }
@@ -1781,6 +2080,29 @@ fn commit_locked(
             actual.insert(path.clone(), None);
         }
     }
+    if let Some(modes) = modes {
+        for (path, mode) in modes {
+            if !checkpoint_dependency_path(path)
+                || mode.before.is_some() != old_files.contains_key(path)
+                || mode.after.is_some() != new.files.contains_key(path)
+                || [mode.before, mode.after]
+                    .into_iter()
+                    .flatten()
+                    .any(|bits| bits & !0o7777 != 0)
+                || file_mode(root, path)? != mode.before
+            {
+                return Err(CoreError::conflict(format!(
+                    "Invalid or changed file mode: {path}"
+                )));
+            }
+            if mode.before != mode.after && !actual.contains_key(path) {
+                let bytes = changes.get(path).ok_or_else(|| {
+                    CoreError::invalid(format!("Missing mode-change content: {path}"))
+                })?;
+                actual.insert(path.clone(), Some(bytes.clone()));
+            }
+        }
+    }
     let document = match actual.get("document.json") {
         Some(Some(bytes)) => bytes.clone(),
         Some(None) => return Err(CoreError::invalid("Cannot delete the document")),
@@ -1820,6 +2142,11 @@ fn commit_locked(
         if old_files.get(path) != old_hash.as_ref() {
             return Err(CoreError::conflict(format!("External edit of {path}")));
         }
+        if let Some(mode) = modes.and_then(|modes| modes.get(path)) {
+            if file_mode(root, path)? != mode.before {
+                return Err(CoreError::conflict(format!("File mode changed: {path}")));
+            }
+        }
         let old_copy = if let Some(old_content) = &old_content {
             let name = format!("old-{i}");
             durable_write(&txdir.join(&name), old_content)?;
@@ -1840,12 +2167,19 @@ fn commit_locked(
             new_hash: bytes.as_deref().map(hash),
             old_copy,
             new_copy,
+            modes: modes.and_then(|modes| modes.get(path).cloned()),
         });
     }
     let journal = Journal {
         old_manifest_hash: hash(&old_bytes),
         new_manifest_hash: hash(&new_bytes),
-        old_revision: old.revision,
+        old_revision: if modes.is_some_and(|items| !items.is_empty()) {
+            JournalRevision::ModeAware {
+                mode_aware_revision: old.revision,
+            }
+        } else {
+            JournalRevision::Legacy(old.revision)
+        },
         new_revision: new.revision,
         old_generation: old.storage_generation,
         new_generation: new.storage_generation,
@@ -1872,7 +2206,7 @@ fn commit_locked(
     #[cfg(test)]
     interrupt_at(0)?;
     for (index, entry) in journal.entries.iter().enumerate() {
-        if file_hash(root, &entry.path)? != entry.old_hash {
+        if !entry_matches(root, entry, false)? {
             return Err(CoreError::conflict(format!(
                 "External edit of {}",
                 entry.path
@@ -1884,15 +2218,24 @@ fn commit_locked(
                 hook();
             }
         });
-        replace_with(
+        replace_with_modes(
             root,
             &entry.path,
             entry.old_hash.as_deref(),
             actual.get(&entry.path).and_then(Option::as_deref),
             &retained.join(format!("entry-{index}")),
+            entry.modes.as_ref(),
         )?;
         #[cfg(test)]
         interrupt_at(index + 1)?;
+    }
+    for entry in &journal.entries {
+        if entry.modes.is_some() && !entry_matches(root, entry, true)? {
+            return Err(CoreError::conflict(format!(
+                "External mode change of {}",
+                entry.path
+            )));
+        }
     }
     if scan(root)? != new.files || file_hash(root, "project.json")? != old_marker_hash {
         return Err(CoreError::conflict(

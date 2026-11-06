@@ -260,6 +260,8 @@ fn valid_receipt(receipt: &Receipt, id: Uuid, project: Uuid) -> bool {
 /// Exact set for a completed record; a tombstone may be missing listed items.
 fn inspect(path: &Path, receipt: &Receipt, partial: bool, has_receipt: bool) -> Result<()> {
     directory(path)?;
+    let journal: Journal = serde_json::from_str(&receipt.journal)
+        .map_err(|e| CoreError::invalid(format!("Invalid retained journal: {e}")))?;
     let mut seen_files = BTreeSet::new();
     let mut seen_dirs = BTreeSet::new();
     for entry in walkdir::WalkDir::new(path).min_depth(1).follow_links(false) {
@@ -286,6 +288,33 @@ fn inspect(path: &Path, receipt: &Receipt, partial: bool, has_receipt: bool) -> 
                 .ok_or_else(|| CoreError::invalid("Unknown retained file"))?;
             if regular_hash(entry.path())? != *expected {
                 return Err(CoreError::conflict("Retained file changed"));
+            }
+            if let Some((directory, _)) = relative.split_once('/') {
+                if let Some(index) = directory
+                    .strip_prefix("entry-")
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    if let Some(modes) = journal
+                        .entries
+                        .get(index)
+                        .and_then(|entry| entry.modes.as_ref())
+                    {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if Some(
+                                fs::symlink_metadata(entry.path())?.permissions().mode() & 0o7777,
+                            ) != modes.before
+                            {
+                                return Err(CoreError::conflict("Retained file mode changed"));
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        return Err(CoreError::unsupported(
+                            "File modes are unavailable on this platform",
+                        ));
+                    }
+                }
             }
             seen_files.insert(relative.to_owned());
         } else {

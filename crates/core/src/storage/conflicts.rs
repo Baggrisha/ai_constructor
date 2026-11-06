@@ -1056,76 +1056,75 @@ struct GeneratedBlock {
     hash: String,
 }
 
-pub(super) fn write_generated_block(root: &Path, path: &str, digest: &str) -> Result<()> {
+const GENERATED_BLOCKS: &str = "history/generated-blocks/";
+
+pub(crate) fn generated_block(root: &Path, path: &str, digest: &str) -> Result<(String, Vec<u8>)> {
     if !path.starts_with("src/generated/") {
         return Err(CoreError::invalid("Invalid generated source path"));
     }
     safe_path(root, path)?;
     check_hash(digest)?;
-    let directory = ensure_directory(root, ".aic-local/blocked-generated")?;
-    let name = format!("{}-{digest}.json", hash(path.as_bytes()));
-    let destination = directory.join(name);
+    let name = format!("{GENERATED_BLOCKS}{}-{digest}.json", hash(path.as_bytes()));
     let bytes = super::json(&GeneratedBlock {
         path: path.into(),
         hash: digest.into(),
     })?;
-    if destination.exists() {
-        if fs::read(&destination)? != bytes {
-            return Err(CoreError::conflict("Generated source block was modified"));
-        }
-        return Ok(());
-    }
-    let temp = directory.join(format!(".{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        super::durable_write(&temp, &bytes)?;
-        match atomic::move_no_replace(&temp, &destination) {
-            Ok(()) => sync_dir(&directory)?,
-            Err(e) if destination.exists() => {
-                if fs::read(&destination)? != bytes {
-                    return Err(e.into());
-                }
-                fs::remove_file(&temp)?;
-                sync_dir(&directory)?;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    Ok((name, bytes))
 }
 
-/// A block applies only while the committed path still contains those exact
-/// externally supplied bytes; an explicit resolution may select another hash.
-pub(super) fn blocked_generated(root: &Path, manifest: &Manifest) -> Result<Vec<String>> {
+pub(super) fn legacy_generated_blocks(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     let directory = safe_path(root, ".aic-local/blocked-generated")?;
-    let entries = match fs::read_dir(&directory) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e.into()),
     };
-    let mut paths = std::collections::BTreeSet::new();
+    let mut blocks = BTreeMap::new();
     for entry in entries {
         super::control::check()?;
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            return Err(CoreError::invalid("Invalid generated source block"));
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        let block: GeneratedBlock = serde_json::from_slice(&fs::read(entry.path())?)
-            .map_err(|e| CoreError::invalid(format!("Invalid generated source block: {e}")))?;
-        check_hash(&block.hash)?;
-        if !block.path.starts_with("src/generated/")
-            || name != format!("{}-{}.json", hash(block.path.as_bytes()), block.hash)
-        {
+        if !entry.file_type()?.is_file() {
             return Err(CoreError::invalid("Invalid generated source block"));
         }
-        safe_path(root, &block.path)?;
+        let block: GeneratedBlock = serde_json::from_slice(&fs::read(entry.path())?)
+            .map_err(|e| CoreError::invalid(format!("Invalid generated source block: {e}")))?;
+        let (portable_path, bytes) = generated_block(root, &block.path, &block.hash)?;
+        if portable_path.strip_prefix(GENERATED_BLOCKS) != Some(name.as_str()) {
+            return Err(CoreError::invalid("Invalid generated source block"));
+        }
+        blocks.insert(portable_path, bytes);
+    }
+    Ok(blocks)
+}
+
+/// The exact externally supplied bytes remain protected until explicitly resolved.
+pub(super) fn blocked_generated(root: &Path, manifest: &Manifest) -> Result<Vec<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut blocks = legacy_generated_blocks(root)?;
+    for (path, expected) in &manifest.files {
+        if !path.starts_with(GENERATED_BLOCKS) {
+            continue;
+        }
+        let bytes =
+            match file_bytes(root, path)? {
+                Some(bytes) if hash(&bytes) == *expected => bytes,
+                _ => baseline_file(root, &super::json(manifest)?, manifest, path)?.ok_or_else(
+                    || CoreError::conflict(format!("Changed generated source block {path}")),
+                )?,
+            };
+        blocks.insert(path.clone(), bytes);
+    }
+    for (path, bytes) in blocks {
+        let block: GeneratedBlock = serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError::invalid(format!("Invalid generated source block: {e}")))?;
+        let (expected, _) = generated_block(root, &block.path, &block.hash)?;
+        if path != expected {
+            return Err(CoreError::invalid("Invalid generated source block"));
+        }
         if manifest.files.get(&block.path) == Some(&block.hash) {
             paths.insert(block.path);
         }
@@ -1638,6 +1637,11 @@ impl crate::ProjectSession {
                 "Local document belongs to another project",
             ));
         }
+        if model.file_history_version.is_none() && before.file_history_version.is_some() {
+            model.file_history_version = before.file_history_version;
+            document =
+                serde_json::to_value(&model).map_err(|e| CoreError::invalid(e.to_string()))?;
+        }
         let local_dependencies_changed = state.pending.iter().any(|(path, bytes)| {
             (path.starts_with("src/") || path.starts_with("assets/"))
                 && files.get(path).map(String::as_str) != Some(hash(bytes).as_str())
@@ -1691,6 +1695,7 @@ impl crate::ProjectSession {
             let transaction_id = Uuid::new_v4();
             history.undo.push(before.clone());
             history.redo.clear();
+            history.redo_files.clear();
             history.transaction_ids.insert(transaction_id);
             let dependencies_changed = local_dependencies_changed
                 || base.files.keys().chain(files.keys()).any(|path| {
@@ -1718,7 +1723,24 @@ impl crate::ProjectSession {
             changes.insert(transaction_path, transaction);
         }
         for (path, digest) in generated_blocks {
-            write_generated_block(&self.path, &path, &digest)?;
+            let (block_path, bytes) = generated_block(&self.path, &path, &digest)?;
+            files.insert(block_path.clone(), hash(&bytes));
+            deletions.remove(&block_path);
+            changes.insert(block_path, bytes);
+        }
+        for path in blocked_generated(&self.path, &base)? {
+            if files.get(&path) == base.files.get(&path) {
+                let digest = base
+                    .files
+                    .get(&path)
+                    .ok_or_else(|| CoreError::invalid("Missing blocked generated file"))?;
+                let (record, bytes) = generated_block(&self.path, &path, digest)?;
+                if files.get(&record) != Some(&hash(&bytes)) {
+                    return Err(CoreError::conflict(
+                        "Cannot remove protection while the generated file is unchanged",
+                    ));
+                }
+            }
         }
         if let Some(source) = &archive.retained_source {
             if retained_hash(&safe_path(&self.path, &source.source)?)? != source.hash {
@@ -2169,14 +2191,59 @@ mod tests {
             .iter()
             .any(|path| path == "src/generated/external.tsx"));
         let portable = temporary.path().join("portable");
+        reopened.create_portable_snapshot(&portable).unwrap();
+        assert!(!portable.join(".aic-local").exists());
+        let portable_session = crate::open_project(&portable).unwrap();
+        assert!(diagnostics(&portable_session)["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
+        assert!(portable_session.restore_checkpoint(&checkpoint).is_err());
         assert_eq!(
-            reopened
-                .create_portable_snapshot(&portable)
-                .unwrap_err()
-                .code,
-            "REVISION_CONFLICT"
+            fs::read(portable.join("src/generated/external.tsx")).unwrap(),
+            b"external source"
         );
-        assert!(!portable.exists());
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "core.excludesFile=/dev/null"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let tracked = git(&["ls-files", "-z"]);
+        let copy = temporary.path().join("git-only");
+        fs::create_dir(&copy).unwrap();
+        let mut copied_block = false;
+        for path in std::str::from_utf8(&tracked)
+            .unwrap()
+            .split('\0')
+            .filter(|path| !path.is_empty())
+        {
+            copied_block |= path.starts_with("history/generated-blocks/");
+            let destination = copy.join(path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(root.join(path), destination).unwrap();
+        }
+        assert!(copied_block);
+        assert!(!copy.join(".aic-local").exists());
+        let git_copy = crate::open_project(&copy).unwrap();
+        assert!(diagnostics(&git_copy)["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
+        assert!(git_copy.restore_checkpoint(&checkpoint).is_err());
         let duplicate_path = temporary.path().join("duplicate");
         let duplicate = reopened.duplicate_to(&duplicate_path, "Copy").unwrap();
         let copy_info = diagnostics(&duplicate);
@@ -2186,6 +2253,36 @@ mod tests {
             .iter()
             .any(|path| path == "src/generated/external.tsx"));
         assert!(duplicate.restore_checkpoint(&checkpoint).is_err());
+        assert_eq!(
+            fs::read(duplicate_path.join("src/generated/external.tsx")).unwrap(),
+            b"external source"
+        );
+        drop(duplicate);
+        fs::remove_dir_all(duplicate_path.join(".aic-local")).unwrap();
+        let duplicate = crate::open_project(&duplicate_path).unwrap();
+        assert!(diagnostics(&duplicate)["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
+        assert!(duplicate.restore_checkpoint(&checkpoint).is_err());
+        let (record, _) = generated_block(
+            &duplicate_path,
+            "src/generated/external.tsx",
+            &hash(b"external source"),
+        )
+        .unwrap();
+        fs::remove_file(duplicate_path.join(&record)).unwrap();
+        let info = diagnostics(&duplicate);
+        assert!(info["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
+        let request = resolution(&info, "externalChange", &record);
+        assert!(duplicate
+            .resolve_external_conflict(&request.to_string())
+            .is_err());
         assert_eq!(
             fs::read(duplicate_path.join("src/generated/external.tsx")).unwrap(),
             b"external source"
@@ -2200,6 +2297,48 @@ mod tests {
             fs::read(root.join("src/generated/external.tsx")).unwrap(),
             b"external source"
         );
+    }
+
+    #[test]
+    fn legacy_generated_blocks_become_portable_on_open() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("project");
+        let session = crate::create_project(&root, "Example").unwrap();
+        fs::write(root.join("src/generated/external.tsx"), b"external source").unwrap();
+        let info = diagnostics(&session);
+        let request = resolution(&info, "externalChange", "src/generated/external.tsx");
+        session
+            .resolve_external_conflict(&request.to_string())
+            .unwrap();
+        drop(session);
+        let name = format!(
+            "{}-{}.json",
+            hash(b"src/generated/external.tsx"),
+            hash(b"external source")
+        );
+        let relative = format!("history/generated-blocks/{name}");
+        let portable_block = root.join(&relative);
+        let legacy = root.join(".aic-local/blocked-generated");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::rename(&portable_block, legacy.join(&name)).unwrap();
+        let mut manifest: Manifest =
+            serde_json::from_slice(&fs::read(root.join("project.json")).unwrap()).unwrap();
+        manifest.files.remove(&relative).unwrap();
+        fs::write(
+            root.join("project.json"),
+            super::super::json(&manifest).unwrap(),
+        )
+        .unwrap();
+        let reopened = crate::open_project(&root).unwrap();
+        assert!(portable_block.is_file());
+        drop(reopened);
+        fs::remove_dir_all(root.join(".aic-local")).unwrap();
+        let reopened = crate::open_project(&root).unwrap();
+        assert!(diagnostics(&reopened)["blockedGenerated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/generated/external.tsx"));
     }
 
     #[test]

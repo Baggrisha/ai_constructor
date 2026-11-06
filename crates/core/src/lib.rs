@@ -65,6 +65,22 @@ impl From<std::io::Error> for CoreError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileVersion {
+    hash: String,
+    mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileChange {
+    before: Option<FileVersion>,
+    after: Option<FileVersion>,
+}
+
+type FileChanges = BTreeMap<String, FileChange>;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct History {
     undo: Vec<Document>,
@@ -72,12 +88,59 @@ struct History {
     transaction_ids: BTreeSet<Uuid>,
     #[serde(default)]
     file_restore_barrier: Option<usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    undo_files: BTreeMap<usize, FileChanges>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    redo_files: BTreeMap<usize, FileChanges>,
+}
+
+impl History {
+    fn validate_file_entries(&self) -> Result<()> {
+        for (entries, count) in [
+            (&self.undo_files, self.undo.len()),
+            (&self.redo_files, self.redo.len()),
+        ] {
+            for (index, changes) in entries {
+                if *index >= count || changes.is_empty() {
+                    return Err(CoreError::invalid("Invalid file history index"));
+                }
+                for (path, change) in changes {
+                    if !storage::checkpoint_dependency_path(path)
+                        || change.before == change.after
+                        || [&change.before, &change.after]
+                            .into_iter()
+                            .flatten()
+                            .any(|version| {
+                                version.mode & !0o7777 != 0
+                                    || version.hash.len() != 64
+                                    || !version
+                                        .hash
+                                        .bytes()
+                                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            })
+                    {
+                        return Err(CoreError::invalid(format!(
+                            "Invalid file history for {path}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn duplicate_history(bytes: &[u8], source_project: Uuid, target_project: Uuid) -> Result<History> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| CoreError::invalid(format!("Invalid history: {error}")))?;
-    let fields = ["undo", "redo", "transaction_ids", "file_restore_barrier"];
+    let fields = [
+        "undo",
+        "redo",
+        "transaction_ids",
+        "file_restore_barrier",
+        "undo_files",
+        "redo_files",
+    ];
     if value
         .as_object()
         .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
@@ -88,6 +151,7 @@ fn duplicate_history(bytes: &[u8], source_project: Uuid, target_project: Uuid) -
     }
     let mut history: History = serde_json::from_value(value)
         .map_err(|error| CoreError::invalid(format!("Invalid history: {error}")))?;
+    history.validate_file_entries()?;
     for document in history.undo.iter_mut().chain(history.redo.iter_mut()) {
         if document.project_id != source_project {
             return Err(CoreError::invalid("History belongs to another project"));
@@ -212,6 +276,7 @@ struct State {
     pending: BTreeMap<String, Vec<u8>>,
     read_only_reason: Option<String>,
     local_generation: u64,
+    checkpoint_mode_confirmation: Option<(Uuid, u64)>,
     dirty: bool,
 }
 
@@ -352,6 +417,12 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
             Err(e) => return Err(e.into()),
         }
     };
+    history.validate_file_entries()?;
+    if (!history.undo_files.is_empty() || !history.redo_files.is_empty())
+        && document.get("fileHistoryVersion").and_then(Value::as_u64) != Some(1)
+    {
+        read_only_reason = Some("File history compatibility marker is missing".into());
+    }
     Ok(ProjectSession {
         path,
         retention_limit: AtomicU64::new(storage::retention::UNLIMITED),
@@ -362,6 +433,7 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
             history,
             pending: BTreeMap::new(),
             local_generation: 0,
+            checkpoint_mode_confirmation: None,
             read_only_reason,
             dirty: false,
         }),
@@ -573,12 +645,14 @@ impl ProjectSession {
             serde_json::json!({"transaction": transaction, "before": before, "after": next});
         storage::control::begin_commit()?;
         let redo = std::mem::take(&mut state.history.redo);
+        let redo_files = std::mem::take(&mut state.history.redo_files);
         state.history.undo.push(before);
         state.history.transaction_ids.insert(id);
         let result = state.record(id, description, document);
         if result.is_err() {
             state.history.undo.pop();
             state.history.redo = redo;
+            state.history.redo_files = redo_files;
             state.history.transaction_ids.remove(&id);
         }
         result
@@ -621,6 +695,22 @@ impl ProjectSession {
                 "Nothing to undo"
             })
         })?;
+        let file_changes = if redo {
+            state
+                .history
+                .redo_files
+                .get(&(state.history.redo.len() - 1))
+        } else {
+            state
+                .history
+                .undo_files
+                .get(&(state.history.undo.len() - 1))
+        }
+        .cloned();
+        if let Some(file_changes) = file_changes {
+            return self.travel_files(&mut state, redo, before, next, file_changes);
+        }
+        next.file_history_version = before.file_history_version.or(next.file_history_version);
         next.revision = before
             .revision
             .checked_add(1)
@@ -661,6 +751,162 @@ impl ProjectSession {
             }
         }
         result
+    }
+
+    fn travel_files(
+        &self,
+        state: &mut State,
+        redo: bool,
+        before: Document,
+        mut next: Document,
+        mut file_changes: FileChanges,
+    ) -> Result<String> {
+        if state
+            .pending
+            .keys()
+            .any(|path| path.starts_with("src/") || path.starts_with("assets/"))
+        {
+            return Err(CoreError::unsupported(
+                "Save pending file changes before changing history",
+            ));
+        }
+        let inputs = storage::snapshot_inputs(&self.path, &state.manifest_bytes)?;
+        let chat_assets = self.preserve_chat_assets(state, &before, &mut next, &inputs)?;
+        let mut changes = state.pending.clone();
+        let mut deletions = BTreeSet::new();
+        let mut modes = BTreeMap::new();
+        let mut target_files = state.manifest.files.clone();
+        let mut directories = BTreeMap::new();
+        for (path, change) in &mut file_changes {
+            let (expected, target) = if redo {
+                (change.before.clone(), change.after.clone())
+            } else {
+                (change.after.clone(), change.before.clone())
+            };
+            let current_hash = inputs.get(path).map(|bytes| storage::hash(bytes));
+            let current_mode = storage::file_mode(&self.path, path)?;
+            if current_hash.as_ref() != expected.as_ref().map(|version| &version.hash)
+                || current_mode != expected.as_ref().map(|version| version.mode)
+            {
+                return Err(CoreError::conflict(format!(
+                    "File history no longer matches {path}"
+                )));
+            }
+            if chat_assets.contains(path) && target.is_none() {
+                if redo {
+                    change.after = expected;
+                } else {
+                    change.before = expected;
+                }
+                continue;
+            }
+            storage::checkpoint_destination(&self.path, path, &mut directories, true)?;
+            if let Some(target) = &target {
+                let bytes = storage::checkpoint_blob(&self.path, &state.manifest, &target.hash)?;
+                storage::validate_checkpoint_asset(path, &target.hash)?;
+                target_files.insert(path.clone(), target.hash.clone());
+                changes.insert(path.clone(), bytes);
+            } else {
+                target_files.remove(path);
+                deletions.insert(path.clone());
+            }
+            modes.insert(
+                path.clone(),
+                storage::ModeTransition {
+                    before: expected.as_ref().map(|version| version.mode),
+                    after: target.as_ref().map(|version| version.mode),
+                },
+            );
+        }
+        file_changes.retain(|_, change| change.before != change.after);
+        let dependencies = target_files
+            .iter()
+            .filter(|(path, _)| storage::checkpoint_dependency_path(path))
+            .map(|(path, hash)| (path.clone(), hash.clone()))
+            .collect();
+        storage::validate_checkpoint_tree(&self.path, &dependencies)?;
+        next.file_history_version = Some(1);
+        next.revision = before
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CoreError::invalid("Revision overflow"))?;
+        next.mark_restored_properties(&before);
+        next.validate()?;
+        next.validate_files(&target_files)?;
+        let document =
+            serde_json::to_value(&next).map_err(|e| CoreError::invalid(e.to_string()))?;
+        let mut history = state.history.clone();
+        if redo {
+            let index = history.redo.len() - 1;
+            history.redo.pop();
+            history.redo_files.remove(&index);
+            let index = history.undo.len();
+            history.undo.push(before.clone());
+            if !file_changes.is_empty() {
+                history.undo_files.insert(index, file_changes.clone());
+            }
+        } else {
+            let index = history.undo.len() - 1;
+            history.undo.pop();
+            history.undo_files.remove(&index);
+            let index = history.redo.len();
+            history.redo.push(before.clone());
+            if !file_changes.is_empty() {
+                history.redo_files.insert(index, file_changes.clone());
+            }
+        }
+        history.validate_file_entries()?;
+        let id = loop {
+            let candidate = Uuid::new_v4();
+            if !history.transaction_ids.contains(&candidate)
+                && !state
+                    .manifest
+                    .files
+                    .contains_key(&format!("history/transactions/{candidate}.json"))
+            {
+                break candidate;
+            }
+        };
+        history.transaction_ids.insert(id);
+        changes.insert(
+            format!("history/transactions/{id}.json"),
+            storage::json(&serde_json::json!({
+                "transactionId": id, "kind": if redo { "redo" } else { "undo" },
+                "before": before, "after": next, "fileChanges": &file_changes
+            }))?,
+        );
+        changes.insert("history/state.json".into(), storage::json(&history)?);
+        changes.insert("document.json".into(), storage::json(&document)?);
+        let mut manifest = state.manifest.clone();
+        manifest.revision = next.revision;
+        let generation = state.next_generation()?;
+        let committed = match storage::commit_with_file_modes(
+            &self.path,
+            &state.manifest_bytes,
+            &manifest,
+            &changes,
+            &deletions,
+            &modes,
+        ) {
+            Ok(committed) => committed,
+            Err(error) if error.code == "CANCELED" => return Err(error),
+            Err(error) => {
+                state.local_generation = generation;
+                state.read_only_reason =
+                    Some("File history failed; reopen the project to recover".into());
+                return Err(error);
+            }
+        };
+        self.after_commit(&state.manifest_bytes, &committed, state.manifest.project_id);
+        state.local_generation = generation;
+        state.manifest =
+            serde_json::from_slice(&committed).map_err(|e| CoreError::invalid(e.to_string()))?;
+        state.manifest_bytes = committed;
+        state.document = document;
+        state.history = history;
+        state.pending.clear();
+        state.dirty = false;
+        state.snapshot()
     }
 
     pub fn rename(&self, name: &str) -> Result<()> {
@@ -790,6 +1036,10 @@ impl ProjectSession {
                         .pending
                         .insert("history/state.json".into(), storage::json(&history)?);
                     target.history = history;
+                }
+                for (path, digest) in &blocked_generated {
+                    let (record, bytes) = storage::generated_block(stage.path(), path, digest)?;
+                    target.pending.insert(record, bytes);
                 }
                 for (path, bytes) in chats.into_files(target.manifest.project_id)? {
                     target.pending.insert(path, bytes);
@@ -921,10 +1171,61 @@ impl ProjectSession {
             .map_err(|e| CoreError::invalid(e.to_string()))
     }
 
+    fn preserve_chat_assets(
+        &self,
+        state: &State,
+        before: &Document,
+        next: &mut Document,
+        inputs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<BTreeSet<String>> {
+        let mut paths = BTreeSet::new();
+        for id in storage::chat_attachment_ids(self, state)? {
+            let current = before
+                .assets
+                .iter()
+                .find(|asset| asset.id == id)
+                .ok_or_else(|| {
+                    CoreError::new("MISSING_ASSET", format!("Missing chat attachment {id}"))
+                })?;
+            if !inputs.contains_key(&current.path) {
+                return Err(CoreError::new(
+                    "MISSING_ASSET",
+                    format!("Missing chat attachment {id}"),
+                ));
+            }
+            match next.assets.iter().find(|asset| asset.id == id) {
+                Some(saved) if saved.path != current.path => {
+                    return Err(CoreError::conflict(format!(
+                        "Chat attachment {id} differs from the selected historical asset"
+                    )));
+                }
+                Some(_) => {}
+                None => next.assets.push(current.clone()),
+            }
+            paths.insert(current.path.clone());
+        }
+        Ok(paths)
+    }
+
     pub fn restore_checkpoint(&self, id: &str) -> Result<String> {
+        self.restore_checkpoint_impl(id, false)
+    }
+
+    pub fn restore_checkpoint_with_missing_modes(&self, id: &str) -> Result<String> {
+        self.restore_checkpoint_impl(id, true)
+    }
+
+    fn restore_checkpoint_impl(&self, id: &str, allow_missing_modes: bool) -> Result<String> {
         let id = Uuid::parse_str(id).map_err(|e| CoreError::invalid(e.to_string()))?;
         let mut state = self.state()?;
         state.ensure_writable()?;
+        if allow_missing_modes
+            && state.checkpoint_mode_confirmation != Some((id, state.local_generation))
+        {
+            return Err(CoreError::conflict(
+                "Checkpoint confirmation is stale; inspect it again",
+            ));
+        }
         let inputs = storage::snapshot_inputs(&self.path, &state.manifest_bytes)?;
         let metadata_path = format!("checkpoints/{id}.json");
         if !state.manifest.files.contains_key(&metadata_path) {
@@ -962,6 +1263,8 @@ impl ProjectSession {
         }
         next.validate()?;
         next.validate_files(&checkpoint.dependencies)?;
+        // Chat history is not rolled back with design history.
+        self.preserve_chat_assets(&state, &before, &mut next, &inputs)?;
         if checkpoint.executable_modes.as_ref().is_some_and(|modes| {
             modes.len() != checkpoint.dependencies.len()
                 || modes.iter().any(|(path, mode)| {
@@ -976,6 +1279,7 @@ impl ProjectSession {
         let mut changes = state.pending.clone();
         let mut deletions = BTreeSet::new();
         let mut file_changes = BTreeMap::new();
+        let mut default_mode = None;
         for (path, digest) in &checkpoint.dependencies {
             if !storage::checkpoint_dependency_path(path) {
                 return Err(CoreError::invalid(format!(
@@ -997,26 +1301,36 @@ impl ProjectSession {
             storage::validate_checkpoint_asset(path, digest)?;
             let content = storage::checkpoint_blob(&self.path, &state.manifest, digest)?;
             let old_hash = inputs.get(path).map(|bytes| storage::hash(bytes));
-            if let Some(modes) = &checkpoint.executable_modes {
-                let expected_mode = *modes
-                    .get(path)
-                    .ok_or_else(|| CoreError::invalid("Missing checkpoint executable mode"))?;
-                let current_mode = if old_hash.is_some() {
-                    Some(storage::checkpoint_executable_mode(&self.path, path)?)
-                } else {
-                    None
-                };
-                if (expected_mode != 0
-                    && (current_mode != Some(expected_mode) || old_hash.as_ref() != Some(digest)))
-                    || (expected_mode == 0 && current_mode.is_some_and(|mode| mode != 0))
-                {
-                    return Err(CoreError::unsupported(format!(
-                        "Cannot safely restore executable permissions for {path}"
-                    )));
-                }
-            } else if old_hash.as_ref() != Some(digest) {
-                return Err(CoreError::unsupported(format!("Legacy checkpoint does not record executable permissions for changed or missing file {path}")));
+            let current_mode = storage::file_mode(&self.path, path)?;
+            if old_hash.is_some() != current_mode.is_some() {
+                return Err(CoreError::conflict(format!("File changed: {path}")));
             }
+            if checkpoint.executable_modes.is_none()
+                && current_mode.is_none()
+                && !allow_missing_modes
+            {
+                state.checkpoint_mode_confirmation = Some((id, state.local_generation));
+                return Err(CoreError::new(
+                    "CHECKPOINT_MODE_CONFIRMATION_REQUIRED",
+                    format!("Checkpoint does not record the mode of missing file {path}"),
+                ));
+            }
+            let base_mode = match current_mode {
+                Some(mode) => mode,
+                None => match default_mode {
+                    Some(mode) => mode,
+                    None => {
+                        let mode = storage::default_file_mode(&self.path)?;
+                        default_mode = Some(mode);
+                        mode
+                    }
+                },
+            };
+            let target_mode = match &checkpoint.executable_modes {
+                Some(modes) => (base_mode & !0o111) | modes[path],
+                None if current_mode.is_some() => base_mode,
+                None => base_mode & !0o111,
+            };
             if path.starts_with("assets/")
                 && old_hash.is_some()
                 && old_hash.as_ref() != Some(digest)
@@ -1025,11 +1339,19 @@ impl ProjectSession {
                     "Checkpoint asset has different contents on disk: {path}"
                 )));
             }
-            if old_hash.as_ref() != Some(digest) {
+            if old_hash.as_ref() != Some(digest) || current_mode != Some(target_mode) {
                 changes.insert(path.clone(), content);
                 file_changes.insert(
                     path.clone(),
-                    serde_json::json!({"beforeHash": old_hash, "afterHash": digest}),
+                    FileChange {
+                        before: old_hash
+                            .zip(current_mode)
+                            .map(|(hash, mode)| FileVersion { hash, mode }),
+                        after: Some(FileVersion {
+                            hash: digest.clone(),
+                            mode: target_mode,
+                        }),
+                    },
                 );
             }
         }
@@ -1045,9 +1367,17 @@ impl ProjectSession {
             // Later assets may still be referenced by chat history; keep them as orphans.
             if !path.starts_with("assets/") && !checkpoint.dependencies.contains_key(path) {
                 deletions.insert(path.clone());
+                let mode = storage::file_mode(&self.path, path)?
+                    .ok_or_else(|| CoreError::conflict(format!("Missing file: {path}")))?;
                 file_changes.insert(
                     path.clone(),
-                    serde_json::json!({"beforeHash": storage::hash(content), "afterHash": null}),
+                    FileChange {
+                        before: Some(FileVersion {
+                            hash: storage::hash(content),
+                            mode,
+                        }),
+                        after: None,
+                    },
                 );
             }
         }
@@ -1057,7 +1387,7 @@ impl ProjectSession {
         let mut directory_names = BTreeMap::new();
         // Preserve the inverse file contents in the same content-addressed store.
         for path in file_changes.keys() {
-            storage::checkpoint_destination(&self.path, path, &mut directory_names)?;
+            storage::checkpoint_destination(&self.path, path, &mut directory_names, true)?;
             if let Some(content) = inputs.get(path) {
                 let digest = storage::hash(content);
                 let blob = format!("checkpoints/blobs/{digest}");
@@ -1072,6 +1402,11 @@ impl ProjectSession {
                 }
             }
         }
+        next.file_history_version = if file_changes.is_empty() {
+            before.file_history_version.or(next.file_history_version)
+        } else {
+            Some(1)
+        };
         next.revision = before
             .revision
             .checked_add(1)
@@ -1091,15 +1426,18 @@ impl ProjectSession {
         let mut history = state.history.clone();
         history.undo.push(before.clone());
         history.redo.clear();
+        history.redo_files.clear();
         if !file_changes.is_empty() {
-            history.file_restore_barrier = Some(history.undo.len());
+            history
+                .undo_files
+                .insert(history.undo.len() - 1, file_changes.clone());
         }
         history.transaction_ids.insert(transaction_id);
         changes.insert(
             transaction_path,
             storage::json(&serde_json::json!({
                 "transactionId": transaction_id, "kind": "restoreCheckpoint",
-                "checkpointId": id, "before": before, "after": next, "fileChanges": file_changes
+                "checkpointId": id, "before": before, "after": next, "fileChanges": &file_changes
             }))?,
         );
         changes.insert("history/state.json".into(), storage::json(&history)?);
@@ -1107,12 +1445,25 @@ impl ProjectSession {
         let mut manifest = state.manifest.clone();
         manifest.revision = next.revision;
         let next_generation = state.next_generation()?;
-        let committed = match storage::commit_with_deletions(
+        let modes = file_changes
+            .iter()
+            .map(|(path, change)| {
+                (
+                    path.clone(),
+                    storage::ModeTransition {
+                        before: change.before.as_ref().map(|version| version.mode),
+                        after: change.after.as_ref().map(|version| version.mode),
+                    },
+                )
+            })
+            .collect();
+        let committed = match storage::commit_with_file_modes(
             &self.path,
             &state.manifest_bytes,
             &manifest,
             &changes,
             &deletions,
+            &modes,
         ) {
             Ok(committed) => committed,
             Err(error) if error.code == "CANCELED" => return Err(error),
@@ -1131,6 +1482,7 @@ impl ProjectSession {
         state.document = document;
         state.history = history;
         state.pending.clear();
+        state.checkpoint_mode_confirmation = None;
         state.dirty = false;
         state.snapshot()
     }

@@ -191,14 +191,17 @@ fn restore_replaces_adds_and_deletes_files_in_one_new_revision() {
         snapshot(&reopened)["document"]["revision"],
         result["document"]["revision"]
     );
-    let error = reopened.undo().unwrap_err();
-    assert_eq!(error.code, "UNSUPPORTED_FEATURE");
+    reopened.undo().unwrap();
+    assert_later_files(&path);
+    drop(reopened);
+    let reopened = open_project(&path).unwrap();
+    reopened.redo().unwrap();
     assert_checkpoint_files(&path);
     rename(&reopened, "Later edit");
     reopened.undo().unwrap();
-    let before_barrier = snapshot(&reopened);
-    assert_eq!(reopened.undo().unwrap_err().code, "UNSUPPORTED_FEATURE");
-    assert_eq!(snapshot(&reopened), before_barrier);
+    reopened.undo().unwrap();
+    assert_later_files(&path);
+    reopened.redo().unwrap();
     reopened.redo().unwrap();
     assert_eq!(
         snapshot(&reopened)["document"]["nodes"][0]["name"],
@@ -501,7 +504,7 @@ fn file_directory_collision_is_rejected_before_publication() {
 
 #[cfg(unix)]
 #[test]
-fn existing_executable_file_is_not_replaced_or_removed() {
+fn checkpoint_restore_undo_and_redo_preserve_known_executable_modes() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("project");
@@ -509,23 +512,31 @@ fn existing_executable_file_is_not_replaced_or_removed() {
     let source = path.join("src/user/main.js");
     std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
     let session = open_project(&path).unwrap();
-    let before = snapshot(&session);
+    session.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), b"checkpoint main");
     assert_eq!(
-        session.restore_checkpoint(&checkpoint).unwrap_err().code,
-        "UNSUPPORTED_FEATURE"
-    );
-    assert_eq!(snapshot(&session), before);
-    assert_eq!(std::fs::read(&source).unwrap(), b"later main");
-    assert_ne!(
-        std::fs::metadata(source).unwrap().permissions().mode() & 0o111,
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o111,
         0
     );
-    assert_later_files(&path);
+    session.undo().unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), b"later main");
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
+    drop(session);
+    let session = open_project(&path).unwrap();
+    session.redo().unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), b"checkpoint main");
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o111,
+        0
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn removed_executable_is_not_restored_without_its_mode() {
+fn removed_executable_is_restored_with_its_checkpoint_mode() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("project");
@@ -544,19 +555,104 @@ fn removed_executable_is_not_restored_without_its_mode() {
         &[(source, None), ("src/user/new.ts", Some(b"later"))],
     );
     let session = open_project(&path).unwrap();
-    let before = snapshot(&session);
-    let manifest = std::fs::read(path.join("project.json")).unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
     assert_eq!(
-        session.restore_checkpoint(&checkpoint).unwrap_err().code,
-        "UNSUPPORTED_FEATURE"
+        std::fs::metadata(path.join(source))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
     );
-    assert_eq!(snapshot(&session), before);
-    assert_eq!(std::fs::read(path.join("project.json")).unwrap(), manifest);
+    assert!(!path.join("src/user/new.ts").exists());
+    session.undo().unwrap();
     assert!(!path.join(source).exists());
     assert_eq!(
         std::fs::read(path.join("src/user/new.ts")).unwrap(),
         b"later"
     );
+    session.redo().unwrap();
+    assert_eq!(
+        std::fs::metadata(path.join(source))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mode_only_restore_is_undoable_and_survives_reopen() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Example").unwrap());
+    let source = path.join("src/user/build.sh");
+    persist_files(&path, &[("src/user/build.sh", Some(b"same bytes"))]);
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let checkpoint = open_project(&path).unwrap().create_checkpoint().unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let session = open_project(&path).unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+    session.undo().unwrap();
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    drop(session);
+    let session = open_project(&path).unwrap();
+    session.redo().unwrap();
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), b"same bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_checkpoint_mode_restore_recovers_whole_file_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut recovered_after = false;
+    for point in 0..32 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project");
+        drop(create_project(&path, "Example").unwrap());
+        let relative = "src/user/build.sh";
+        let source = path.join(relative);
+        persist_files(&path, &[(relative, Some(b"checkpoint"))]);
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let checkpoint = open_project(&path).unwrap().create_checkpoint().unwrap();
+        persist_files(&path, &[(relative, Some(b"later"))]);
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let session = open_project(&path).unwrap();
+        INTERRUPT_AFTER.with(|value| value.set(Some(point)));
+        let result = session.restore_checkpoint(&checkpoint);
+        INTERRUPT_AFTER.with(|value| value.set(None));
+        drop(session);
+        if result.is_ok() {
+            break;
+        }
+        let reopened = open_project(&path).unwrap();
+        assert_eq!(snapshot(&reopened)["readOnly"], false, "point {point}");
+        let bytes = std::fs::read(&source).unwrap();
+        let mode = std::fs::metadata(&source).unwrap().permissions().mode() & 0o777;
+        match bytes.as_slice() {
+            b"checkpoint" => {
+                assert_eq!(mode, 0o751, "point {point}");
+                recovered_after = true;
+            }
+            b"later" => assert_eq!(mode, 0o640, "point {point}"),
+            _ => panic!("unexpected file at point {point}"),
+        }
+    }
+    assert!(recovered_after);
 }
 
 #[test]
@@ -575,10 +671,45 @@ fn legacy_checkpoint_without_mode_metadata_refuses_to_recreate_missing_files() {
     let manifest = std::fs::read(path.join("project.json")).unwrap();
     assert_eq!(
         session.restore_checkpoint(&checkpoint).unwrap_err().code,
-        "UNSUPPORTED_FEATURE"
+        "CHECKPOINT_MODE_CONFIRMATION_REQUIRED"
     );
     assert_eq!(snapshot(&session), before);
     assert_eq!(std::fs::read(path.join("project.json")).unwrap(), manifest);
+    assert_later_files(&path);
+    session
+        .restore_checkpoint_with_missing_modes(&checkpoint)
+        .unwrap();
+    assert_checkpoint_files(&path);
+    session.undo().unwrap();
+    assert_later_files(&path);
+}
+
+#[test]
+fn legacy_checkpoint_confirmation_is_bound_to_the_session_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("project");
+    let checkpoint = setup(&path);
+    let metadata_path = format!("checkpoints/{checkpoint}.json");
+    let mut metadata: Value =
+        serde_json::from_slice(&std::fs::read(path.join(&metadata_path)).unwrap()).unwrap();
+    metadata.as_object_mut().unwrap().remove("executableModes");
+    let bytes = json_bytes(&metadata).unwrap();
+    persist_files(&path, &[(metadata_path.as_str(), Some(&bytes))]);
+    let session = open_project(&path).unwrap();
+    assert_eq!(
+        session.restore_checkpoint(&checkpoint).unwrap_err().code,
+        "CHECKPOINT_MODE_CONFIRMATION_REQUIRED"
+    );
+    rename(&session, "Changed after question");
+    let before = snapshot(&session);
+    assert_eq!(
+        session
+            .restore_checkpoint_with_missing_modes(&checkpoint)
+            .unwrap_err()
+            .code,
+        "REVISION_CONFLICT"
+    );
+    assert_eq!(snapshot(&session), before);
     assert_later_files(&path);
 }
 
@@ -683,14 +814,12 @@ fn changed_executable_flag_is_not_silently_ignored_when_content_matches() {
         let checkpoint = open_project(&path).unwrap().create_checkpoint().unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(changed_mode)).unwrap();
         let session = open_project(&path).unwrap();
-        let before = snapshot(&session);
-        let manifest = std::fs::read(path.join("project.json")).unwrap();
+        session.restore_checkpoint(&checkpoint).unwrap();
         assert_eq!(
-            session.restore_checkpoint(&checkpoint).unwrap_err().code,
-            "UNSUPPORTED_FEATURE"
+            std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            (changed_mode & !0o111) | (initial_mode & 0o111)
         );
-        assert_eq!(snapshot(&session), before);
-        assert_eq!(std::fs::read(path.join("project.json")).unwrap(), manifest);
+        session.undo().unwrap();
         assert_eq!(
             std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
             changed_mode
@@ -777,7 +906,7 @@ fn case_distinct_checkpoint_directories_restore_on_case_sensitive_filesystems() 
 
 #[cfg(unix)]
 #[test]
-fn legacy_checkpoint_with_changed_source_cannot_lose_unknown_executable_mode() {
+fn legacy_checkpoint_preserves_the_current_mode_of_existing_files() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("project");
@@ -798,16 +927,28 @@ fn legacy_checkpoint_with_changed_source_cannot_lose_unknown_executable_mode() {
             (source, Some(b"later")),
         ],
     );
+    std::fs::set_permissions(path.join(source), std::fs::Permissions::from_mode(0o751)).unwrap();
     let session = open_project(&path).unwrap();
-    let before = snapshot(&session);
-    let manifest = std::fs::read(path.join("project.json")).unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(std::fs::read(path.join(source)).unwrap(), b"checkpoint");
     assert_eq!(
-        session.restore_checkpoint(&checkpoint).unwrap_err().code,
-        "UNSUPPORTED_FEATURE"
+        std::fs::metadata(path.join(source))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
     );
-    assert_eq!(snapshot(&session), before);
-    assert_eq!(std::fs::read(path.join("project.json")).unwrap(), manifest);
+    session.undo().unwrap();
     assert_eq!(std::fs::read(path.join(source)).unwrap(), b"later");
+    assert_eq!(
+        std::fs::metadata(path.join(source))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
 }
 
 #[cfg(unix)]

@@ -4,7 +4,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::domain::{ActionKind, Binding, Bounds, FeatureMap, Flow, ResponsiveOverride, SizeMode};
+use super::domain::{
+    ActionKind, Binding, Bounds, FeatureMap, Flow, ResponsiveOverride, Scalar, SizeMode,
+};
 use super::validation::{identifier, node_supported, property_kind};
 use super::{
     CoreError, Document, Node, NodeKind, Operation, Origin, PropertyMeta, Result, Transaction,
@@ -105,6 +107,10 @@ fn lock_target(node: &Node, path: &str) -> Result<String> {
         || (target == "/content/vector" && matches!(node.kind, NodeKind::Vector))
         || (matches!(target.as_str(), "/content/moduleId" | "/content/props")
             && matches!(node.kind, NodeKind::CodeComponent))
+        || (matches!(node.kind, NodeKind::CodeComponent)
+            && target
+                .strip_prefix("/content/props/")
+                .is_some_and(identifier))
         || (target == "/content/componentId" && matches!(node.kind, NodeKind::ComponentInstance))
         || target
             .strip_prefix("/bindings/")
@@ -210,6 +216,20 @@ fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
         }
         "/content/props" if matches!(node.kind, NodeKind::CodeComponent) => {
             known_mut(&mut node.content)?.props = optional(value)?
+        }
+        _ if matches!(node.kind, NodeKind::CodeComponent)
+            && path.strip_prefix("/content/props/").is_some_and(identifier) =>
+        {
+            let key = &path["/content/props/".len()..];
+            let content = known_mut(&mut node.content)?;
+            if let Some(value) = optional::<Scalar>(value)? {
+                content
+                    .props
+                    .get_or_insert_with(Default::default)
+                    .insert(key.to_owned(), value);
+            } else if let Some(props) = &mut content.props {
+                props.remove(key);
+            }
         }
         _ if path.strip_prefix("/events/").is_some_and(identifier) => {
             let key = &path["/events/".len()..];
@@ -439,12 +459,21 @@ impl Document {
                         (content.module_id.is_some(), "/content/moduleId"),
                         (content.component_id.is_some(), "/content/componentId"),
                         (content.vector.is_some(), "/content/vector"),
-                        (content.props.is_some(), "/content/props"),
                         (a11y.label.is_some(), "/a11y/label"),
                         (a11y.alt.is_some(), "/a11y/alt"),
                     ] {
                         if present {
                             mark(&mut new_node, path, transaction.origin, revision);
+                        }
+                    }
+                    if let Some(props) = &content.props {
+                        for key in props.keys() {
+                            mark(
+                                &mut new_node,
+                                &format!("/content/props/{}", escaped(key)),
+                                transaction.origin,
+                                revision,
+                            );
                         }
                     }
                     for key in node

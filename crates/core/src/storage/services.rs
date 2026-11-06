@@ -149,6 +149,38 @@ fn get_messages(session: &ProjectSession, state: &State, id: Uuid) -> Result<Vec
     messages(&tracked_bytes(&session.path, &state.manifest, &path)?, id)
 }
 
+pub(crate) fn chat_attachment_ids(
+    session: &ProjectSession,
+    state: &State,
+) -> Result<BTreeSet<Uuid>> {
+    let mut assets = BTreeSet::new();
+    for path in state
+        .manifest
+        .files
+        .keys()
+        .filter(|path| path.starts_with("chats/") && path.ends_with("/chat.json"))
+    {
+        let bytes = tracked_bytes(&session.path, &state.manifest, path)?;
+        let chat: Chat = serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError::invalid(format!("Invalid {path}: {e}")))?;
+        if *path != chat_path(chat.id) {
+            return Err(CoreError::invalid(format!(
+                "Chat path does not match metadata: {path}"
+            )));
+        }
+        validate_chat(&chat, chat.id, state.manifest.project_id)?;
+        for message in get_messages(session, state, chat.id)? {
+            assets.extend(
+                message
+                    .attachments
+                    .into_iter()
+                    .map(|attachment| attachment.asset_id),
+            );
+        }
+    }
+    Ok(assets)
+}
+
 fn candidate_bytes<'a>(
     root: &std::path::Path,
     files: &BTreeMap<String, String>,

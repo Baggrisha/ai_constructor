@@ -46,6 +46,46 @@ fn interruption_at_each_publication_recovers_old_or_new_state() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn killed_process_at_each_publication_recovers_a_complete_snapshot() {
+    const PROJECT: &str = "AIC_TEST_KILL_PUBLICATION_PROJECT";
+    const POINT: &str = "AIC_TEST_KILL_PUBLICATION_POINT";
+    if let Some(path) = std::env::var_os(PROJECT) {
+        let session = open_project(std::path::PathBuf::from(path)).unwrap();
+        change(&session);
+        let point: usize = std::env::var(POINT).unwrap().parse().unwrap();
+        super::KILL_AFTER.with(|value| value.set(Some(point)));
+        let _ = session.save();
+        panic!("child did not reach publication point {point}");
+    }
+
+    use std::os::unix::process::ExitStatusExt;
+    for point in 0..=4 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project");
+        drop(create_project(&path, "Example").unwrap());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::killed_process_at_each_publication_recovers_a_complete_snapshot",
+            ])
+            .env(PROJECT, &path)
+            .env(POINT, point.to_string())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "point {point}");
+        let restored = open_project(&path).unwrap();
+        let state = snapshot(&restored);
+        assert_eq!(state["readOnly"], false, "point {point}");
+        let name = if point == 4 { "Changed" } else { "Frame" };
+        assert_eq!(state["document"]["nodes"][0]["name"], name, "point {point}");
+        let marker: super::Manifest =
+            serde_json::from_slice(&std::fs::read(path.join("project.json")).unwrap()).unwrap();
+        assert_eq!(super::scan(&path).unwrap(), marker.files, "point {point}");
+    }
+}
+
 #[test]
 fn unknown_file_version_during_recovery_is_preserved_and_read_only() {
     let temp = tempfile::tempdir().unwrap();

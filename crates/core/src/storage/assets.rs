@@ -503,6 +503,7 @@ impl ProjectSession {
             history.file_restore_barrier = Some(history.undo.len());
         }
         history.redo.clear();
+        history.redo_files.clear();
         history.transaction_ids.insert(transaction_id);
         let transaction = json!({"transactionId": transaction_id, "kind": if asset_id.is_some() {"relinkAsset"} else {"importAsset"}, "before": before, "after": next});
         let mut changes = BTreeMap::from([

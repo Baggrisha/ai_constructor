@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 import XCTest
 
 final class AIConstructorUITests: XCTestCase {
@@ -7,6 +8,17 @@ final class AIConstructorUITests: XCTestCase {
         let condition = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: element)
         return XCTWaiter.wait(for: [condition], timeout: timeout) == .completed
     }
+
+    private func chooseFile(_ url: URL, in app: XCUIApplication) {
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey("g", modifierFlags: [.command, .shift])
+        app.typeText(url.path)
+        app.typeKey(.return, modifierFlags: [])
+        if app.dialogs.firstMatch.exists || app.sheets.firstMatch.exists {
+            app.typeKey(.return, modifierFlags: [])
+        }
+    }
+
     private func waitForFrame(_ project: URL, name: String, width: Double? = nil, height: Double? = nil) -> Bool {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             guard let data = try? Data(contentsOf: project.appendingPathComponent("document.json")),
@@ -823,5 +835,444 @@ final class AIConstructorUITests: XCTestCase {
         XCTAssertTrue(app.menuItems["Дублировать проект…"].isEnabled)
         XCTAssertTrue(app.menuItems["Создать переносимый снимок…"].isEnabled)
         XCTAssertTrue(app.menuItems["Создать контрольную точку"].isEnabled)
+    }
+    func testCheckpointRestoreCreatesRevisionAndPreservesChatsAfterReopen() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-checkpoint-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let attachment = base.appendingPathComponent("attachment.svg")
+        let attachmentBytes = Data("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".utf8)
+        try attachmentBytes.write(to: attachment)
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+
+        let project = base.appendingPathComponent("projects/Новый проект").standardizedFileURL.resolvingSymlinksInPath()
+        let name = app.textFields["frame-name"]
+        XCTAssertTrue(name.waitForExistence(timeout: 10))
+        name.click()
+        name.typeKey("a", modifierFlags: .command)
+        name.typeText("Checkpoint frame")
+        XCTAssertTrue(waitForFrame(project, name: "Checkpoint frame"))
+        XCTAssertTrue(app.staticTexts["Сохранено"].waitForExistence(timeout: 10))
+
+        let actions = app.descendants(matching: .any)["project-actions"].firstMatch
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        let create = app.menuItems["Создать контрольную точку"]
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        XCTAssertTrue(create.isEnabled)
+        create.click()
+        let checkpointDirectory = project.appendingPathComponent("checkpoints")
+        func checkpointFiles() -> [URL] {
+            ((try? FileManager.default.contentsOfDirectory(at: checkpointDirectory, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension == "json" }
+        }
+        let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            checkpointFiles().count == 1
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [created], timeout: 15), .completed)
+        let checkpoint = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: try XCTUnwrap(checkpointFiles().first))) as? [String: Any])
+        let checkpointId = try XCTUnwrap(checkpoint["id"] as? String)
+        let checkpointRevision = try XCTUnwrap(checkpoint["revision"] as? NSNumber).uint64Value
+        let assetsPanel = app.descendants(matching: .any)["panel-assets"].firstMatch
+        XCTAssertTrue(waitUntilEnabled(assetsPanel))
+        assetsPanel.click()
+        let importButton = app.buttons["import-asset"]
+        XCTAssertTrue(importButton.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(importButton))
+        importButton.click()
+        chooseFile(attachment, in: app)
+        let documentFile = project.appendingPathComponent("document.json")
+        func firstAsset() -> [String: Any]? {
+            guard let data = try? Data(contentsOf: documentFile),
+                  let document = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let assets = document["assets"] as? [[String: Any]] else { return nil }
+            return assets.first
+        }
+        let imported = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in firstAsset() != nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [imported], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(importButton))
+        let savedAsset = try XCTUnwrap(firstAsset())
+        let assetId = try XCTUnwrap(savedAsset["id"] as? String)
+        let assetPath = try XCTUnwrap(savedAsset["path"] as? String)
+
+        app.descendants(matching: .any)["panel-chats"].firstMatch.click()
+        let newChat = app.buttons["Новый чат"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(newChat))
+        newChat.click()
+        let title = app.textFields["chat-title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.click()
+        title.typeText("After checkpoint")
+        app.buttons["confirm-chat"].click()
+        let message = app.textViews["chat-message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(message))
+        message.click()
+        message.typeText("Keep this message")
+        let attachmentPicker = app.popUpButtons["Вложение"]
+        XCTAssertTrue(attachmentPicker.waitForExistence(timeout: 5))
+        attachmentPicker.click()
+        app.menuItems[assetPath].click()
+        app.buttons["save-chat-message"].click()
+        XCTAssertTrue(app.staticTexts["Keep this message"].waitForExistence(timeout: 10))
+        let chatDirectories = try FileManager.default.contentsOfDirectory(at: project.appendingPathComponent("chats"), includingPropertiesForKeys: nil)
+        let chat = try XCTUnwrap(chatDirectories.first)
+        let messagesFile = chat.appendingPathComponent("messages.jsonl")
+        let messagesBefore = try Data(contentsOf: messagesFile)
+        XCTAssertTrue(String(decoding: messagesBefore, as: UTF8.self).contains("Keep this message"))
+
+        app.descendants(matching: .any)["panel-inspector"].firstMatch.click()
+        XCTAssertTrue(name.waitForExistence(timeout: 10))
+        name.click()
+        name.typeKey("a", modifierFlags: .command)
+        name.typeText("Later frame")
+        XCTAssertTrue(waitForFrame(project, name: "Later frame"))
+        XCTAssertTrue(app.staticTexts["Сохранено"].waitForExistence(timeout: 10))
+        let before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: documentFile)) as? [String: Any])
+        let revisionBefore = try XCTUnwrap(before["revision"] as? NSNumber).uint64Value
+        XCTAssertGreaterThan(revisionBefore, checkpointRevision)
+
+        func chooseCheckpoint() {
+            XCTAssertTrue(waitUntilEnabled(actions))
+            actions.click()
+            let restore = app.menuItems["Восстановить контрольную точку"]
+            XCTAssertTrue(restore.waitForExistence(timeout: 5))
+            XCTAssertTrue(restore.isEnabled)
+            restore.click()
+            let entry = app.menuItems["Ревизия \(checkpointRevision) · \(checkpointId.prefix(8))"]
+            XCTAssertTrue(entry.waitForExistence(timeout: 5))
+            entry.click()
+        }
+        chooseCheckpoint()
+        let confirmation = app.alerts["Восстановить контрольную точку?"]
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.buttons["Отмена"].click()
+        XCTAssertTrue(waitForFrame(project, name: "Later frame"))
+        chooseCheckpoint()
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.buttons["Восстановить"].click()
+        XCTAssertTrue(waitForFrame(project, name: "Checkpoint frame"))
+        XCTAssertTrue(app.staticTexts["Сохранено"].waitForExistence(timeout: 10))
+        let restoredName = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Checkpoint frame"), object: name)
+        XCTAssertEqual(XCTWaiter.wait(for: [restoredName], timeout: 10), .completed)
+        let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: documentFile)) as? [String: Any])
+        XCTAssertGreaterThan(try XCTUnwrap(restored["revision"] as? NSNumber).uint64Value, revisionBefore)
+        let restoredRevision = try XCTUnwrap(restored["revision"] as? NSNumber).uint64Value
+        let settle = expectation(description: "old focused field cannot autosave after restore")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { settle.fulfill() }
+        wait(for: [settle], timeout: 3)
+        let settled = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: documentFile)) as? [String: Any])
+        XCTAssertEqual(try XCTUnwrap(settled["revision"] as? NSNumber).uint64Value, restoredRevision)
+        XCTAssertTrue(waitForFrame(project, name: "Checkpoint frame"))
+        XCTAssertEqual(try Data(contentsOf: messagesFile), messagesBefore)
+        let restoredAssets = try XCTUnwrap(restored["assets"] as? [[String: Any]])
+        XCTAssertTrue(restoredAssets.contains { $0["id"] as? String == assetId && $0["path"] as? String == assetPath })
+        XCTAssertEqual(try Data(contentsOf: project.appendingPathComponent(assetPath)), attachmentBytes)
+        XCTAssertEqual(name.value as? String, "Checkpoint frame")
+        let undo = app.buttons["Отменить"]
+        XCTAssertTrue(waitUntilEnabled(undo))
+        undo.click()
+        XCTAssertTrue(waitForFrame(project, name: "Later frame"))
+        let redo = app.buttons["Повторить"]
+        XCTAssertTrue(waitUntilEnabled(redo))
+        redo.click()
+        XCTAssertTrue(waitForFrame(project, name: "Checkpoint frame"))
+        let redoSettled = expectation(description: "old focused field cannot autosave after redo")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { redoSettled.fulfill() }
+        wait(for: [redoSettled], timeout: 3)
+        XCTAssertTrue(waitForFrame(project, name: "Checkpoint frame"))
+        XCTAssertEqual(try Data(contentsOf: messagesFile), messagesBefore)
+
+        app.terminate()
+        app.launch()
+        let row = app.descendants(matching: .any)["recent-project-\(project.path)"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        XCTAssertTrue(name.waitForExistence(timeout: 10))
+        XCTAssertEqual(name.value as? String, "Checkpoint frame")
+        app.descendants(matching: .any)["panel-chats"].firstMatch.click()
+        XCTAssertTrue(app.staticTexts["Keep this message"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts[assetPath].waitForExistence(timeout: 10))
+    }
+
+    func testMissingAssetCanBeRelinkedAfterReopen() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-asset-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let original = base.appendingPathComponent("original.svg")
+        let replacement = base.appendingPathComponent("replacement.svg")
+        try Data("<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".utf8).write(to: original)
+        let replacementData = Data("<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>".utf8)
+        try replacementData.write(to: replacement)
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        let project = base.appendingPathComponent("projects/Новый проект").standardizedFileURL.resolvingSymlinksInPath()
+        let actions = app.descendants(matching: .any)["project-actions"].firstMatch
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        app.menuItems["Создать контрольную точку"].click()
+        let checkpoint = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            let paths = (try? FileManager.default.contentsOfDirectory(at: project.appendingPathComponent("checkpoints"), includingPropertiesForKeys: nil)) ?? []
+            return paths.contains { $0.pathExtension == "json" }
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [checkpoint], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        XCTAssertTrue(waitUntilEnabled(app.menuItems["Восстановить контрольную точку"]))
+        app.typeKey(.escape, modifierFlags: [])
+
+        app.descendants(matching: .any)["panel-assets"].firstMatch.click()
+        let importButton = app.buttons["import-asset"]
+        XCTAssertTrue(importButton.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilEnabled(importButton))
+        importButton.click()
+        chooseFile(original, in: app)
+        let documentFile = project.appendingPathComponent("document.json")
+        func asset() -> [String: Any]? {
+            guard let data = try? Data(contentsOf: documentFile),
+                  let document = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let assets = document["assets"] as? [[String: Any]] else { return nil }
+            return assets.first
+        }
+        let imported = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in asset() != nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [imported], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(importButton))
+        let importedAsset = try XCTUnwrap(asset())
+        let assetId = try XCTUnwrap(importedAsset["id"] as? String)
+        let oldPath = try XCTUnwrap(importedAsset["path"] as? String)
+        app.terminate()
+        try FileManager.default.removeItem(at: project.appendingPathComponent(oldPath))
+
+        app.launch()
+        let row = app.descendants(matching: .any)["recent-project-\(project.path)"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        let repair = app.buttons["Восстановить…"]
+        XCTAssertTrue(repair.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilEnabled(repair))
+        repair.click()
+        let confirmation = app.alerts["Восстановить ресурс?"]
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.buttons["Выбрать замену…"].click()
+        chooseFile(replacement, in: app)
+        let relinked = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            guard let current = asset() else { return false }
+            return current["id"] as? String == assetId && current["path"] as? String != oldPath
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [relinked], timeout: 15), .completed)
+        let newPath = try XCTUnwrap(asset()?["path"] as? String)
+        XCTAssertEqual(try Data(contentsOf: project.appendingPathComponent(newPath)), replacementData)
+        XCTAssertTrue(app.buttons["Перепривязать…"].waitForExistence(timeout: 15))
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        XCTAssertTrue(waitUntilEnabled(app.menuItems["Восстановить контрольную точку"]))
+    }
+
+    func testPortableSnapshotKeepsGeneratedProtectionAfterConflictResolution() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-generated-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        let project = base.appendingPathComponent("projects/Новый проект")
+        let external = Data("external generated source".utf8)
+        try external.write(to: project.appendingPathComponent("src/generated/external.tsx"), options: .atomic)
+
+        app.descendants(matching: .any)["panel-diagnostics"].firstMatch.click()
+        let review = app.buttons["Просмотреть и разрешить…"]
+        XCTAssertTrue(review.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilEnabled(review))
+        let actions = app.descendants(matching: .any)["project-actions"].firstMatch
+        actions.click()
+        XCTAssertFalse(app.menuItems["Создать переносимый снимок…"].isEnabled)
+        app.typeKey(.escape, modifierFlags: [])
+        review.click()
+        let picker = app.popUpButtons["Использовать"].firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 10))
+        picker.click()
+        app.menuItems["Версия на диске"].click()
+        app.buttons["Применить выбор…"].click()
+        let apply = app.buttons["Применить"]
+        XCTAssertTrue(apply.waitForExistence(timeout: 5))
+        apply.click()
+        let warning = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "защита сохраняется в переносимом снимке")).firstMatch
+        XCTAssertTrue(warning.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        let snapshot = app.menuItems["Создать переносимый снимок…"]
+        XCTAssertTrue(snapshot.waitForExistence(timeout: 5))
+        XCTAssertTrue(snapshot.isEnabled)
+        snapshot.click()
+        let confirmation = app.alerts["Создать переносимый снимок?"]
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.buttons["Продолжить"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        let completed = app.alerts["Переносимый снимок создан"]
+        XCTAssertTrue(completed.waitForExistence(timeout: 20))
+        completed.buttons["OK"].click()
+
+        let portable = base.appendingPathComponent("projects/Новый проект — снимок")
+        XCTAssertEqual(try Data(contentsOf: portable.appendingPathComponent("src/generated/external.tsx")), external)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: portable.appendingPathComponent(".aic-local").path))
+        let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: portable.appendingPathComponent("project.json"))) as? [String: Any])
+        let files = try XCTUnwrap(manifest["files"] as? [String: Any])
+        XCTAssertTrue(files.keys.contains { $0.hasPrefix("history/generated-blocks") })
+    }
+
+    func testLegacyCheckpointRequiresConfirmationForMissingFileModes() throws {
+        continueAfterFailure = false
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("aic-legacy-mode-ui-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let app = XCUIApplication()
+        app.launchEnvironment["AIC_APPLICATION_SUPPORT"] = base.appendingPathComponent("support").path
+        app.launchEnvironment["AIC_PROJECTS_DIRECTORY"] = base.appendingPathComponent("projects").path
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["new-project"].waitForExistence(timeout: 10))
+        app.buttons["new-project"].click()
+        XCTAssertTrue(app.dialogs.firstMatch.waitForExistence(timeout: 5) || app.sheets.firstMatch.waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.textFields["frame-name"].waitForExistence(timeout: 10))
+        let project = base.appendingPathComponent("projects/Новый проект").standardizedFileURL.resolvingSymlinksInPath()
+        let manifestFile = project.appendingPathComponent("project.json")
+        let relative = "src/user/missing-script.sh"
+        let source = project.appendingPathComponent(relative)
+        let contents = Data("#!/bin/sh\necho fixture\n".utf8)
+        try contents.write(to: source, options: .atomic)
+        app.descendants(matching: .any)["panel-diagnostics"].firstMatch.click()
+
+        func manifestContainsSource() -> Bool {
+            guard let data = try? Data(contentsOf: manifestFile),
+                  let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let files = manifest["files"] as? [String: Any] else { return false }
+            return files[relative] != nil
+        }
+        func selectDiskVersion() {
+            let review = app.buttons["Просмотреть и разрешить…"]
+            XCTAssertTrue(review.waitForExistence(timeout: 20))
+            XCTAssertTrue(waitUntilEnabled(review))
+            review.click()
+            let picker = app.popUpButtons["Использовать"].firstMatch
+            XCTAssertTrue(picker.waitForExistence(timeout: 10))
+            picker.click()
+            app.menuItems["Версия на диске"].click()
+            app.buttons["Применить выбор…"].click()
+            let confirm = app.buttons["Применить"]
+            XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+            confirm.click()
+        }
+        selectDiskVersion()
+        let tracked = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in manifestContainsSource() }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [tracked], timeout: 15), .completed)
+        let actions = app.descendants(matching: .any)["project-actions"].firstMatch
+        XCTAssertTrue(waitUntilEnabled(actions))
+        actions.click()
+        let create = app.menuItems["Создать контрольную точку"]
+        XCTAssertTrue(waitUntilEnabled(create))
+        create.click()
+        let checkpointDirectory = project.appendingPathComponent("checkpoints")
+        func checkpointFiles() -> [URL] {
+            ((try? FileManager.default.contentsOfDirectory(at: checkpointDirectory, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension == "json" }
+        }
+        let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in checkpointFiles().count == 1 }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [created], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(actions))
+        try FileManager.default.removeItem(at: source)
+        selectDiskVersion()
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !manifestContainsSource() }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(actions))
+        app.terminate()
+
+        let checkpointFile = try XCTUnwrap(checkpointFiles().first)
+        var checkpoint = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: checkpointFile)) as? [String: Any])
+        let checkpointId = try XCTUnwrap(checkpoint["id"] as? String)
+        let checkpointRevision = try XCTUnwrap(checkpoint["revision"] as? NSNumber).uint64Value
+        XCTAssertNotNil(checkpoint.removeValue(forKey: "executableModes"))
+        let legacy = try JSONSerialization.data(withJSONObject: checkpoint, options: [.prettyPrinted, .sortedKeys])
+        try legacy.write(to: checkpointFile, options: .atomic)
+        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestFile)) as? [String: Any])
+        var files = try XCTUnwrap(manifest["files"] as? [String: Any])
+        files["checkpoints/\(checkpointId).json"] = SHA256.hash(data: legacy).map { String(format: "%02x", $0) }.joined()
+        manifest["files"] = files
+        try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]).write(to: manifestFile, options: .atomic)
+        let localState = project.appendingPathComponent(".aic-local")
+        if FileManager.default.fileExists(atPath: localState.path) { try FileManager.default.removeItem(at: localState) }
+
+        app.launch()
+        let row = app.descendants(matching: .any)["recent-project-\(project.path)"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        func startRestore() {
+            XCTAssertTrue(waitUntilEnabled(actions))
+            actions.click()
+            let restore = app.menuItems["Восстановить контрольную точку"]
+            XCTAssertTrue(waitUntilEnabled(restore))
+            restore.click()
+            let entry = app.menuItems["Ревизия \(checkpointRevision) · \(checkpointId.prefix(8))"]
+            XCTAssertTrue(entry.waitForExistence(timeout: 5))
+            entry.click()
+            let confirmation = app.alerts["Восстановить контрольную точку?"]
+            XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+            confirmation.buttons["Восстановить"].click()
+        }
+        startRestore()
+        let modeConfirmation = app.alerts["Восстановить файлы без права запуска?"]
+        XCTAssertTrue(modeConfirmation.waitForExistence(timeout: 10))
+        XCTAssertTrue(modeConfirmation.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Права существующих файлов сохранятся")).firstMatch.exists)
+        modeConfirmation.buttons["Отмена"].click()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        startRestore()
+        XCTAssertTrue(modeConfirmation.waitForExistence(timeout: 10))
+        modeConfirmation.buttons["Восстановить без права запуска"].click()
+        let restored = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (try? Data(contentsOf: source)) == contents
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 15), .completed)
+        let attributes = try FileManager.default.attributesOfItem(atPath: source.path)
+        XCTAssertEqual((try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue) & 0o111, 0)
+        XCTAssertTrue(waitUntilEnabled(app.buttons["Отменить"]))
+        app.buttons["Отменить"].click()
+        let undone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !FileManager.default.fileExists(atPath: source.path)
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [undone], timeout: 15), .completed)
+        XCTAssertTrue(waitUntilEnabled(app.buttons["Повторить"]))
+        app.buttons["Повторить"].click()
+        let redone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (try? Data(contentsOf: source)) == contents
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [redone], timeout: 15), .completed)
     }
 }

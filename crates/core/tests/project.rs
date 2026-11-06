@@ -1289,3 +1289,90 @@ fn duplicate_refuses_unrecognized_agent_records_without_data_loss() {
     assert!(!destination.exists());
     assert_eq!(std::fs::read(path.join(relative)).unwrap(), bytes);
 }
+
+#[test]
+fn checkpoint_restore_preserves_new_chat_attachment_and_its_asset() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project");
+    let image = dir.path().join("late.svg");
+    let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>"#;
+    std::fs::write(&image, bytes).unwrap();
+    let session = create_project(&path, "Example").unwrap();
+    let checkpoint = session.create_checkpoint().unwrap();
+    let chat: Value =
+        serde_json::from_str(&session.create_chat("Chat", "discuss").unwrap()).unwrap();
+    let chat_id = chat["id"].as_str().unwrap();
+    let asset: Value = serde_json::from_str(&session.import_asset(&image).unwrap()).unwrap();
+    let message = json!({
+        "role":"user", "content":[{"type":"text","text":"Attachment"}],
+        "attachments":[{"assetId":asset["id"]}]
+    });
+    session
+        .append_chat_message(chat_id, &message.to_string())
+        .unwrap();
+    let before_messages = session.chat_messages_json(chat_id).unwrap();
+    session.restore_checkpoint(&checkpoint).unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(
+        reopened.chat_messages_json(chat_id).unwrap(),
+        before_messages
+    );
+    assert!(snapshot(&reopened)["document"]["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == &asset));
+    assert_eq!(
+        std::fs::read(path.join(asset["path"].as_str().unwrap()))
+            .unwrap()
+            .as_slice(),
+        bytes.as_slice()
+    );
+}
+
+#[test]
+fn checkpoint_restore_rejects_a_chat_attachment_identity_collision() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project");
+    let original = dir.path().join("old.svg");
+    let replacement = dir.path().join("new.svg");
+    std::fs::write(
+        &original,
+        br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &replacement,
+        br#"<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>"#,
+    )
+    .unwrap();
+    let session = create_project(&path, "Example").unwrap();
+    let asset: Value = serde_json::from_str(&session.import_asset(&original).unwrap()).unwrap();
+    let checkpoint = session.create_checkpoint().unwrap();
+    let current: Value = serde_json::from_str(
+        &session
+            .relink_asset(asset["id"].as_str().unwrap(), &replacement)
+            .unwrap(),
+    )
+    .unwrap();
+    let chat: Value =
+        serde_json::from_str(&session.create_chat("Chat", "discuss").unwrap()).unwrap();
+    let chat_id = chat["id"].as_str().unwrap();
+    let message = json!({
+        "role":"user", "content":[{"type":"text","text":"Current"}],
+        "attachments":[{"assetId":asset["id"]}]
+    });
+    session
+        .append_chat_message(chat_id, &message.to_string())
+        .unwrap();
+    let before = snapshot(&session);
+    let before_messages = session.chat_messages_json(chat_id).unwrap();
+    assert!(session.restore_checkpoint(&checkpoint).is_err());
+    assert_eq!(snapshot(&session), before);
+    assert_eq!(
+        session.chat_messages_json(chat_id).unwrap(),
+        before_messages
+    );
+    assert!(path.join(current["path"].as_str().unwrap()).is_file());
+}

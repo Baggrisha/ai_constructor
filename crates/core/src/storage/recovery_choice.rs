@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use super::{
     atomic, conflicts, control, durable_write, file_bytes, file_hash, hash, hash_file,
-    json as encode, lock, replace_with, safe_path, scan, sync_dir, unexpected_retained,
-    verify_backup, Entry, Journal, Loaded, Manifest, ObservedMarker,
+    json as encode, lock, replace_with, replace_with_modes, safe_path, scan, sync_dir,
+    unexpected_retained, unexpected_retained_mode, verify_backup, Entry, Journal, Loaded, Manifest,
+    ModeTransition, ObservedMarker,
 };
 use crate::{CoreError, ProjectSession, Result};
 
@@ -73,6 +74,8 @@ struct Archive {
     observed_disk_token: String,
     observed_marker_hash: Option<String>,
     observed_files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    observed_modes: BTreeMap<String, Option<u32>>,
     choices: Vec<String>,
     snapshots: Snapshots,
     blocked_paths: Vec<String>,
@@ -93,10 +96,28 @@ fn digest_id(
     disk_token: &str,
     old: bool,
     new: bool,
+    modes: &BTreeMap<String, Option<u32>>,
 ) -> Result<String> {
-    let bytes = serde_json::to_vec(&(journal_id, journal_hash, disk_token, old, new))
-        .map_err(|e| CoreError::invalid(e.to_string()))?;
+    let bytes = if modes.is_empty() {
+        serde_json::to_vec(&(journal_id, journal_hash, disk_token, old, new))
+    } else {
+        serde_json::to_vec(&(journal_id, journal_hash, disk_token, old, new, modes))
+    }
+    .map_err(|e| CoreError::invalid(e.to_string()))?;
     Ok(hash(&bytes))
+}
+
+fn observed_modes(root: &Path, journal: &Journal) -> Result<BTreeMap<String, Option<u32>>> {
+    let mut modes = BTreeMap::new();
+    for entry in journal.entries.iter().filter(|entry| entry.modes.is_some()) {
+        if modes
+            .insert(entry.path.clone(), super::file_mode(root, &entry.path)?)
+            .is_some()
+        {
+            return Err(CoreError::invalid("Duplicate file mode entry"));
+        }
+    }
+    Ok(modes)
 }
 
 fn is_digest(id: &str) -> bool {
@@ -176,7 +197,7 @@ fn manifests(dir: &Path, journal: &Journal) -> Result<[(Vec<u8>, Manifest); 2]> 
     let new: Manifest =
         serde_json::from_slice(&new_bytes).map_err(|e| CoreError::invalid(e.to_string()))?;
     if old.project_id != new.project_id
-        || old.revision != journal.old_revision
+        || old.revision != journal.old_revision.value()
         || new.revision != journal.new_revision
         || old.storage_generation != journal.old_generation
         || new.storage_generation != journal.new_generation
@@ -372,6 +393,7 @@ fn load_archive(root: &Path, id: &str) -> Result<Archive> {
             &token,
             archive.snapshots.old.available,
             archive.snapshots.new.available,
+            &archive.observed_modes,
         )? != id
     {
         return Err(CoreError::conflict("Recovery archive identity changed"));
@@ -533,7 +555,15 @@ pub(super) fn diagnostics(
             durable_write(&stage.join("disk-manifest"), bytes)?;
         }
         let journal_hash = hash(&journal_bytes);
-        let id = digest_id(&txid, &journal_hash, token, old.available, new.available)?;
+        let modes = observed_modes(root, &journal)?;
+        let id = digest_id(
+            &txid,
+            &journal_hash,
+            token,
+            old.available,
+            new.available,
+            &modes,
+        )?;
         finish_snapshot_paths(&id, &mut old);
         finish_snapshot_paths(&id, &mut new);
         let mut choices = Vec::new();
@@ -557,6 +587,7 @@ pub(super) fn diagnostics(
             observed_disk_token: token.into(),
             observed_marker_hash: marker_hash.clone(),
             observed_files: observed.clone(),
+            observed_modes: modes,
             choices,
             snapshots: Snapshots { old, new },
             blocked_paths: Vec::new(),
@@ -564,6 +595,7 @@ pub(super) fn diagnostics(
         durable_write(&stage.join("metadata.json"), &encode(&archive)?)?;
         sync_dir(&stage)?;
         if scan(root)? != *observed
+            || observed_modes(root, &journal)? != archive.observed_modes
             || file_bytes(root, "project.json")?.as_deref() != marker
             || read_regular(
                 root,
@@ -623,6 +655,43 @@ fn selected<'a>(archive: &'a Archive, take: &str) -> Result<&'a Snapshot> {
     }
 }
 
+fn choice_modes(
+    archive: &Archive,
+    journal: &Journal,
+    target: &Manifest,
+    take: &str,
+) -> Result<BTreeMap<String, ModeTransition>> {
+    let mut result = BTreeMap::new();
+    for entry in &journal.entries {
+        let Some(modes) = &entry.modes else { continue };
+        let before = *archive
+            .observed_modes
+            .get(&entry.path)
+            .ok_or_else(|| CoreError::invalid("Missing observed file mode"))?;
+        let after = if take == "old" {
+            modes.before
+        } else {
+            modes.after
+        };
+        if before.is_some() != archive.observed_files.contains_key(&entry.path)
+            || after.is_some() != target.files.contains_key(&entry.path)
+            || [before, after]
+                .into_iter()
+                .flatten()
+                .any(|mode| mode & !0o7777 != 0)
+            || result
+                .insert(entry.path.clone(), ModeTransition { before, after })
+                .is_some()
+        {
+            return Err(CoreError::invalid("Invalid recovery file modes"));
+        }
+    }
+    if result.len() != archive.observed_modes.len() {
+        return Err(CoreError::invalid("Unexpected observed file mode"));
+    }
+    Ok(result)
+}
+
 fn retained_choice(
     root: &Path,
     archive: &Archive,
@@ -630,6 +699,7 @@ fn retained_choice(
     manifest: &Manifest,
     take: &str,
     marker_hash: &str,
+    modes: &BTreeMap<String, ModeTransition>,
 ) -> Result<PathBuf> {
     let local = safe_path(root, ".aic-local/retained")?;
     fs::create_dir_all(&local)?;
@@ -655,6 +725,7 @@ fn retained_choice(
         .map(|path| Entry {
             old_hash: archive.observed_files.get(&path).cloned(),
             new_hash: manifest.files.get(&path).cloned(),
+            modes: modes.get(&path).cloned(),
             path,
             old_copy: None,
             new_copy: None,
@@ -807,7 +878,16 @@ pub(super) fn resume(
     verify_observed_archive(root, &archive)?;
     verify_available_snapshots(root, &archive)?;
     let marker_hash = hash(&target_marker);
-    let retained = retained_choice(root, &archive, journal, &target, &intent.take, &marker_hash)?;
+    let modes = choice_modes(&archive, journal, &target, &intent.take)?;
+    let retained = retained_choice(
+        root,
+        &archive,
+        journal,
+        &target,
+        &intent.take,
+        &marker_hash,
+        &modes,
+    )?;
     let paths: Vec<_> = archive
         .observed_files
         .keys()
@@ -834,12 +914,32 @@ pub(super) fn resume(
     for (index, path) in paths.iter().enumerate() {
         let before = archive.observed_files.get(path);
         let after = target.files.get(path);
-        if (observed.get(path) != before && observed.get(path) != after)
+        let transition = modes.get(path);
+        let current_mode = if transition.is_some() {
+            super::file_mode(root, path)?
+        } else {
+            None
+        };
+        let matches_before = observed.get(path) == before
+            && transition.is_none_or(|mode| current_mode == mode.before);
+        let matches_after =
+            observed.get(path) == after && transition.is_none_or(|mode| current_mode == mode.after);
+        let entry = Entry {
+            path: path.clone(),
+            old_hash: before.cloned(),
+            new_hash: after.cloned(),
+            old_copy: None,
+            new_copy: None,
+            modes: transition.cloned(),
+        };
+        let retained_path = retained.join(format!("entry-{index}"));
+        if (!matches_before && !matches_after)
             || unexpected_retained(
-                &retained.join(format!("entry-{index}")),
+                &retained_path,
                 before.map(String::as_str),
                 after.map(String::as_str),
             )?
+            || unexpected_retained_mode(&retained_path, &entry)?
         {
             return readonly(root, dir, journal, &archive, reason);
         }
@@ -855,10 +955,17 @@ pub(super) fn resume(
         let before = archive.observed_files.get(path);
         let after = target.files.get(path);
         let current = file_hash(root, path)?;
-        if current.as_ref() == after {
+        let transition = modes.get(path);
+        let current_mode = if transition.is_some() {
+            super::file_mode(root, path)?
+        } else {
+            None
+        };
+        if current.as_ref() == after && transition.is_none_or(|mode| current_mode == mode.after) {
             continue;
         }
-        if current.as_ref() != before {
+        if current.as_ref() != before || transition.is_some_and(|mode| current_mode != mode.before)
+        {
             return readonly(root, dir, journal, &archive, reason);
         }
         if file_hash(root, "project.json")? != current_marker {
@@ -871,7 +978,12 @@ pub(super) fn resume(
                 "Recovery journal changed during publication",
             ));
         }
-        super::checkpoint_destination(root, path, &mut destination_directories)?;
+        super::checkpoint_destination(
+            root,
+            path,
+            &mut destination_directories,
+            transition.is_some(),
+        )?;
         let bytes = match after {
             Some(expected) => {
                 let source = snapshot
@@ -894,15 +1006,21 @@ pub(super) fn resume(
                 hook();
             }
         });
-        replace_with(
+        replace_with_modes(
             root,
             path,
             current.as_deref(),
             bytes.as_deref(),
             &retained.join(format!("entry-{index}")),
+            transition,
         )?;
         #[cfg(test)]
         super::interrupt_at(2002 + index)?;
+    }
+    for (path, mode) in &modes {
+        if super::file_mode(root, path)? != mode.after {
+            return readonly(root, dir, journal, &archive, reason);
+        }
     }
     if scan(root)? != target.files || file_hash(root, "project.json")? != current_marker {
         return readonly(root, dir, journal, &archive, reason);
@@ -928,6 +1046,11 @@ pub(super) fn resume(
         || file_hash(root, "project.json")?.as_deref() != Some(marker_hash.as_str())
     {
         return readonly(root, dir, journal, &archive, reason);
+    }
+    for (path, mode) in &modes {
+        if super::file_mode(root, path)? != mode.after {
+            return readonly(root, dir, journal, &archive, reason);
+        }
     }
     verify_observed_archive(root, &archive)?;
     verify_available_snapshots(root, &archive)?;
@@ -993,6 +1116,11 @@ impl ProjectSession {
             {
                 return Err(CoreError::conflict("Recovery journal changed"));
             }
+            if observed_modes(&self.path, &journal)? != archive.observed_modes {
+                return Err(CoreError::conflict(
+                    "File modes changed since recovery was inspected",
+                ));
+            }
             verify_observed_archive(&self.path, &archive)?;
             verify_available_snapshots(&self.path, &archive)?;
             let snapshot = selected(&archive, &request.take)?;
@@ -1011,7 +1139,10 @@ impl ProjectSession {
             if state.dirty || !state.pending.is_empty() {
                 conflicts::archive_failed(&self.path, &state, &observed, marker.as_deref())?;
             }
-            if scan(&self.path)? != observed || file_bytes(&self.path, "project.json")? != marker {
+            if scan(&self.path)? != observed
+                || file_bytes(&self.path, "project.json")? != marker
+                || observed_modes(&self.path, &journal)? != archive.observed_modes
+            {
                 return Err(CoreError::conflict(
                     "Disk changed while preparing the recovery choice",
                 ));

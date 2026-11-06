@@ -249,9 +249,11 @@ fn validate_known_vector_fields(node: &Node) -> Result<()> {
 impl Document {
     // Unknown current-schema content remains readable but cannot be rewritten.
     pub fn editable(&self) -> bool {
-        self.components
-            .iter()
-            .all(|v| matches!(v, FeatureItem::Known(_)))
+        self.file_history_version.is_none_or(|version| version == 1)
+            && self
+                .components
+                .iter()
+                .all(|v| matches!(v, FeatureItem::Known(_)))
             && self
                 .targets
                 .iter()
@@ -272,7 +274,8 @@ impl Document {
     }
 
     fn validate_with(&self, strict_bound_sizes: bool) -> Result<()> {
-        if self.schema_version != 1 || self.pages.is_empty() {
+        if self.schema_version != 1 || self.pages.is_empty() || self.file_history_version == Some(0)
+        {
             return Err(CoreError::invalid("Unsupported or empty document"));
         }
         let (components, unknown_components) = records(

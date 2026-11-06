@@ -10,6 +10,7 @@ mod geometry;
 mod operations;
 mod text;
 mod validation;
+mod vector;
 
 use domain::{
     Action, Animation, Asset, Binding, Bounds, CodeModule, Component, FeatureItem, FeatureMap,
@@ -31,6 +32,8 @@ pub struct Document {
     pub schema_version: u32,
     pub project_id: Uuid,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_history_version: Option<u32>,
     pub pages: Vec<Page>,
     pub nodes: Vec<Node>,
     pub components: Vec<FeatureItem<Component>>,
@@ -193,6 +196,7 @@ impl Document {
             schema_version: 1,
             project_id,
             revision: 0,
+            file_history_version: None,
             pages: vec![Page {
                 id: Uuid::new_v4(),
                 name: "Page 1".into(),

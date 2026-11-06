@@ -10,6 +10,7 @@
     "schemaVersion": { "const": 1 },
     "projectId": { "$ref": "#/$defs/id" },
     "revision": { "type": "integer", "minimum": 0 },
+    "fileHistoryVersion": { "const": 1 },
     "pages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/page" } },
     "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
     "components": { "type": "array", "items": { "$ref": "#/$defs/component" } },
@@ -107,7 +108,7 @@
     },
     "vector": {
       "type": "object", "additionalProperties": false, "required": ["paths"],
-      "description": "Editable paths and optional native geometric figures in node-local CSS pixels.",
+      "description": "Editable paths and native geometric figures in node-local CSS pixels. Hug dimensions use tight geometric bounds independently of the other axis; move-only subpaths do not contribute. Empty, unrecognized, or malformed geometry has no measurable intrinsic size. Source bounds and viewport transforms remain separate.",
       "properties": {
         "paths": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/vectorCommand" } } },
         "shapes": { "type": "array", "items": { "$ref": "#/$defs/vectorShape" } }

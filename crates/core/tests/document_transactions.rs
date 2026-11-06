@@ -541,6 +541,75 @@ fn code_module_requires_a_tracked_source_and_valid_prop_contract() {
     );
     assert!(session.apply_transaction(&tx.to_string()).is_err());
     assert_eq!(snapshot(&session), before);
+    assert_eq!(
+        before["document"]["nodes"][1]["propertyMeta"]["/content/props/title"]["agentLocked"],
+        true
+    );
+    assert_eq!(
+        before["document"]["nodes"][1]["propertyMeta"]["/content/props/count"]["agentLocked"],
+        true
+    );
+    let unlock = transaction(
+        &session,
+        &[component],
+        json!([
+            {"type":"setProperty","nodeId":component,
+             "path":"/propertyMeta/~1content~1props~1count/agentLocked","value":false}
+        ]),
+    );
+    session.apply_transaction(&unlock.to_string()).unwrap();
+    let before_agent = snapshot(&session);
+    let mut locked = transaction(
+        &session,
+        &[component],
+        json!([
+            {"type":"setProperty","nodeId":component,"path":"/content/props/count","value":3},
+            {"type":"setProperty","nodeId":component,"path":"/content/props/title","value":"No"}
+        ]),
+    );
+    locked["origin"] = json!("agent");
+    assert_eq!(
+        session
+            .apply_transaction(&locked.to_string())
+            .unwrap_err()
+            .code,
+        "LOCKED_PROPERTY"
+    );
+    assert_eq!(snapshot(&session), before_agent);
+    let mut valid = transaction(
+        &session,
+        &[component],
+        json!([
+            {"type":"setProperty","nodeId":component,"path":"/content/props/count","value":3}
+        ]),
+    );
+    valid["origin"] = json!("agent");
+    session.apply_transaction(&valid.to_string()).unwrap();
+    let changed = snapshot(&session);
+    assert_eq!(
+        changed["document"]["nodes"][1]["content"]["props"]["count"].as_f64(),
+        Some(3.0)
+    );
+    assert_eq!(
+        changed["document"]["nodes"][1]["content"]["props"]["title"],
+        "Hello"
+    );
+    let invalid = transaction(
+        &session,
+        &[component],
+        json!([
+            {"type":"setProperty","nodeId":component,"path":"/content/props/title","value":false}
+        ]),
+    );
+    assert!(session.apply_transaction(&invalid.to_string()).is_err());
+    assert_eq!(snapshot(&session), changed);
+    session.undo().unwrap();
+    assert_eq!(
+        snapshot(&session)["document"]["nodes"][1]["content"]["props"]["count"].as_f64(),
+        Some(2.0)
+    );
+    session.redo().unwrap();
+    let before = snapshot(&session);
     session.save().unwrap();
     assert_eq!(std::fs::read(path.join(source_path)).unwrap(), source);
     drop(session);
@@ -1947,18 +2016,35 @@ fn unknown_vector_shapes_remain_read_only_and_are_not_rewritten() {
     let root = root(&session);
     drop(session);
     let vector_id = Uuid::new_v4();
+    let marker = Uuid::new_v4();
     let mut vector = node(vector_id, root, "vector");
+    vector["layout"]["widthMode"] = json!("hug");
     vector["content"]["vector"] = json!({
         "paths": [],
         "shapes": [{"type": "futureStar", "points": [1, 2, 3], "extra": {"keep": true}}]
     });
-    document["nodes"][0]["children"] = json!([vector_id]);
+    document["nodes"][0]["layout"]["flow"] = json!({
+        "direction":"row","gap":0,
+        "padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"
+    });
+    document["nodes"][0]["children"] = json!([vector_id, marker]);
     document["nodes"].as_array_mut().unwrap().push(vector);
+    document["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(node(marker, root, "group"));
     write_document_fixture(&path, &document);
     let original = std::fs::read(path.join("document.json")).unwrap();
     let reopened = open_project(&path).unwrap();
     assert_eq!(snapshot(&reopened)["readOnly"], true);
     assert_eq!(snapshot(&reopened)["document"], document);
+    assert_eq!(
+        reopened
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false,)
+            .unwrap_err()
+            .code,
+        "UNSUPPORTED_FEATURE"
+    );
     assert!(reopened.save().is_err());
     assert_eq!(std::fs::read(path.join("document.json")).unwrap(), original);
 }
@@ -2699,4 +2785,314 @@ fn historical_invalid_bound_size_opens_without_rewriting_and_can_be_repaired() {
     session
         .transform_point_json(&child.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
         .unwrap();
+}
+
+#[test]
+fn component_instance_hug_uses_the_template_and_breakpoint() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Component hug").unwrap());
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = Uuid::parse_str(document["pages"][0]["rootId"].as_str().unwrap()).unwrap();
+    let template = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let row = Uuid::new_v4();
+    let component = Uuid::new_v4();
+    let mut template_node = node(template, root, "group");
+    template_node["layout"]["w"] = json!(80);
+    template_node["children"] = json!([child]);
+    template_node["responsive"] = json!([{"breakpoint":500,"w":50}]);
+    let mut row_node = node(row, root, "group");
+    row_node["layout"]["flow"] = json!({
+        "direction":"row","gap":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"
+    });
+    document["nodes"][0]["children"] = json!([template, row]);
+    document["nodes"].as_array_mut().unwrap().extend([
+        template_node,
+        node(child, template, "group"),
+        row_node,
+    ]);
+    document["components"] = json!([{"id":component,"rootId":template}]);
+    write_document_fixture(&path, &document);
+    let session = open_project(&path).unwrap();
+    let instance = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut instance_node = node(instance, row, "componentInstance");
+    instance_node["content"]["componentId"] = json!(component);
+    instance_node["layout"]["widthMode"] = json!("hug");
+    let insert = transaction(
+        &session,
+        &[row, instance, marker],
+        json!([
+            {"type":"insertNode","parentId":row,"index":0,"node":instance_node},
+            {"type":"insertNode","parentId":row,"index":1,"node":node(marker, row, "group")}
+        ]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    let position = |breakpoint: Option<f64>| -> f64 {
+        let value = match breakpoint {
+            Some(width) => session.transform_point_at_breakpoint_json(
+                &marker.to_string(),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                false,
+                false,
+                width,
+            ),
+            None => session.transform_point_json(
+                &marker.to_string(),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                false,
+                false,
+            ),
+        }
+        .unwrap();
+        serde_json::from_str::<Value>(&value).unwrap()["x"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(position(None), 80.0);
+    assert_eq!(position(Some(500.0)), 50.0);
+    let change = transaction(
+        &session,
+        &[template],
+        json!([
+            {"type":"setProperty","nodeId":template,"path":"/layout/flow","value":{
+                "direction":"row","gap":0,"padding":{"top":0,"right":3,"bottom":0,"left":2},"align":"start"
+            }},
+            {"type":"setProperty","nodeId":template,"path":"/layout/widthMode","value":"hug"}
+        ]),
+    );
+    session.apply_transaction(&change.to_string()).unwrap();
+    assert_eq!(position(None), 105.0);
+    assert_eq!(position(Some(500.0)), 50.0);
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    let result = reopened
+        .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false)
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&result).unwrap()["x"], 105.0);
+}
+
+#[test]
+fn vector_hug_measures_shapes_paths_and_viewport_coordinates() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Vector hug").unwrap();
+    let root = root(&session);
+    let vector_id = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut vector = node(vector_id, root, "vector");
+    vector["layout"]["widthMode"] = json!("hug");
+    vector["layout"]["heightMode"] = json!("hug");
+    vector["sourceBounds"] = json!({"x": 900, "y": 800, "w": 500, "h": 400});
+    vector["sourceDensity"] = json!(2);
+    vector["responsive"] = json!([{"breakpoint": 500, "w": 200}]);
+    vector["content"]["vector"] = json!({"paths": [], "shapes": [
+        {"type":"rect","x":0,"y":0,"w":1,"h":1}
+    ]});
+    let flow = |direction| {
+        json!({
+            "direction":direction,"gap":0,
+            "padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"
+        })
+    };
+    let insert = transaction(
+        &session,
+        &[root, vector_id, marker],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":flow("row")},
+            {"type":"insertNode","parentId":root,"index":0,"node":vector},
+            {"type":"insertNode","parentId":root,"index":1,"node":node(marker, root, "group")}
+        ]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    let point = |breakpoint: Option<f64>| -> Value {
+        let result = if let Some(width) = breakpoint {
+            session.transform_point_at_breakpoint_json(
+                &marker.to_string(),
+                0.0,
+                0.0,
+                2.0,
+                3.0,
+                5.0,
+                false,
+                false,
+                width,
+            )
+        } else {
+            session.transform_point_json(&marker.to_string(), 0.0, 0.0, 2.0, 3.0, 5.0, false, false)
+        };
+        serde_json::from_str(&result.unwrap()).unwrap()
+    };
+    let shapes = [
+        (
+            json!({"type":"rect","x":-5,"y":7,"w":40,"h":20,"rx":3,"ry":4}),
+            40.0,
+            20.0,
+        ),
+        (json!({"type":"circle","cx":-5,"cy":7,"r":3}), 6.0, 6.0),
+        (
+            json!({"type":"ellipse","cx":-5,"cy":7,"rx":2,"ry":4}),
+            4.0,
+            8.0,
+        ),
+        (
+            json!({"type":"line","x1":3,"y1":-4,"x2":-7,"y2":9}),
+            10.0,
+            13.0,
+        ),
+        (
+            json!({"type":"polyline","points":[{"x":0,"y":1},{"x":-2,"y":7},{"x":3,"y":-5}]}),
+            5.0,
+            12.0,
+        ),
+        (
+            json!({"type":"polygon","points":[{"x":0,"y":0},{"x":8,"y":4},{"x":-2,"y":9}]}),
+            10.0,
+            9.0,
+        ),
+        (
+            json!({"type":"rect","x":9007199254740992.0,"y":0,"w":1,"h":1}),
+            1.0,
+            1.0,
+        ),
+        (
+            json!({"type":"circle","cx":9007199254740992.0,"cy":0,"r":0.25}),
+            0.5,
+            0.5,
+        ),
+    ];
+    for (shape, width, height) in shapes {
+        let change = transaction(
+            &session,
+            &[root, vector_id],
+            json!([
+                {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":flow("row")},
+                {"type":"setProperty","nodeId":vector_id,"path":"/content/vector",
+                    "value":{"paths":[],"shapes":[shape]}}
+            ]),
+        );
+        session.apply_transaction(&change.to_string()).unwrap();
+        assert_eq!(point(None)["x"].as_f64().unwrap(), 2.0 * width + 3.0);
+        assert_eq!(point(Some(500.0))["x"].as_f64().unwrap(), 403.0);
+        let column = transaction(
+            &session,
+            &[root],
+            json!([{"type":"setProperty","nodeId":root,"path":"/layout/flow","value":flow("column")}]),
+        );
+        session.apply_transaction(&column.to_string()).unwrap();
+        assert_eq!(point(None)["y"].as_f64().unwrap(), 2.0 * height + 5.0);
+    }
+    let curve = json!({"paths":[[
+        {"type":"moveTo","x":0,"y":0},
+        {"type":"curveTo","x1":100,"y1":200,"x2":100,"y2":-200,"x":0,"y":0},
+        {"type":"moveTo","x":-30,"y":-4},
+        {"type":"lineTo","x":-10,"y":-12},
+        {"type":"close"},
+        {"type":"lineTo","x":-20,"y":-8},
+        {"type":"moveTo","x":999,"y":999}
+    ]]});
+    let change = transaction(
+        &session,
+        &[root, vector_id],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":flow("row")},
+            {"type":"setProperty","nodeId":vector_id,"path":"/content/vector","value":curve},
+            {"type":"setProperty","nodeId":vector_id,"path":"/layout/heightMode","value":"fixed"}
+        ]),
+    );
+    session.apply_transaction(&change.to_string()).unwrap();
+    assert!((point(None)["x"].as_f64().unwrap() - 213.0).abs() < 1e-10);
+    let change = transaction(
+        &session,
+        &[root, vector_id],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":flow("column")},
+            {"type":"setProperty","nodeId":vector_id,"path":"/layout/heightMode","value":"hug"},
+            {"type":"setProperty","nodeId":vector_id,"path":"/layout/widthMode","value":"fixed"}
+        ]),
+    );
+    session.apply_transaction(&change.to_string()).unwrap();
+    let expected_y = 2.0 * (200.0 / 3.0_f64.sqrt()) + 5.0;
+    assert!((point(None)["y"].as_f64().unwrap() - expected_y).abs() < 1e-10);
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    let point: Value = serde_json::from_str(
+        &reopened
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 2.0, 3.0, 5.0, false, false)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!((point["y"].as_f64().unwrap() - expected_y).abs() < 1e-10);
+}
+
+#[test]
+fn vector_hug_rejects_ambiguous_empty_and_overflowing_geometry() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Vector errors").unwrap();
+    let root = root(&session);
+    let vector_id = Uuid::new_v4();
+    let marker = Uuid::new_v4();
+    let mut vector = node(vector_id, root, "vector");
+    vector["layout"]["widthMode"] = json!("hug");
+    vector["content"]["vector"] = json!({"paths":[]});
+    let insert = transaction(
+        &session,
+        &[root, vector_id, marker],
+        json!([
+            {"type":"setProperty","nodeId":root,"path":"/layout/flow","value":{
+                "direction":"row","gap":0,
+                "padding":{"top":0,"right":0,"bottom":0,"left":0},"align":"start"}},
+            {"type":"insertNode","parentId":root,"index":0,"node":vector},
+            {"type":"insertNode","parentId":root,"index":1,"node":node(marker, root, "group")}
+        ]),
+    );
+    session.apply_transaction(&insert.to_string()).unwrap();
+    for value in [
+        json!({"paths":[]}),
+        json!({"paths":[[{"type":"moveTo","x":10,"y":20}]]}),
+        json!({"paths":[[{"type":"lineTo","x":10,"y":20}]]}),
+        json!({"paths":[[{"type":"close"}]]}),
+    ] {
+        let change = transaction(
+            &session,
+            &[vector_id],
+            json!([{"type":"setProperty","nodeId":vector_id,"path":"/content/vector","value":value}]),
+        );
+        session.apply_transaction(&change.to_string()).unwrap();
+        let before = snapshot(&session);
+        assert_eq!(
+            session
+                .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false,)
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_FEATURE"
+        );
+        assert_eq!(snapshot(&session), before);
+    }
+    let overflow = transaction(
+        &session,
+        &[vector_id],
+        json!([{"type":"setProperty","nodeId":vector_id,"path":"/content/vector",
+            "value":{"paths":[],"shapes":[{"type":"circle","cx":1e308,"cy":0,"r":1e308}]}}]),
+    );
+    session.apply_transaction(&overflow.to_string()).unwrap();
+    assert_eq!(
+        session
+            .transform_point_json(&marker.to_string(), 0.0, 0.0, 1.0, 0.0, 0.0, false, false,)
+            .unwrap_err()
+            .code,
+        "INVALID_DOCUMENT"
+    );
 }

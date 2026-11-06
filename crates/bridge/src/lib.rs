@@ -292,6 +292,15 @@ impl ProjectSession {
             .inner
             .restore_checkpoint_controlled(&id, control.inner.clone())?)
     }
+    pub fn restore_checkpoint_with_missing_modes_controlled(
+        &self,
+        id: String,
+        control: Arc<OperationControl>,
+    ) -> Result<String, CoreError> {
+        Ok(self
+            .inner
+            .restore_checkpoint_with_missing_modes_controlled(&id, control.inner.clone())?)
+    }
     pub fn import_asset_controlled(
         &self,
         path: String,
