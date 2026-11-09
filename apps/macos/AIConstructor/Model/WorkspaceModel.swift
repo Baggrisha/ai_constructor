@@ -49,13 +49,17 @@ final class WorkspaceModel: ObservableObject {
     private var inspectorCommitTask: Task<Void, Never>?
     private var canvasTaskState: CanvasTaskState?
     private var canvasQueued = false
+    /// The document revision the current canvas was rendered from; a
+    /// render request only runs when it is out of date.
+    private var canvasRevision: UInt64?
     private var canvasScale = 0.0
     private var pendingGesture: CanvasGesture?
     private var operationControl: OperationControl?
     private var diagnosticControl: OperationControl?
-    private var possibleUnsaved = false
+    var possibleUnsaved = false
 
     var writesBlocked: Bool { snapshot?.readOnly == true || diagnostics?.readOnly == true }
+
 
     var hasBlockingFrameDraft: Bool {
         guard let frameDraft else { return false }
@@ -94,15 +98,15 @@ final class WorkspaceModel: ObservableObject {
     }
     private var sessions: [String: ProjectSession] = [:]
     private var sessionProjectIds: [String: String] = [:]
-    private var currentPath: URL?
+    private(set) var currentPath: URL?
     private var deferredChatLoad = false
     private var deferredChatId: String?
     private var projectWatcher: ProjectFileWatcher?
     private var observationTask: Task<Void, Never>?
     private var observationPending = false
-    private let library = ProjectLibrary.shared
+    let library = ProjectLibrary.shared
 
-    private var session: ProjectSession? {
+    var session: ProjectSession? {
         guard let currentPath else { return nil }
         return sessions[currentPath.path]
     }
@@ -120,7 +124,7 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func perform<T>(
+    func perform<T>(
         _ title: String,
         control: OperationControl? = nil,
         errorContext: String? = nil,
@@ -267,6 +271,7 @@ final class WorkspaceModel: ObservableObject {
         canvasTaskState = nil
         canvasQueued = false
         canvasGenerating = false
+        canvasRevision = nil
         canvas = .empty
         watchProject(url)
         remember(url, replacing: oldPath)
@@ -461,6 +466,7 @@ final class WorkspaceModel: ObservableObject {
             canvasTaskState = nil
             canvasQueued = false
             canvasGenerating = false
+            canvasRevision = nil
             canvas = .empty
         }
     }
@@ -551,7 +557,7 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func accept(_ result: SaveResult, context: String? = nil) {
+    func accept(_ result: SaveResult, context: String? = nil) {
         applySnapshot(result.snapshot)
         possibleUnsaved = result.snapshot.dirty
         if let error = result.error {
@@ -714,7 +720,10 @@ final class WorkspaceModel: ObservableObject {
             try editAndSaveSnapshot(session) { try session.undoAndSaveControlled(control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.acceptHistoryChange($0) }
+        }) {
+            self.acceptHistoryChange($0)
+            self.refreshCanvas(force: true)
+        }
     }
 
     func redo() {
@@ -728,7 +737,10 @@ final class WorkspaceModel: ObservableObject {
             try editAndSaveSnapshot(session) { try session.redoAndSaveControlled(control: control) }
         }, failure: { error in
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-        }) { self.acceptHistoryChange($0) }
+        }) {
+            self.acceptHistoryChange($0)
+            self.refreshCanvas(force: true)
+        }
     }
 
     func createCheckpoint() {
@@ -1160,8 +1172,9 @@ final class WorkspaceModel: ObservableObject {
     /// Renders the current page to HTML and computed bounds. Revisions are
     /// requested in order and every request re-reads the session, so a stale
     /// result can never replace a newer one.
-    func refreshCanvas() {
+    func refreshCanvas(force: Bool = false) {
         guard let session, let path = currentPath, session === self.session else { return }
+        if force { canvasRevision = nil }
         guard let page = snapshot?.document.pages.first(where: { $0.id == selectedPageId })
                 ?? snapshot?.document.pages.first else {
             canvas = .empty
@@ -1176,6 +1189,7 @@ final class WorkspaceModel: ObservableObject {
             return
         }
         canvasQueued = false
+        guard canvasRevision != snapshot?.document.revision || canvas.nodes.isEmpty else { return }
         let request = CanvasTaskRequest(session: session, page: CanvasPage(id: page.id, rootId: page.rootId), scale: canvasScale)
         let item = CanvasTaskState(request: request)
         canvasTaskState = item
@@ -1203,6 +1217,7 @@ final class WorkspaceModel: ObservableObject {
         switch result {
         case .success(let content):
             canvas = content
+            canvasRevision = snapshot?.document.revision
             canvasNotice = nil
             selectedNodeIds = selectedNodeIds.filter { id in content.nodes.contains { $0.id == id } }
         case .failure(let error):
@@ -1258,7 +1273,7 @@ final class WorkspaceModel: ObservableObject {
         case .move:
             selectNode(hit.id, extending: extending)
             guard selectedNodeIds.contains(hit.id) else { return }
-            ids = orderedSelection()
+            ids = orderedSelection
             if ids.count > 1, canvas.nodes.first(where: { $0.id == ids[0] })?.parentId != canvas.nodes.first(where: { $0.id == hit.id })?.parentId {
                 canvasNotice = "Перемещать вместе можно только элементы одного родителя."
                 return
@@ -1333,8 +1348,100 @@ final class WorkspaceModel: ObservableObject {
         pendingGesture != nil
     }
 
-    private func orderedSelection() -> [String] {
-        canvas.nodes.filter { selectedNodeIds.contains($0.id) }.map(\.id)
+    /// Selected nodes in canvas order, so group and paste results are stable.
+    var orderedSelection: [String] {
+        canvas.nodes.filter { selectedNodeIds.contains($0.id) && $0.id != snapshot?.root?.id }.map(\.id)
+    }
+
+    // MARK: Marquee selection
+
+    /// The rubber band while dragging on empty canvas, in document coordinates.
+    @Published private(set) var marquee: CanvasRect?
+    /// The node the "restore as text" sheet replaces; nil hides it.
+    @Published var restoreTextTarget: String?
+    private var marqueeStart: CGPoint?
+    private var marqueeBase: Set<String> = []
+
+    /// A press on empty canvas starts a rubber band; nodes it touches on
+    /// release are added to the selection (C.4).
+    func beginMarquee(at point: CGPoint, extending: Bool) {
+        let base = extending ? selectedNodeIds : []
+        if !extending { selectNode(nil, extending: false) }
+        marqueeStart = point
+        marqueeBase = base
+        marquee = CanvasRect(x: point.x, y: point.y, w: 0, h: 0)
+    }
+
+    func updateMarquee(at point: CGPoint) {
+        guard let start = marqueeStart else { return }
+        marquee = CanvasRect(x: min(start.x, point.x), y: min(start.y, point.y),
+                             w: abs(point.x - start.x), h: abs(point.y - start.y))
+    }
+
+    func endMarquee(at point: CGPoint) {
+        guard let start = marqueeStart, let root = snapshot?.root else { return }
+        let box = CanvasRect(x: min(start.x, point.x), y: min(start.y, point.y),
+                             w: abs(point.x - start.x), h: abs(point.y - start.y))
+        marqueeStart = nil
+        marquee = nil
+        let threshold = 3.0 / max(canvasScale, 0.001)
+        guard box.w > threshold || box.h > threshold else {
+            selectedNodeIds = marqueeBase
+            return
+        }
+        let hits = canvas.nodes.filter { node in
+            guard node.id != root.id, !node.hidden else { return false }
+            return node.x < box.x + box.w && node.x + node.w > box.x && node.y < box.y + box.h && node.y + node.h > box.y
+        }
+        // Only siblings of the shallowest hit: a marquee never mixes parents.
+        let depth = { (id: String) -> Int in
+            var level = 0
+            var parent = self.canvas.nodes.first { $0.id == id }?.parentId
+            while let current = parent {
+                level += 1
+                parent = self.canvas.nodes.first { $0.id == current }?.parentId
+            }
+            return level
+        }
+        let shallowest = hits.map { depth($0.id) }.min() ?? 0
+        let ids = hits.filter { depth($0.id) == shallowest }.map(\.id)
+        selectedNodeIds = marqueeBase.union(ids)
+        commitDraft()
+    }
+
+    func cancelMarquee() {
+        marqueeStart = nil
+        marquee = nil
+    }
+
+    var marqueeActive: Bool { marqueeStart != nil }
+
+    // MARK: Vector point drag
+
+    private var vectorDrag: (id: String, index: Int, start: CGPoint, point: CGPoint)?
+
+    func beginVectorDrag(_ id: String, index: Int, at point: CGPoint) {
+        guard !writesBlocked, operation == nil else { return }
+        vectorDrag = (id, index, point, point)
+    }
+
+    func updateVectorDrag(at point: CGPoint) {
+        guard let drag = vectorDrag else { return }
+        vectorDrag = (drag.id, drag.index, drag.start, point)
+    }
+
+    var vectorDragPreview: (id: String, index: Int, delta: CGVector)? {
+        guard let drag = vectorDrag else { return nil }
+        return (drag.id, drag.index, CGVector(dx: drag.point.x - drag.start.x, dy: drag.point.y - drag.start.y))
+    }
+
+    /// The whole vector is written back once, so a point drag is one undo step.
+    func endVectorDrag(at point: CGPoint) {
+        guard let drag = vectorDrag else { return }
+        vectorDrag = nil
+        let delta = CGVector(dx: point.x - drag.start.x, dy: point.y - drag.start.y)
+        guard abs(delta.dx) > 0.01 || abs(delta.dy) > 0.01 else { return }
+        moveVectorPoint(drag.id, index: drag.index, by: delta)
     }
 
     private func gestureOperations(_ gesture: CanvasGesture, preview: CanvasRect, rotation: Double?) -> [[String: Any]]? {
@@ -1367,8 +1474,8 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func applyCanvasOperations(_ operations: [[String: Any]], scope: [String], baseRevision: UInt64, baseFingerprint: String) {
-        guard let session else { return }
+    func applyCanvasOperations(_ operations: [[String: Any]], scope: [String], baseRevision: UInt64, baseFingerprint: String) {
+        guard operation == nil, let session else { return }
         let transaction: [String: Any] = [
             "transactionId": UUID().uuidString.lowercased(),
             "baseRevision": baseRevision,
@@ -1377,31 +1484,32 @@ final class WorkspaceModel: ObservableObject {
             "scopeNodeIds": scope,
             "operations": operations
         ]
+        let json: String
         do {
             let data = try JSONSerialization.data(withJSONObject: transaction, options: [.sortedKeys])
-            guard let json = String(data: data, encoding: .utf8) else { throw CocoaError(.fileWriteInapplicableStringEncoding) }
-            let previousUnsaved = possibleUnsaved
-            possibleUnsaved = true
-            let control = newOperationControl()
-            perform("Сохранение изменений…", control: control, work: {
-                try editAndSaveSnapshot(session) {
-                    try session.applyTransactionAndSaveControlled(transactionJson: json, control: control)
-                }
-            }, failure: { error in
-                if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
-            }) { result in
-                if let error = result.error {
-                    // The core already refuses conflicting transactions, so the
-                    // snapshot is authoritative and the canvas must follow it.
-                    self.accept(result)
-                    self.error = [error, "Действие не сохранено; холст показывает состояние проекта."].joined(separator: "\n")
-                } else {
-                    self.accept(result)
-                }
-                self.refreshCanvas()
-            }
+            guard let encoded = String(data: data, encoding: .utf8) else { throw CocoaError(.fileWriteInapplicableStringEncoding) }
+            json = encoded
         } catch {
             self.error = readableError(error)
+            return
+        }
+        let previousUnsaved = possibleUnsaved
+        possibleUnsaved = true
+        let control = newOperationControl()
+        perform("Сохранение изменений…", control: control, work: {
+            try editAndSaveSnapshot(session) {
+                try session.applyTransactionAndSaveControlled(transactionJson: json, control: control)
+            }
+        }, failure: { error in
+            if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
+        }) { result in
+            self.accept(result)
+            if let failure = result.error {
+                // The core already refuses conflicting transactions, so the
+                // snapshot is authoritative and the canvas must follow it.
+                self.error = [failure, "Действие не сохранено; холст показывает состояние проекта."].joined(separator: "\n")
+            }
+            self.refreshCanvas()
         }
     }
 
@@ -1480,7 +1588,7 @@ final class WorkspaceModel: ObservableObject {
         canvasPatches = []
     }
 
-    private func applySnapshot(_ next: Snapshot?) {
+    func applySnapshot(_ next: Snapshot?) {
         let previous = snapshot
         snapshot = next
         rawNodes = nil
@@ -1681,7 +1789,7 @@ final class WorkspaceModel: ObservableObject {
         setNodeProperty(id, "/propertyMeta/\(escaped)/agentLocked", !unlocked)
     }
 
-    private func setNodeProperty(_ id: String, _ path: String, _ value: Any) {
+    func setNodeProperty(_ id: String, _ path: String, _ value: Any) {
         guard let snapshot, rawNode(id) != nil else { return }
         let operation: [String: Any] = ["type": "setProperty", "nodeId": id, "path": path, "value": value]
         applyCanvasOperations([operation], scope: [id], baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
@@ -1694,7 +1802,7 @@ final class WorkspaceModel: ObservableObject {
     /// snapshot is needed, so earlier ones are not retained.
     private var rawNodes: [[String: Any]]?
 
-    private var rawDocumentNodes: [[String: Any]] {
+    var rawDocumentNodes: [[String: Any]] {
         if rawNodes == nil, snapshot != nil, let session, let json = try? session.snapshotJson(),
            let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
            let nodes = (object["document"] as? [String: Any])?["nodes"] as? [[String: Any]] {

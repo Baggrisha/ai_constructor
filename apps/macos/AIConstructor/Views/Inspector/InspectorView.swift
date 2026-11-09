@@ -18,6 +18,10 @@ struct InspectorView: View {
                     Divider()
                     InspectorBehaviorSection(model: model, node: node)
                     Divider()
+                    if (node["kind"] as? String) == "vector" {
+                        InspectorVectorSection(model: model, node: node)
+                        Divider()
+                    }
                     InspectorLockSection(model: model, node: node)
                     Divider()
                     DisabledSection(title: "Анимация", note: "Появится в M2")
@@ -244,6 +248,11 @@ private struct InspectorDesignSection: View {
                 }
                 InspectorField(model: model, node: node, spec: FieldSpec("/style/radius", "Радиус", .number, debounce: true))
                 InspectorField(model: model, node: node, spec: FieldSpec("/style/opacity", "Прозрачность", .number, debounce: true))
+                HStack(spacing: 12) {
+                    ForEach(["/layout/minW", "/layout/maxW", "/layout/minH", "/layout/maxH"], id: \.self) { path in
+                        CompactNumberField(model: model, node: node, path: path, label: path.split(separator: "/").last.map(String.init) ?? path)
+                    }
+                }
             }
             if hasText { textFields }
             if kind == "image" { imageFields }
@@ -282,7 +291,9 @@ private struct InspectorDesignSection: View {
     @ViewBuilder
     private var imageFields: some View {
         Text("Изображение").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 4)
-        InspectorField(model: model, node: node, spec: FieldSpec("/style/fit", "Вписывание", .text))
+        Text(model.inspectorValue(node, "/content/assetId") as? String ?? "Ресурс не выбран")
+            .font(.caption2).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+        ImageRow(model: model, node: node)
         Label("Кадрирование недоступно в M1", systemImage: "nosign")
             .font(.caption2).foregroundStyle(.secondary)
     }
@@ -297,6 +308,71 @@ private struct InspectorDesignSection: View {
         InspectorField(model: model, node: node, spec: FieldSpec("/layout/flow/padding/bottom", "Отступ снизу", .number, debounce: true))
         InspectorField(model: model, node: node, spec: FieldSpec("/layout/flow/padding/left", "Отступ слева", .number, debounce: true))
         InspectorField(model: model, node: node, spec: FieldSpec("/layout/flow/padding/right", "Отступ справа", .number, debounce: true))
+    }
+}
+
+private struct ImageRow: View {
+    @ObservedObject var model: WorkspaceModel
+    let node: [String: Any]
+    @StoredState private var fit: String?
+
+    init(model: WorkspaceModel, node: [String: Any]) {
+        self.model = model
+        self.node = node
+    }
+
+    private var current: String { fit ?? model.inspectorValue(node, "/style/fit") as? String ?? "" }
+    private var id: String { node["id"] as? String ?? "" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Вписывание").font(.caption).foregroundStyle(.secondary).frame(width: 78, alignment: .leading)
+                Picker("", selection: Binding(
+                    get: { current },
+                    set: { next in
+                        fit = next
+                        model.editProperty("/style/fit", value: next.isEmpty ? nil : next)
+                    })) {
+                    Text("Не задано").tag("")
+                    Text("Растянуть").tag("fill")
+                    Text("Вписать").tag("contain")
+                    Text("Заполнить").tag("cover")
+                    Text("Без масштаба").tag("none")
+                }
+                .labelsHidden()
+            }
+            Button("Заменить изображение…") { model.replaceImage(id) }
+                .disabled(model.writesBlocked)
+                .accessibilityIdentifier("inspector-replace-image")
+        }
+        .onChange(of: model.draftVersion) { fit = nil }
+    }
+}
+
+private struct InspectorVectorSection: View {
+    @ObservedObject var model: WorkspaceModel
+    let node: [String: Any]
+
+    init(model: WorkspaceModel, node: [String: Any]) {
+        self.model = model
+        self.node = node
+    }
+
+    private var points: Int { model.vectorPoints(node["id"] as? String ?? "").count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionTitle("Вектор")
+            Text(points == 0 ? "В контуре нет точек" : "Точек: \(points). Перетаскивайте точки на холсте.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Восстановить как текст…") {
+                model.restoreTextTarget = node["id"] as? String
+            }
+            .disabled(model.writesBlocked)
+            .accessibilityIdentifier("inspector-restore-text")
+        }
+        .padding(12)
     }
 }
 

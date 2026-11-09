@@ -29,10 +29,59 @@ struct AIConstructorApp: App {
                 Button("Найти и заменить…") { WorkspaceCommands.shared.search = true }
                     .keyboardShortcut("f", modifiers: .command)
             }
+
+            CommandMenu("Правка") {
+                Button("Дублировать") { WorkspaceCommands.shared.duplicate() }
+                    .keyboardShortcut("d", modifiers: .command)
+                Button("Копировать") { WorkspaceCommands.shared.copy() }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Вставить") { WorkspaceCommands.shared.paste() }
+                    .keyboardShortcut("v", modifiers: .command)
+                Button("Удалить") { WorkspaceCommands.shared.deleteSelection() }
+                    .keyboardShortcut(.delete, modifiers: [])
+                Button("Выделить всё") { WorkspaceCommands.shared.selectAll() }
+                    .keyboardShortcut("a", modifiers: .command)
+                Divider()
+                Button("Группировать") { WorkspaceCommands.shared.group() }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("Разгруппировать") { WorkspaceCommands.shared.ungroup() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                Divider()
+                Button("Восстановить как текст…") { WorkspaceCommands.shared.restoreText() }
+                    .disabled(WorkspaceCommands.shared.model?.canRestoreAsText != true)
+            }
             CommandMenu("Вставка") {
                 ForEach(WorkspaceCommands.insertKinds, id: \.self) { kind in
                     Button(WorkspaceCommands.title(kind)) { WorkspaceCommands.shared.insert(kind: kind) }
                 }
+            }
+            CommandMenu("Слой") {
+                Button("На передний план") { WorkspaceCommands.shared.bringToFront() }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                Button("Выше") { WorkspaceCommands.shared.bringForward() }
+                    .keyboardShortcut("]", modifiers: .command)
+                Button("Ниже") { WorkspaceCommands.shared.sendBackward() }
+                    .keyboardShortcut("[", modifiers: .command)
+                Button("На задний план") { WorkspaceCommands.shared.sendToBack() }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+            }
+            CommandMenu("Выравнивание") {
+                ForEach(AlignmentEdge.allCases, id: \.self) { edge in
+                    Button(edge.title) { WorkspaceCommands.shared.align(edge) }
+                }
+                Divider()
+                ForEach(DistributionAxis.allCases, id: \.self) { axis in
+                    Button(axis.title) { WorkspaceCommands.shared.distribute(axis) }
+                }
+            }
+            CommandMenu("Компонент") {
+                Button("Создать из выделения") { WorkspaceCommands.shared.createComponent() }
+                Menu("Вставить экземпляр") {
+                    ForEach(WorkspaceCommands.shared.model?.components ?? []) { component in
+                        Button(component.name) { WorkspaceCommands.shared.insertComponent(component.id) }
+                    }
+                }
+                Button("Разорвать связь") { WorkspaceCommands.shared.breakComponent() }
             }
         }
         Settings {
@@ -55,6 +104,26 @@ final class WorkspaceCommands {
     func redo() { model?.redo() }
     func save() { model?.save() }
     func insert(kind: String) { model?.insertNode(kind) }
+    func duplicate() { model?.duplicateSelection() }
+    func deleteSelection() { model?.deleteSelection() }
+    func selectAll() { model?.selectAllNodes() }
+    func copy() { model?.copySelection() }
+    func paste() { model?.paste() }
+    func restoreText() {
+        guard let model, model.canRestoreAsText else { return }
+        model.restoreTextTarget = model.inspectorNodeId
+    }
+    func group() { model?.groupSelection() }
+    func ungroup() { model?.ungroupSelection() }
+    func bringToFront() { model?.bringToFront() }
+    func bringForward() { model?.bringForward() }
+    func sendBackward() { model?.sendBackward() }
+    func sendToBack() { model?.sendToBack() }
+    func align(_ edge: AlignmentEdge) { model?.align(edge) }
+    func distribute(_ axis: DistributionAxis) { model?.distribute(axis) }
+    func createComponent() { model?.createComponentFromSelection() }
+    func insertComponent(_ id: String) { model?.insertComponent(id) }
+    func breakComponent() { model?.breakComponentLink() }
 
     static func title(_ kind: String) -> String {
         switch kind {

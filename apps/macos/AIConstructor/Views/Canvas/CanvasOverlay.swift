@@ -23,6 +23,19 @@ struct CanvasGeometry {
     }
 }
 
+struct VectorHandle: Identifiable {
+    let id: Int
+    let position: CGPoint
+}
+
+struct VectorHandleEvent {
+    enum Phase { case began, changed, ended }
+    let nodeId: String
+    let handle: Int
+    let phase: Phase
+    let point: CGPoint
+}
+
 struct CanvasGuides {
     static let threshold: Double = 1
 
@@ -63,6 +76,16 @@ struct CanvasOverlay: View {
     let onPlainHover: (String?) -> Void
     let onDeviceHover: (CGPoint) -> Void
     let onDoubleClick: (CGPoint) -> Void
+    let onMarquee: (CGPoint, CGPoint) -> Void
+    let marquee: CanvasRect?
+    /// Right-click at the point, with the window location for the menu.
+    let onContext: (CGPoint, CGPoint) -> Void
+    /// Called on right-click; nil means no context menu on the canvas.
+    let onMenu: (CGPoint) -> NSMenu?
+    let vectorPoints: [VectorHandle]
+    let vectorDrag: (VectorHandleEvent) -> Void
+    /// The vector the handles belong to, so events carry its node id.
+    let vectorNodeId: String
 
     private static let handleSize: CGFloat = 7
 
@@ -84,7 +107,8 @@ struct CanvasOverlay: View {
             Color.white.opacity(0.001)
                 .frame(width: size.width, height: size.height)
                 .contentShape(Rectangle())
-                .modifier(MouseGesture(onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onPlainHover, onDoubleClick: onDoubleClick))
+                .modifier(MouseGesture(onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onPlainHover,
+                                       onDoubleClick: onDoubleClick, onMarquee: onMarquee, onContext: onContext, onMenu: onMenu))
                 DeviceHoverCatcher(onMove: onDeviceHover)
             if geometry.scale >= 0.5 {
                 ForEach(highlighted) { node in
@@ -132,6 +156,24 @@ struct CanvasOverlay: View {
                         .modifier(MouseGesture(kind: .rotate, onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onPlainHover))
                 }
             }
+            if let marquee, marquee.w > 0 || marquee.h > 0 {
+                let frame = geometry.screen(marquee)
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.08))
+                    .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 1))
+                    .frame(width: frame.width, height: frame.height)
+                    .position(x: frame.midX, y: frame.midY)
+                    .allowsHitTesting(false)
+            }
+            ForEach(vectorPoints) { handle in
+                Circle().fill(Color.white)
+                    .overlay(Circle().stroke(Color.accentColor, lineWidth: 1.5))
+                    .frame(width: Self.handleSize, height: Self.handleSize)
+                    .position(handle.position)
+                    .contentShape(Rectangle().size(width: 14, height: 14))
+                    .modifier(MouseGesture(kind: .move, onPress: { _, _, _ in }, onDrag: { _, _ in }, onEnd: { _, _ in },
+                                           onHover: { _ in }, handleDrag: handleDrag(handle.id)))
+            }
             if let preview, dragging, !selected.isEmpty {
                 let frame = geometry.screen(preview)
                 if rotation == nil {
@@ -150,6 +192,16 @@ struct CanvasOverlay: View {
     /// rotation bar, so the marker stays visible without rotating hit testing.
     private func outerFrame(for node: CanvasNodeBounds) -> CGRect {
         rect(node).insetBy(dx: -0.5, dy: -0.5)
+    }
+
+    /// Points report their own press, drag and release; a point drag never
+    /// starts the node gesture underneath.
+    private func handleDrag(_ index: Int) -> HandleDrag {
+        let id = vectorNodeId
+        let report = vectorDrag
+        return HandleDrag(onPress: { report(VectorHandleEvent(nodeId: id, handle: index, phase: .began, point: $0)) },
+                          onDrag: { report(VectorHandleEvent(nodeId: id, handle: index, phase: .changed, point: $0)) },
+                          onEnd: { report(VectorHandleEvent(nodeId: id, handle: index, phase: .ended, point: $0)) })
     }
 
     private func handlePoints(_ frame: CGRect) -> [CGPoint] {
@@ -256,10 +308,16 @@ struct MouseGesture: ViewModifier {
     let onEnd: @MainActor (CanvasGestureKind, CGPoint) -> Void
     let onHover: @MainActor (String?) -> Void
     var onDoubleClick: (@MainActor (CGPoint) -> Void)?
+    var onMarquee: (@MainActor (CGPoint, CGPoint) -> Void)?
+    var onContext: (@MainActor (CGPoint, CGPoint) -> Void)?
+    var onMenu: (@MainActor (CGPoint) -> NSMenu?)?
+    var handleDrag: HandleDrag?
 
     func body(content: Content) -> some View {
         content.background(MouseEventCatcher(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd,
-                                             onHover: onHover, onDoubleClick: onDoubleClick))
+                                             onHover: onHover, onDoubleClick: onDoubleClick,
+                                             onMarquee: onMarquee, onContext: onContext, onMenu: onMenu,
+                                             handleDrag: handleDrag))
     }
 }
 
@@ -270,6 +328,10 @@ struct MouseEventCatcher: NSViewRepresentable {
     let onEnd: (CanvasGestureKind, CGPoint) -> Void
     let onHover: (String?) -> Void
     var onDoubleClick: (@MainActor (CGPoint) -> Void)?
+    var onMarquee: (@MainActor (CGPoint, CGPoint) -> Void)?
+    var onContext: (@MainActor (CGPoint, CGPoint) -> Void)?
+    var onMenu: (@MainActor (CGPoint) -> NSMenu?)?
+    var handleDrag: HandleDrag?
 
     func makeNSView(context: Context) -> MouseCatcherView { MouseCatcherView() }
 
@@ -283,6 +345,25 @@ struct MouseEventCatcher: NSViewRepresentable {
             }
         }
         view.configure(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onHover)
+        let marquee = onMarquee
+        view.onMarquee = marquee.map { action in
+            { [weak view] start, end in
+                guard let view else { return }
+                action(view.convert(start, to: nil), view.convert(end, to: nil))
+            }
+        }
+        let context = onContext
+        view.onContext = context.map { action in
+            { [weak view] location in
+                guard let view else { return }
+                action(view.convert(location, to: nil), location)
+            }
+        }
+        view.onMenu = onMenu
+        let drag = handleDrag
+        view.handleDrag = drag.map { handlers in
+            { phase, point in handlers.report(phase, point) }
+        }
     }
 }
 
@@ -304,6 +385,22 @@ final class EditingFocus {
     }
 }
 
+/// Owns the press/drag/release of one vector point; `report` receives the
+/// view's own local point so point drags never go through window space.
+struct HandleDrag {
+    let onPress: (CGPoint) -> Void
+    let onDrag: (CGPoint) -> Void
+    let onEnd: (CGPoint) -> Void
+
+    func report(_ phase: VectorHandleEvent.Phase, _ point: CGPoint) {
+        switch phase {
+        case .began: onPress(point)
+        case .changed: onDrag(point)
+        case .ended: onEnd(point)
+        }
+    }
+}
+
 final class MouseCatcherView: NSView {
     private(set) var kind: CanvasGestureKind = .move
     var onPress: ((CGPoint, CGPoint, NSEvent.ModifierFlags) -> Void)?
@@ -311,6 +408,10 @@ final class MouseCatcherView: NSView {
     var onEnd: ((CanvasGestureKind, CGPoint) -> Void)?
     var onHover: ((String?) -> Void)?
     var onDoubleClick: (() -> Void)?
+    var onMarquee: ((CGPoint, CGPoint) -> Void)?
+    var onContext: ((CGPoint) -> Void)?
+    var onMenu: ((CGPoint) -> NSMenu?)?
+    var handleDrag: ((VectorHandleEvent.Phase, CGPoint) -> Void)?
     var onEnter: (() -> Void)?
     var onEscape: (() -> Void)?
     private var lastClick: (time: TimeInterval, point: CGPoint)?
@@ -355,7 +456,11 @@ final class MouseCatcherView: NSView {
             return
         }
         lastClick = (now, start)
-        onPress?(start, event.locationInWindow, event.modifierFlags)
+        if let handleDrag {
+            handleDrag(.began, point(event))
+        } else {
+            onPress?(start, event.locationInWindow, event.modifierFlags)
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -363,14 +468,40 @@ final class MouseCatcherView: NSView {
         let current = point(event)
         if !dragging, hypot(current.x - start.x, current.y - start.y) < Self.threshold { return }
         dragging = true
+        if let handleDrag {
+            handleDrag(.changed, current)
+            return
+        }
         onDrag?(kind, current)
+        onMarquee?(start, current)
     }
 
     override func mouseUp(with event: NSEvent) {
         guard pressed else { return }
         pressed = false
-        if dragging { onEnd?(kind, point(event)) }
+        if let handleDrag {
+            handleDrag(.ended, point(event))
+            dragging = false
+            return
+        }
+        if dragging {
+            onEnd?(kind, point(event))
+            onMarquee?(start, point(event))
+        }
         dragging = false
+    }
+
+    /// The menu is built after the click has resolved a selection.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let onMenu else { return nil }
+        let location = event.locationInWindow
+        onContext?(location)
+        return onMenu(location)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.rightMouseDown(with: event)
     }
 
     override func keyDown(with event: NSEvent) {

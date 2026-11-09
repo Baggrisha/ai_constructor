@@ -21,7 +21,7 @@ struct CanvasView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let scale = CanvasGeometry.scale(viewSize: proxy.size, root: content.rootSize)
+            let scale = max(CanvasGeometry.scale(viewSize: proxy.size, root: content.rootSize), 0.0001)
             let height = content.nodes.isEmpty ? proxy.size.height : max(proxy.size.height, content.rootSize.height * scale + 24)
             ScrollView(.vertical) {
                 contentBody(width: proxy.size.width, height: height, scale: scale)
@@ -49,7 +49,13 @@ struct CanvasView: View {
                               rotation: model.canvasRotation,
                               levels: levels(),
                               dragging: model.canvasEditing,
-                              onPress: { point, _, _ in press(at: point, scale: scale) },
+                              onPress: { point, _, flags in
+                                  if content.topmost(at: document(point, scale: scale)) == nil {
+                                      model.beginMarquee(at: document(point, scale: scale), extending: flags.contains(.shift))
+                                  } else {
+                                      press(at: point, scale: scale)
+                                  }
+                              },
                               onDrag: { kind, point in model.updateCanvasGesture(kind, at: document(point, scale: scale)) },
                               onEnd: { kind, point in model.endCanvasGesture(kind, at: document(point, scale: scale)) },
                               onPlainHover: { model.canvasHoveredId = $0 },
@@ -57,7 +63,14 @@ struct CanvasView: View {
                               onDoubleClick: { point in
                                   guard let hit = content.topmost(at: document(point, scale: scale)) else { return }
                                   model.beginTextEditing(hit.id)
-                              })
+                              },
+                              onMarquee: marqueeHandler(scale: scale),
+                              marquee: model.marquee,
+                              onContext: { point, _ in selectForMenu(point, scale: scale) },
+                              onMenu: { _ in canvasMenu() },
+                              vectorPoints: vectorPoints(scale: scale),
+                              vectorDrag: onVectorDrag(scale: scale),
+                              vectorNodeId: model.inspectorNodeId ?? "")
                 if let editingId = model.textEditingId {
                     TextEditorOverlay(model: model, content: content, scale: scale, editingId: editingId)
                         .id(editingId)
@@ -117,6 +130,73 @@ struct CanvasView: View {
         .frame(width: size.width, height: size.height)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+
+    /// Rubber-band selection runs only while it is the active gesture; the
+    /// regular drag path is left alone for node moves and handles.
+    private func marqueeHandler(scale: Double) -> (CGPoint, CGPoint) -> Void {
+        { _, end in
+            guard model.marqueeActive else { return }
+            let mutating = NSEvent.pressedMouseButtons % 2 == 1
+            if mutating {
+                model.updateMarquee(at: document(end, scale: scale))
+            } else {
+                model.endMarquee(at: document(end, scale: scale))
+            }
+        }
+    }
+
+    /// Right-click selects what is under the pointer, then the menu asks.
+    /// Real clicks arrive as AppKit events; the Accessibility path only posts
+    /// menu items, so the bounds are resolved from the last pointer position.
+    private func selectForMenu(_ point: CGPoint, scale: Double) {
+        let location = document(point, scale: scale)
+        if let hit = content.topmost(at: location) {
+            if !model.selectedNodeIds.contains(hit.id) { model.selectNode(hit.id, extending: false) }
+            return
+        }
+        guard let id = model.canvasHoveredId, let bounds = content.nodes.first(where: { $0.id == id }) else { return }
+        let inside = location.x >= bounds.x && location.y >= bounds.y
+            && location.x < bounds.x + bounds.w && location.y < bounds.y + bounds.h
+        if inside, !model.selectedNodeIds.contains(id) { model.selectNode(id, extending: false) }
+    }
+
+    /// Right-click on an image or vector offers "restore as text" (C.8).
+    @MainActor
+    private func canvasMenu() -> NSMenu? {
+        guard let id = model.inspectorNodeId, model.canRestoreAsText else { return nil }
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "Восстановить как текст…", action: nil, keyEquivalent: "")
+        item.target = model
+        item.action = #selector(WorkspaceModel.restoreTextFromMenu(_:))
+        item.representedObject = id
+        menu.addItem(item)
+        return menu
+    }
+
+    /// Points of a single selected vector, in view coordinates, with the
+    /// pending drag applied so the handle follows the pointer.
+    private func vectorPoints(scale: Double) -> [VectorHandle] {
+        guard let id = model.inspectorNodeId,
+              let node = content.nodes.first(where: { $0.id == id }), node.kind == "vector" else { return [] }
+        let drag = model.vectorDragPreview
+        let delta = drag?.id == id ? CGVector(dx: drag?.delta.dx ?? 0, dy: drag?.delta.dy ?? 0) : .zero
+        return model.vectorPoints(id).map { point in
+            VectorHandle(id: point.id,
+                         position: CGPoint(x: (node.x + point.point.x + delta.dx) * scale,
+                                           y: (node.y + point.point.y + delta.dy) * scale))
+        }
+    }
+
+    private func onVectorDrag(scale: Double) -> (VectorHandleEvent) -> Void {
+        { event in
+            let point = document(event.point, scale: scale)
+            switch event.phase {
+            case .began: model.beginVectorDrag(event.nodeId, index: event.handle, at: point)
+            case .changed: model.updateVectorDrag(at: point)
+            case .ended: model.endVectorDrag(at: point)
+            }
+        }
     }
 
     private func document(_ point: CGPoint, scale: Double) -> CGPoint {
