@@ -23,7 +23,7 @@ mod recovery_choice;
 pub(crate) mod retention;
 mod services;
 
-pub(crate) use assets::{font_asset, image_dimensions};
+pub(crate) use assets::{asset_bytes, font_asset, image_dimensions};
 pub(crate) use conflicts::generated_block;
 pub(crate) use diagnostics::capture_external;
 pub(crate) use services::{chat_attachment_ids, rewrite_chats};

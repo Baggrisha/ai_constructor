@@ -8,6 +8,7 @@ use crate::{CoreError, Result};
 mod domain;
 mod geometry;
 mod operations;
+mod render;
 mod text;
 mod validation;
 mod vector;
@@ -98,6 +99,25 @@ pub enum NodeKind {
     Select,
     ComponentInstance,
     CodeComponent,
+}
+
+impl NodeKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Frame => "frame",
+            Self::Group => "group",
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Vector => "vector",
+            Self::Button => "button",
+            Self::Input => "input",
+            Self::Textarea => "textarea",
+            Self::Checkbox => "checkbox",
+            Self::Select => "select",
+            Self::ComponentInstance => "componentInstance",
+            Self::CodeComponent => "codeComponent",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

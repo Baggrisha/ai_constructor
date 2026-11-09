@@ -264,6 +264,36 @@ impl<'a> TextEngine<'a> {
         };
         shape(fonts, style, content.text.as_deref().unwrap_or(""), width)
     }
+
+    /// Byte offsets in the original text where a wrapped line starts.
+    pub(super) fn line_breaks(&mut self, node: &Node, width: f64) -> Result<Vec<usize>> {
+        let style = node
+            .style
+            .known()
+            .ok_or_else(|| CoreError::unsupported("Unknown text style"))?;
+        let content = node
+            .content
+            .known()
+            .ok_or_else(|| CoreError::unsupported("Unknown text content"))?;
+        let key = FontKey {
+            asset: style.font_asset_id,
+            family: style.font_family.clone(),
+            fallback: style.font_fallback.clone(),
+        };
+        let fonts = match self.fonts.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let fonts = load_fonts(self.document, self.project_path, entry.key())?;
+                entry.insert(fonts)
+            }
+        };
+        shape_line_breaks(
+            fonts,
+            style,
+            content.text.as_deref().unwrap_or(""),
+            width as f32,
+        )
+    }
 }
 
 // COSMIC's editor lines recognize CR/LF only. Adapt Unicode BK/CR/LF/NL
@@ -295,6 +325,103 @@ fn hard_break(ch: char) -> bool {
             | BreakClass::LineFeed
             | BreakClass::NextLine
     )
+}
+
+fn style_font_face<'a>(fonts: &'a mut FontSet, style: &NodeStyle) -> Result<&'a mut FontSystem> {
+    let weight = Weight(style.font_weight.unwrap_or(400));
+    let font_style = match style.font_style.unwrap_or(FontStyle::Normal) {
+        FontStyle::Normal => Style::Normal,
+        FontStyle::Italic => Style::Italic,
+        FontStyle::Oblique => Style::Oblique,
+    };
+    let face = fonts
+        .system
+        .db()
+        .query(&Query {
+            families: &[Family::Name(&fonts.family)],
+            weight,
+            style: font_style,
+            ..Query::default()
+        })
+        .ok_or_else(|| missing_font(&fonts.family))?;
+    let _ = face;
+    Ok(&mut fonts.system)
+}
+
+fn shape_line_breaks(
+    fonts: &mut FontSet,
+    style: &NodeStyle,
+    text: &str,
+    width: f32,
+) -> Result<Vec<usize>> {
+    if !width.is_finite() || width < 0.0 {
+        return Err(CoreError::invalid("Text width exceeds supported range"));
+    }
+    let family = fonts.family.clone();
+    let system = style_font_face(fonts, style)?;
+    let size = style.font_size.unwrap_or(16.0) as f32;
+    let weight = Weight(style.font_weight.unwrap_or(400));
+    let font_style = match style.font_style.unwrap_or(FontStyle::Normal) {
+        FontStyle::Normal => Style::Normal,
+        FontStyle::Italic => Style::Italic,
+        FontStyle::Oblique => Style::Oblique,
+    };
+    let tracking = (style.letter_spacing.unwrap_or(0.0) / f64::from(size)) as f32;
+    if !tracking.is_finite() {
+        return Err(CoreError::invalid("Letter spacing exceeds supported range"));
+    }
+    let face = system
+        .db()
+        .query(&Query {
+            families: &[Family::Name(&family)],
+            weight,
+            style: font_style,
+            ..Query::default()
+        })
+        .ok_or_else(|| missing_font(&family))?;
+    let base = face_metrics(system.db(), face, size, weight, font_style)?;
+    let line_height = style
+        .line_height
+        .map_or(base.height(), |value| value as f32);
+    let mut buffer = Buffer::new(system, Metrics::new(size, line_height));
+    buffer.set_size(Some(width), None);
+    buffer.set_wrap(match style.text_wrap.unwrap_or(TextWrap::WordOrGlyph) {
+        TextWrap::None => Wrap::None,
+        TextWrap::Word => Wrap::Word,
+        TextWrap::WordOrGlyph => Wrap::WordOrGlyph,
+    });
+    let attrs = Attrs::new()
+        .family(Family::Name(&family))
+        .weight(weight)
+        .style(font_style)
+        .letter_spacing(tracking);
+    let normalized = layout_text(text);
+    buffer.set_text(&normalized, &attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(system, false);
+    // Runs are indexed into the normalized text; map the byte offset back
+    // through the same paragraph separator when hard breaks were substituted.
+    let map_offset = |offset: usize| -> usize {
+        match &normalized {
+            Cow::Borrowed(_) => offset,
+            Cow::Owned(_) => text
+                .char_indices()
+                .map(|(index, _)| index)
+                .nth(normalized[..offset].chars().count())
+                .unwrap_or(text.len()),
+        }
+    };
+    let mut breaks = Vec::new();
+    for run in buffer.layout_runs() {
+        let Some(first) = run.glyphs.first() else {
+            continue;
+        };
+        let offset = map_offset(first.start);
+        if offset > 0 {
+            breaks.push(offset);
+        }
+    }
+    breaks.dedup();
+    Ok(breaks)
 }
 
 fn shape(

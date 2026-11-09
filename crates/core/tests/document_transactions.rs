@@ -3328,3 +3328,207 @@ fn invalid_visual_values_are_rejected_without_mutation() {
         "UNSUPPORTED_FEATURE"
     );
 }
+
+fn png_asset(path: &std::path::Path, width: u32, height: u32) {
+    use image::{ExtendedColorType, ImageEncoder};
+    let file = std::fs::File::create(path).unwrap();
+    let pixels = vec![128_u8; (width * height * 4) as usize];
+    image::codecs::png::PngEncoder::new(file)
+        .write_image(&pixels, width, height, ExtendedColorType::Rgba8)
+        .unwrap();
+}
+
+fn import_asset(session: &ProjectSession, source: &std::path::Path) -> Uuid {
+    let asset: Value = serde_json::from_str(&session.import_asset(source).unwrap()).unwrap();
+    asset["id"].as_str().unwrap().parse().unwrap()
+}
+
+#[test]
+fn layout_json_reports_flow_positions_and_computed_sizes() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Layout").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let free = Uuid::new_v4();
+    let mut frame_node = node(frame, root, "frame");
+    frame_node["layout"] = json!({"x": 10, "y": 20, "w": 300, "h": 100});
+    let mut first_node = node(first, frame, "group");
+    first_node["layout"] = json!({"x": 0, "y": 0, "w": 50, "h": 30});
+    let mut second_node = node(second, frame, "group");
+    second_node["layout"]["widthMode"] = json!("fill");
+    let mut free_node = node(free, root, "group");
+    free_node["layout"] = json!({"x": 400, "y": 50, "w": 20, "h": 20});
+    apply_ok(
+        &session,
+        &[root, frame, first, second, free],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": free_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": frame_node},
+            {"type": "insertNode", "parentId": frame, "index": 0, "node": first_node},
+            {"type": "insertNode", "parentId": frame, "index": 1, "node": second_node},
+            {"type": "setProperty", "nodeId": frame, "path": "/layout/flow", "value": {
+                "direction": "row", "gap": 10,
+                "padding": {"top": 5, "right": 5, "bottom": 5, "left": 5}, "align": "center"}}
+        ]),
+    );
+    let bounds: Value = serde_json::from_str(&session.layout_json(None).unwrap()).unwrap();
+    let find = |id: Uuid| {
+        bounds
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == json!(id.to_string()))
+            .cloned()
+            .unwrap()
+    };
+    let root_bounds = find(root);
+    assert_eq!(root_bounds["x"], 0.0);
+    assert_eq!(root_bounds["w"], 1440.0);
+    let frame_bounds = find(frame);
+    assert_eq!(
+        (frame_bounds["x"].as_f64(), frame_bounds["y"].as_f64()),
+        (Some(10.0), Some(20.0))
+    );
+    let first_bounds = find(first);
+    // Cross-axis alignment centres the 30 px child in the 90 px content box.
+    assert_eq!(
+        (first_bounds["x"].as_f64(), first_bounds["y"].as_f64()),
+        (Some(15.0), Some(55.0))
+    );
+    assert_eq!(first_bounds["inFlow"], true);
+    let second_bounds = find(second);
+    assert_eq!(second_bounds["x"], 75.0);
+    assert_eq!(second_bounds["w"], 230.0);
+    let free_bounds = find(free);
+    assert_eq!(
+        (free_bounds["x"].as_f64(), free_bounds["y"].as_f64()),
+        (Some(400.0), Some(50.0))
+    );
+    assert_eq!(free_bounds["inFlow"], false);
+}
+
+#[test]
+fn preview_html_is_deterministic_self_contained_and_escaped() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Preview").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let text = Uuid::new_v4();
+    let image = Uuid::new_v4();
+    let vector = Uuid::new_v4();
+    let png = temp.path().join("pixel.png");
+    png_asset(&png, 4, 2);
+    let asset = import_asset(&session, &png);
+    let mut text_node = node(text, root, "text");
+    text_node["content"]["text"] = json!("Привет <b>&\"мир\"</b>");
+    text_node["style"] = json!({"fontSize": 20, "color": "#ff0000"});
+    let mut frame_node = node(frame, root, "frame");
+    frame_node["style"] = json!({"radius": 4, "overflow": "hidden", "fill": "#eeeeee"});
+    let mut image_node = node(image, root, "image");
+    image_node["content"]["assetId"] = json!(asset);
+    image_node["style"] = json!({"fit": "contain", "stroke": {"color": "#00ff00", "width": 2}});
+    let mut vector_node = node(vector, root, "vector");
+    vector_node["content"]["vector"] =
+        json!({"paths": [], "shapes": [{"type": "circle", "cx": 10, "cy": 10, "r": 5}]});
+    apply_ok(
+        &session,
+        &[root, frame, text, image, vector],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": frame_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": text_node},
+            {"type": "insertNode", "parentId": root, "index": 2, "node": image_node},
+            {"type": "insertNode", "parentId": root, "index": 3, "node": vector_node}
+        ]),
+    );
+    let first = session.preview_html(None).unwrap();
+    let second = session.preview_html(None).unwrap();
+    assert_eq!(first, second);
+    let lower = first.to_ascii_lowercase();
+    assert!(!lower.contains("<script"));
+    assert!(!lower.contains("http://") && !lower.contains("https://"));
+    assert!(first.contains("data:image/png;base64,"));
+    assert!(first.contains("Привет &lt;b&gt;&amp;\"мир\"&lt;/b&gt;"));
+    let frame_html = first.split(&format!("data-id=\"{frame}\"")).nth(1).unwrap();
+    let frame_style = frame_html
+        .split("style=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    for declaration in [
+        "border-radius:4px;",
+        "overflow:hidden;",
+        "background-color:#eeeeee;",
+    ] {
+        assert!(
+            frame_style.contains(declaration),
+            "{declaration}: {frame_style}"
+        );
+    }
+    assert!(first.contains("object-fit:contain;"));
+    assert!(first.contains("outline:2px solid #00ff00;"));
+    assert!(first.contains("<circle cx=\"10\" cy=\"10\" r=\"5\"/>"));
+    assert!(first.contains(&format!("data-id=\"{image}\"")));
+    // Editing the document changes the preview.
+    apply_ok(
+        &session,
+        &[text],
+        json!([{"type": "setProperty", "nodeId": text, "path": "/content/text", "value": "Другое"} ]),
+    );
+    let third = session.preview_html(None).unwrap();
+    assert_ne!(first, third);
+    assert!(third.contains("Другое"));
+    // Missing assets are reported by the dedicated code, not a layout metric error.
+    std::fs::remove_file(path.join({
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+        doc["assets"][0]["path"].as_str().unwrap().to_owned()
+    }))
+    .unwrap();
+    let error = session.preview_html(None).unwrap_err();
+    assert!(
+        matches!(error.code, "MISSING_ASSET" | "CONFLICT"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn line_breaks_follow_the_measured_text_width() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Lines").unwrap();
+    let root = root(&session);
+    let text = Uuid::new_v4();
+    let mut text_node = node(text, root, "text");
+    text_node["layout"] = json!({"x": 0, "y": 0, "w": 200, "h": 100});
+    text_node["content"]["text"] = json!("Один два три четыре пять шесть семь восемь");
+    apply_ok(
+        &session,
+        &[root, text],
+        json!([{"type": "insertNode", "parentId": root, "index": 0, "node": text_node}]),
+    );
+    let narrow: Vec<usize> =
+        serde_json::from_str(&session.line_breaks_json(&text.to_string(), 60.0).unwrap()).unwrap();
+    let wide: Vec<usize> =
+        serde_json::from_str(&session.line_breaks_json(&text.to_string(), 2000.0).unwrap())
+            .unwrap();
+    assert!(!narrow.is_empty());
+    assert!(wide.is_empty());
+    assert!(narrow.windows(2).all(|pair| pair[0] < pair[1]));
+    // Breaks always fall on a word boundary offset inside the text.
+    let source = "Один два три четыре пять шесть семь восемь";
+    for offset in narrow {
+        assert!(source.is_char_boundary(offset));
+        assert_ne!(source.as_bytes()[offset], b' ');
+    }
+    assert_eq!(
+        session
+            .line_breaks_json(&root.to_string(), 100.0)
+            .unwrap_err()
+            .code,
+        "UNSUPPORTED_FEATURE"
+    );
+}

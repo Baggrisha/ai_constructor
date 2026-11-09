@@ -368,6 +368,18 @@ fn measured_size_inner(
     Ok(sizes[&(id, axis)])
 }
 
+fn actual_size(
+    id: Uuid,
+    nodes: &HashMap<Uuid, &Node>,
+    sizes: &mut HashMap<(Uuid, Axis), f64>,
+    text: &mut LayoutContext<'_>,
+) -> Result<(f64, f64)> {
+    Ok((
+        actual_axis_size(id, Axis::Horizontal, nodes, None, sizes, text)?,
+        actual_axis_size(id, Axis::Vertical, nodes, None, sizes, text)?,
+    ))
+}
+
 fn actual_axis_size(
     id: Uuid,
     axis: Axis,
@@ -565,7 +577,88 @@ fn flow_child(
     }
 }
 
+/// Absolute document-space box of one node, in logical CSS pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeBounds {
+    pub id: Uuid,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub in_flow: bool,
+}
+
 impl Document {
+    /// Computed absolute bounds for every node of `page_id` in document
+    /// coordinates. Flow children are placed by the same rules used for the
+    /// canvas transform; fixed children use their own position.
+    pub fn layout_bounds(&self, project_path: &Path, page_id: Uuid) -> Result<Vec<NodeBounds>> {
+        let page = self
+            .pages
+            .iter()
+            .find(|page| page.id == page_id)
+            .ok_or_else(|| CoreError::invalid(format!("Unknown page {page_id}")))?;
+        let nodes: HashMap<_, _> = self.nodes.iter().map(|node| (node.id, node)).collect();
+        let root = *nodes
+            .get(&page.root_id)
+            .ok_or_else(|| CoreError::invalid(format!("Unknown root {}", page.root_id)))?;
+        let mut sizes = HashMap::new();
+        let mut text = LayoutContext::new(self, project_path);
+        let mut result = Vec::with_capacity(self.nodes.len());
+        let (x, y) = position(root, None, &text)?;
+        let mut pending = vec![(root.id, (x, y))];
+        while let Some((id, offset)) = pending.pop() {
+            let node = nodes[&id];
+            let (w, h) = actual_size(node.id, &nodes, &mut sizes, &mut text)?;
+            result.push(NodeBounds {
+                id,
+                x: offset.0,
+                y: offset.1,
+                w,
+                h,
+                in_flow: node
+                    .parent_id
+                    .and_then(|parent| nodes.get(&parent))
+                    .is_some_and(|parent| parent.layout.flow.is_some()),
+            });
+            for child in &node.children {
+                let child = nodes[child];
+                let position = if node.layout.flow.is_some() {
+                    flow_child(node, (w, h), child, &nodes, None, &mut sizes, &mut text)?.0
+                } else {
+                    position(child, None, &text)?
+                };
+                pending.push((child.id, (offset.0 + position.0, offset.1 + position.1)));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Line-break offsets of a text node's `content.text` at `width`, in
+    /// characters as measured by the shared text engine.
+    pub fn line_breaks(
+        &self,
+        project_path: &Path,
+        node_id: Uuid,
+        width: f64,
+    ) -> Result<Vec<usize>> {
+        if !width.is_finite() || width <= 0.0 {
+            return Err(CoreError::invalid("Invalid text width"));
+        }
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| CoreError::invalid(format!("Unknown node {node_id}")))?;
+        if !matches!(node.kind, NodeKind::Text | NodeKind::Button) {
+            return Err(CoreError::unsupported(format!(
+                "Node {node_id} has no editable text"
+            )));
+        }
+        let mut text = LayoutContext::new(self, project_path);
+        text.text.line_breaks(node, width)
+    }
+
     /// Transform node-local CSS pixels (or source pixels relative to the node)
     /// to/from the viewport. `viewport` is (zoom, pan_x, pan_y). Source bounds
     /// are retained independently and never substituted for layout coordinates.

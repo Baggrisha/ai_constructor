@@ -87,6 +87,17 @@ impl ProjectSession {
     pub fn diagnostics_json(&self) -> Result<String, CoreError> {
         Ok(self.inner.diagnostics_json()?)
     }
+    /// Computed absolute bounds of every node on a page (first page when omitted).
+    pub fn layout_json(&self, page_id: Option<String>) -> Result<String, CoreError> {
+        Ok(self.inner.layout_json(page_id.as_deref())?)
+    }
+    /// Self-contained document preview for the canvas (no scripts or external resources).
+    pub fn preview_html(&self, page_id: Option<String>) -> Result<String, CoreError> {
+        Ok(self.inner.preview_html(page_id.as_deref())?)
+    }
+    pub fn line_breaks_json(&self, node_id: String, width: f64) -> Result<String, CoreError> {
+        Ok(self.inner.line_breaks_json(&node_id, width)?)
+    }
     #[expect(clippy::too_many_arguments, reason = "Preserve the flat UniFFI API")]
     pub fn transform_point_json(
         &self,

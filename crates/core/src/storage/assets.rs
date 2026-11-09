@@ -127,6 +127,17 @@ fn font_extension(bytes: &[u8]) -> Result<Option<&'static str>> {
     Ok(Some(extension))
 }
 
+pub(crate) fn asset_bytes(root: &Path, relative: &str) -> Result<Vec<u8>> {
+    let path = super::safe_path(root, relative)?;
+    std::fs::read(&path).map_err(|error| {
+        if path.exists() {
+            error.into()
+        } else {
+            CoreError::new("MISSING_ASSET", format!("Missing asset {relative}"))
+        }
+    })
+}
+
 pub(crate) fn font_asset(root: &Path, relative: &str) -> Result<Vec<u8>> {
     let path = super::safe_path(root, relative)?;
     let bytes = read_bounded(&path).map_err(|error| {
