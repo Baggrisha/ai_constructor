@@ -89,10 +89,16 @@ fn lock_target(node: &Node, path: &str) -> Result<String> {
             "/kind"
                 | "/parentId"
                 | "/children"
+                | "/hidden"
+                | "/locked"
                 | "/layout"
                 | "/layout/flow"
                 | "/layout/widthMode"
                 | "/layout/heightMode"
+                | "/layout/minW"
+                | "/layout/minH"
+                | "/layout/maxW"
+                | "/layout/maxH"
                 | "/sourceBounds"
                 | "/sourceDensity"
                 | "/responsive"
@@ -139,6 +145,27 @@ fn number(value: &Value) -> Result<f64> {
         .ok_or_else(|| CoreError::invalid("Expected a finite number"))
 }
 
+fn optional_number(value: &Value) -> Result<Option<f64>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(number(value)?))
+    }
+}
+
+fn boolean(value: &Value) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| CoreError::invalid("Expected a boolean"))
+}
+
+fn flow_mut(node: &mut Node) -> Result<&mut Flow> {
+    node.layout
+        .flow
+        .as_mut()
+        .ok_or_else(|| CoreError::invalid(format!("Node {} is not a flow container", node.id)))
+}
+
 fn optional<T: DeserializeOwned>(value: &Value) -> Result<Option<T>> {
     if value.is_null() {
         Ok(None)
@@ -170,7 +197,32 @@ fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
         "/layout/flow" => node.layout.flow = optional::<Flow>(value)?,
         "/layout/widthMode" => node.layout.width_mode = optional::<SizeMode>(value)?,
         "/layout/heightMode" => node.layout.height_mode = optional::<SizeMode>(value)?,
+        "/layout/minW" => node.layout.min_w = optional_number(value)?,
+        "/layout/minH" => node.layout.min_h = optional_number(value)?,
+        "/layout/maxW" => node.layout.max_w = optional_number(value)?,
+        "/layout/maxH" => node.layout.max_h = optional_number(value)?,
+        "/layout/flow/direction" => {
+            let flow = flow_mut(node)?;
+            flow.direction = serde_json::from_value(value.clone())
+                .map_err(|e| CoreError::invalid(e.to_string()))?
+        }
+        "/layout/flow/gap" => flow_mut(node)?.gap = number(value)?,
+        "/layout/flow/align" => {
+            let flow = flow_mut(node)?;
+            flow.align = serde_json::from_value(value.clone())
+                .map_err(|e| CoreError::invalid(e.to_string()))?
+        }
+        "/layout/flow/padding" => {
+            flow_mut(node)?.padding =
+                optional(value)?.ok_or_else(|| CoreError::invalid("Padding cannot be null"))?
+        }
+        "/layout/flow/padding/top" => flow_mut(node)?.padding.top = number(value)?,
+        "/layout/flow/padding/bottom" => flow_mut(node)?.padding.bottom = number(value)?,
+        "/layout/flow/padding/left" => flow_mut(node)?.padding.left = number(value)?,
+        "/layout/flow/padding/right" => flow_mut(node)?.padding.right = number(value)?,
         "/sourceBounds" => node.source_bounds = optional::<Bounds>(value)?,
+        "/hidden" => node.hidden = boolean(value)?,
+        "/locked" => node.locked = boolean(value)?,
         "/sourceDensity" => {
             node.source_density = if value.is_null() {
                 None
@@ -194,6 +246,23 @@ fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
         "/style/lineHeight" => known_mut(&mut node.style)?.line_height = optional(value)?,
         "/style/letterSpacing" => known_mut(&mut node.style)?.letter_spacing = optional(value)?,
         "/style/textWrap" => known_mut(&mut node.style)?.text_wrap = optional(value)?,
+        "/style/textAlign" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => {
+            known_mut(&mut node.style)?.text_align = optional(value)?
+        }
+        "/style/maxLines" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => {
+            known_mut(&mut node.style)?.max_lines = optional(value)?
+        }
+        "/style/overflow" => known_mut(&mut node.style)?.overflow = optional(value)?,
+        "/style/rotate" => known_mut(&mut node.style)?.rotate = optional(value)?,
+        "/style/radius" => known_mut(&mut node.style)?.radius = optional(value)?,
+        "/style/stroke" => known_mut(&mut node.style)?.stroke = optional(value)?,
+        "/style/shadows" => {
+            known_mut(&mut node.style)?.shadows = serde_json::from_value(value.clone())
+                .map_err(|e| CoreError::invalid(e.to_string()))?
+        }
+        "/style/fit" if matches!(node.kind, NodeKind::Image) => {
+            known_mut(&mut node.style)?.fit = optional(value)?
+        }
         "/a11y/label" => known_mut(&mut node.a11y)?.label = optional(value)?,
         "/a11y/alt" => known_mut(&mut node.a11y)?.alt = optional(value)?,
         "/content/text" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => {
@@ -428,6 +497,22 @@ impl Document {
                     ] {
                         mark(&mut new_node, path, transaction.origin, revision);
                     }
+                    if new_node.hidden {
+                        mark(&mut new_node, "/hidden", transaction.origin, revision);
+                    }
+                    if new_node.locked {
+                        mark(&mut new_node, "/locked", transaction.origin, revision);
+                    }
+                    for (present, path) in [
+                        (new_node.layout.min_w.is_some(), "/layout/minW"),
+                        (new_node.layout.min_h.is_some(), "/layout/minH"),
+                        (new_node.layout.max_w.is_some(), "/layout/maxW"),
+                        (new_node.layout.max_h.is_some(), "/layout/maxH"),
+                    ] {
+                        if present {
+                            mark(&mut new_node, path, transaction.origin, revision);
+                        }
+                    }
                     let style = node
                         .style
                         .known()
@@ -453,6 +538,14 @@ impl Document {
                         (style.line_height.is_some(), "/style/lineHeight"),
                         (style.letter_spacing.is_some(), "/style/letterSpacing"),
                         (style.text_wrap.is_some(), "/style/textWrap"),
+                        (style.text_align.is_some(), "/style/textAlign"),
+                        (style.max_lines.is_some(), "/style/maxLines"),
+                        (style.overflow.is_some(), "/style/overflow"),
+                        (style.rotate.is_some(), "/style/rotate"),
+                        (style.radius.is_some(), "/style/radius"),
+                        (style.stroke.is_some(), "/style/stroke"),
+                        (!style.shadows.is_empty(), "/style/shadows"),
+                        (style.fit.is_some(), "/style/fit"),
                         (content.text.is_some(), "/content/text"),
                         (content.placeholder.is_some(), "/content/placeholder"),
                         (content.asset_id.is_some(), "/content/assetId"),

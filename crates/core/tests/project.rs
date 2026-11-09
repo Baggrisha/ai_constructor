@@ -150,8 +150,28 @@ fn future_schema_is_read_only() {
     assert!(session.save().is_err());
 }
 
+fn backup_root() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("aic-migration-support-{}", Uuid::new_v4()))
+}
+
+struct SupportGuard(std::ffi::OsString);
+
+impl SupportGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("AIC_APPLICATION_SUPPORT").unwrap_or_default();
+        std::env::set_var("AIC_APPLICATION_SUPPORT", path);
+        Self(previous)
+    }
+}
+
+impl Drop for SupportGuard {
+    fn drop(&mut self) {
+        std::env::set_var("AIC_APPLICATION_SUPPORT", &self.0);
+    }
+}
+
 #[test]
-fn historical_schema_one_editable_project_opens_without_migration() {
+fn historical_schema_one_editable_project_is_migrated_and_preserved() {
     use sha2::{Digest, Sha256};
     let dir = tempdir().unwrap();
     let path = dir.path().join("project");
@@ -179,14 +199,58 @@ fn historical_schema_one_editable_project_opens_without_migration() {
     let marker_path = path.join("project.json");
     let mut marker: Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
     marker["revision"] = json!(1);
+    marker["schemaVersion"] = json!(1);
     marker["snapshotHash"] = json!(digest);
     marker["files"]["document.json"] = json!(digest);
     let mut marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
     marker_bytes.push(b'\n');
     std::fs::write(marker_path, marker_bytes).unwrap();
-    let opened = open_project(&path).unwrap();
-    assert_eq!(snapshot(&opened)["readOnly"], false);
-    assert_eq!(std::fs::read(path.join("document.json")).unwrap(), bytes);
+    let support = backup_root();
+    let opened = {
+        let _support = SupportGuard::set(&support);
+        open_project(&path).unwrap()
+    };
+    let opened_snapshot = snapshot(&opened);
+    assert_eq!(opened_snapshot["readOnly"], false);
+    assert_eq!(opened_snapshot["document"]["schemaVersion"], 2);
+    assert_eq!(opened_snapshot["document"]["projectId"], *project_id);
+    assert_eq!(opened_snapshot["document"]["revision"], 1);
+    let migrated: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    assert_eq!(migrated["schemaVersion"], 2);
+    let mut original: Value = document.clone();
+    original["schemaVersion"] = json!(2);
+    assert_eq!(migrated, original);
+    let marker: Value =
+        serde_json::from_slice(&std::fs::read(path.join("project.json")).unwrap()).unwrap();
+    assert_eq!(marker["schemaVersion"], 2);
+    assert_eq!(marker["revision"], 1);
+    let backups = std::fs::read_dir(
+        support
+            .join("AIConstructor/Backups")
+            .join(project_id.as_str().unwrap()),
+    )
+    .unwrap()
+    .collect::<std::io::Result<Vec<_>>>()
+    .unwrap();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        std::fs::read(backups[0].path().join("files/document.json")).unwrap(),
+        bytes
+    );
+    // A second open sees an already migrated project.
+    let support_before = std::fs::read_dir(support.join("AIConstructor/Backups"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    let reopened = {
+        let _support = SupportGuard::set(&support);
+        open_project(&path).unwrap()
+    };
+    drop(reopened);
+    let support_after = std::fs::read_dir(support.join("AIConstructor/Backups"))
+        .unwrap()
+        .count();
+    assert_eq!(support_before, support_after);
     rename(&opened, "Updated historical frame");
     opened.save().unwrap();
     assert_eq!(

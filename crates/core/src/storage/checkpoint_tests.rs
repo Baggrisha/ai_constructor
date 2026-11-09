@@ -982,3 +982,53 @@ fn legacy_document_restore_does_not_touch_unchanged_executable() {
         0o111
     );
 }
+
+#[test]
+fn every_interrupted_schema_migration_recovers_whole_schema_one_or_two() {
+    let mut interrupted = 0;
+    let mut migrated = 0;
+    for point in 0..8 {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let support = temp.path().join("support");
+        drop(crate::create_project(&root, "Historical").unwrap());
+        let mut document: Value =
+            serde_json::from_slice(&std::fs::read(root.join("document.json")).unwrap()).unwrap();
+        document["schemaVersion"] = json!(1);
+        let document = json_bytes(&document).unwrap();
+        let files = super::scan(&root).unwrap();
+        let mut marker: Value =
+            serde_json::from_slice(&std::fs::read(root.join("project.json")).unwrap()).unwrap();
+        marker["schemaVersion"] = json!(1);
+        marker["files"]["document.json"] = json!(hash(&document));
+        marker["snapshotHash"] = json!(super::fingerprint(&document, &files));
+        let marker = json_bytes(&marker).unwrap();
+        std::fs::write(root.join("document.json"), &document).unwrap();
+        std::fs::write(root.join("project.json"), &marker).unwrap();
+        std::env::set_var("AIC_APPLICATION_SUPPORT", &support);
+        INTERRUPT_AFTER.with(|slot| slot.set(Some(point)));
+        let session = open_project(&root);
+        INTERRUPT_AFTER.with(|slot| slot.set(None));
+        match session {
+            Ok(session) => {
+                migrated += 1;
+                drop(session);
+            }
+            Err(_) => interrupted += 1,
+        }
+        let reopened = open_project(&root).unwrap();
+        let state: Value = serde_json::from_str(&reopened.snapshot_json().unwrap()).unwrap();
+        assert_eq!(state["readOnly"], false, "point {point}");
+        let version = state["document"]["schemaVersion"].clone();
+        assert!(version == json!(1) || version == json!(2), "point {point}");
+        assert_eq!(state["document"]["revision"], 0, "point {point}");
+        if version == json!(2) {
+            let backups = std::fs::read_dir(support.join("AIConstructor/Backups"))
+                .expect("migration backup")
+                .count();
+            assert_eq!(backups, 1, "point {point}");
+        }
+    }
+    assert!(interrupted > 0, "an interrupted run must be exercised");
+    assert!(migrated > 0, "the completed run must be exercised");
+}

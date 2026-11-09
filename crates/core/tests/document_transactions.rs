@@ -3096,3 +3096,235 @@ fn vector_hug_rejects_ambiguous_empty_and_overflowing_geometry() {
         "INVALID_DOCUMENT"
     );
 }
+
+fn apply_ok(session: &ProjectSession, scope: &[Uuid], operations: Value) {
+    let tx = transaction(session, scope, operations);
+    session.apply_transaction(&tx.to_string()).unwrap();
+}
+
+fn apply_rejected(session: &ProjectSession, scope: &[Uuid], operations: Value) -> String {
+    let before = snapshot(session);
+    let tx = transaction(session, scope, operations);
+    let error = session.apply_transaction(&tx.to_string()).unwrap_err();
+    assert_eq!(snapshot(session), before);
+    error.code.to_owned()
+}
+
+fn saved_node(path: &std::path::Path, id: Uuid) -> Value {
+    let document: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == json!(id.to_string()))
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn new_visual_properties_survive_undo_redo_and_save() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Visual").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let text = Uuid::new_v4();
+    let image = Uuid::new_v4();
+    apply_ok(
+        &session,
+        &[root, frame, text, image],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": node(frame, root, "frame")},
+            {"type": "insertNode", "parentId": frame, "index": 0, "node": node(text, frame, "text")},
+            {"type": "insertNode", "parentId": frame, "index": 1, "node": node(image, frame, "image")}
+        ]),
+    );
+    let changes = [
+        (frame, "/layout/minW", json!(10)),
+        (frame, "/layout/minH", json!(20)),
+        (frame, "/layout/maxW", json!(800)),
+        (frame, "/layout/maxH", json!(600)),
+        (frame, "/style/radius", json!(12)),
+        (frame, "/style/rotate", json!(15.5)),
+        (frame, "/style/overflow", json!("hidden")),
+        (
+            frame,
+            "/style/stroke",
+            json!({"color": "#112233", "width": 2}),
+        ),
+        (
+            frame,
+            "/style/shadows",
+            json!([{"x": 1, "y": 2, "blur": 3, "spread": 4, "color": "#ffffff"}]),
+        ),
+        (text, "/style/textAlign", json!("center")),
+        (text, "/style/maxLines", json!(3)),
+        (image, "/style/fit", json!("contain")),
+        (frame, "/hidden", json!(true)),
+        (frame, "/locked", json!(true)),
+    ];
+    for (id, ptr, value) in changes {
+        apply_ok(
+            &session,
+            &[id],
+            json!([{"type": "setProperty", "nodeId": id, "path": ptr, "value": value}]),
+        );
+    }
+    let scope = [frame, text, image];
+    session.undo().unwrap();
+    session.undo().unwrap();
+    session.redo().unwrap();
+    session.redo().unwrap();
+    session.save().unwrap();
+    let frame_saved = saved_node(&path, frame);
+    assert_eq!(frame_saved["layout"]["minW"], 10.0);
+    assert_eq!(frame_saved["layout"]["minH"], 20.0);
+    assert_eq!(frame_saved["layout"]["maxW"], 800.0);
+    assert_eq!(frame_saved["layout"]["maxH"], 600.0);
+    assert_eq!(frame_saved["style"]["radius"], 12.0);
+    assert_eq!(frame_saved["style"]["rotate"], 15.5);
+    assert_eq!(frame_saved["style"]["overflow"], "hidden");
+    assert_eq!(
+        frame_saved["style"]["stroke"],
+        json!({"color": "#112233", "width": 2.0})
+    );
+    assert_eq!(frame_saved["style"]["shadows"].as_array().unwrap().len(), 1);
+    assert_eq!(frame_saved["hidden"], true);
+    assert_eq!(frame_saved["locked"], true);
+    assert_eq!(saved_node(&path, text)["style"]["textAlign"], "center");
+    assert_eq!(saved_node(&path, text)["style"]["maxLines"], 3);
+    assert_eq!(saved_node(&path, image)["style"]["fit"], "contain");
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(snapshot(&reopened)["readOnly"], false);
+    assert!(scope
+        .iter()
+        .all(|id| snapshot(&reopened)["document"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"] == json!(id.to_string()))));
+}
+
+#[test]
+fn flow_padding_and_gap_can_be_written_individually() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Flow").unwrap();
+    let root = root(&session);
+    apply_ok(
+        &session,
+        &[root],
+        json!([{"type": "setProperty", "nodeId": root, "path": "/layout/flow", "value": {
+            "direction": "row", "gap": 0,
+            "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}, "align": "start"}}]),
+    );
+    for (ptr, value) in [
+        ("/layout/flow/gap", json!(16)),
+        ("/layout/flow/padding/top", json!(1)),
+        ("/layout/flow/padding/right", json!(2)),
+        ("/layout/flow/padding/bottom", json!(3)),
+        ("/layout/flow/padding/left", json!(4)),
+    ] {
+        apply_ok(
+            &session,
+            &[root],
+            json!([{"type": "setProperty", "nodeId": root, "path": ptr, "value": value}]),
+        );
+    }
+    session.save().unwrap();
+    let flow = saved_node(&path, root)["layout"]["flow"].clone();
+    assert_eq!(flow["gap"], 16.0);
+    assert_eq!(
+        flow["padding"],
+        json!({"top": 1.0, "right": 2.0, "bottom": 3.0, "left": 4.0})
+    );
+    let text = Uuid::new_v4();
+    assert_eq!(
+        apply_rejected(
+            &session,
+            &[root, text],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": node(text, root, "text")},
+                {"type": "setProperty", "nodeId": text, "path": "/layout/flow/gap", "value": 4}
+            ]),
+        ),
+        "INVALID_DOCUMENT"
+    );
+}
+
+#[test]
+fn invalid_visual_values_are_rejected_without_mutation() {
+    let temp = tempdir().unwrap();
+    let session = create_project(temp.path().join("project"), "Invalid").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let text = Uuid::new_v4();
+    let image = Uuid::new_v4();
+    apply_ok(
+        &session,
+        &[root, frame, text, image],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": node(frame, root, "group")},
+            {"type": "insertNode", "parentId": frame, "index": 0, "node": node(text, frame, "text")},
+            {"type": "insertNode", "parentId": frame, "index": 1, "node": node(image, frame, "image")}
+        ]),
+    );
+    apply_ok(
+        &session,
+        &[frame],
+        json!([
+            {"type": "setProperty", "nodeId": frame, "path": "/layout/minW", "value": 10},
+            {"type": "setProperty", "nodeId": frame, "path": "/layout/maxW", "value": 20}
+        ]),
+    );
+    for (id, ptr, value) in [
+        (frame, "/layout/minW", json!(30)),
+        (frame, "/layout/maxW", json!(-1)),
+        (frame, "/style/radius", json!(-1)),
+        (frame, "/style/rotate", json!(4000)),
+        (frame, "/style/stroke", json!({"color": "red", "width": 1})),
+        (
+            frame,
+            "/style/shadows",
+            json!((0..9)
+                .map(|_| json!({"x": 0, "y": 0, "blur": 0, "spread": 0, "color": "#000000"}))
+                .collect::<Vec<_>>()),
+        ),
+        (text, "/style/maxLines", json!(0)),
+    ] {
+        assert_eq!(
+            apply_rejected(
+                &session,
+                &[id],
+                json!([{"type": "setProperty", "nodeId": id, "path": ptr, "value": value}]),
+            ),
+            "INVALID_DOCUMENT",
+            "{ptr} {value}"
+        );
+    }
+    let vector = Uuid::new_v4();
+    assert_eq!(
+        apply_rejected(
+            &session,
+            &[root, vector],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": node(vector, root, "vector")},
+                {"type": "setProperty", "nodeId": vector, "path": "/style/radius", "value": -1}
+            ]),
+        ),
+        "INVALID_DOCUMENT"
+    );
+    assert_eq!(
+        apply_rejected(
+            &session,
+            &[root, vector],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": node(vector, root, "vector")},
+                {"type": "setProperty", "nodeId": vector, "path": "/style/textAlign", "value": "center"}
+            ]),
+        ),
+        "UNSUPPORTED_FEATURE"
+    );
+}

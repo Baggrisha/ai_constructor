@@ -18,8 +18,8 @@ struct Version {
 }
 
 const CURRENT: Version = Version {
-    document: 1,
-    manifest: 1,
+    document: 2,
+    manifest: 2,
 };
 
 struct Image {
@@ -35,9 +35,21 @@ struct Migration {
     validate_target: fn(&Image) -> Result<()>,
 }
 
-// No older format is specified or supported. Add a migration only with its real
-// source schema, source/target validators and preservation tests.
-const MIGRATIONS: &[Migration] = &[];
+// v2 only adds optional properties to the node model. The manifest version moves
+// with the document so both files identify the same schema.
+const MIGRATIONS: &[Migration] = &[Migration {
+    from: Version {
+        document: 1,
+        manifest: 1,
+    },
+    to: Version {
+        document: 2,
+        manifest: 2,
+    },
+    validate_source: validate_schema_one_source,
+    apply: apply_schema_one_to_two,
+    validate_target: |_| Ok(()),
+}];
 
 fn version(document: &[u8], manifest: &Manifest) -> Result<Version> {
     let value: Value = serde_json::from_slice(document)
@@ -226,11 +238,105 @@ fn backup(
     Ok(())
 }
 
+// Compare against the shape of schema v1 separately from the current model:
+// the typed model already refuses v1 documents, so a v1 snapshot must be checked
+// structurally or it could be "migrated" without ever being read.
+fn validate_schema_one_source(image: &Image) -> Result<()> {
+    let document = image
+        .files
+        .get("document.json")
+        .ok_or_else(|| CoreError::invalid("Schema v1 project has no document.json"))?;
+    let value: Value = serde_json::from_slice(document)
+        .map_err(|e| CoreError::invalid(format!("Invalid schema v1 document: {e}")))?;
+    let missing = |field: &str| CoreError::invalid(format!("Schema v1 document lacks {field}"));
+    let project_id = value
+        .get("projectId")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| missing("projectId"))?;
+    if project_id != image.manifest.project_id
+        || value.get("revision").and_then(Value::as_u64) != Some(image.manifest.revision)
+    {
+        return Err(CoreError::invalid(
+            "Schema v1 document does not match its manifest",
+        ));
+    }
+    for field in [
+        "pages",
+        "nodes",
+        "tokens",
+        "variables",
+        "actions",
+        "animations",
+    ] {
+        if !value.get(field).is_some_and(Value::is_array) {
+            return Err(missing(field));
+        }
+    }
+    let nodes = value["nodes"].as_array().expect("checked nodes array");
+    for node in nodes {
+        let layout = node
+            .get("layout")
+            .and_then(Value::as_object)
+            .ok_or_else(|| missing("node layout"))?;
+        if ["x", "y", "w", "h"]
+            .iter()
+            .any(|key| !layout.get(*key).is_some_and(Value::is_number))
+        {
+            return Err(CoreError::invalid("Schema v1 node layout is invalid"));
+        }
+        let style = node
+            .get("style")
+            .ok_or_else(|| missing("node style"))?
+            .as_object()
+            .ok_or_else(|| missing("node style"))?;
+        for unsupported in [
+            "stroke",
+            "shadows",
+            "radius",
+            "rotate",
+            "textAlign",
+            "maxLines",
+            "overflow",
+            "fit",
+        ] {
+            if style.contains_key(unsupported) {
+                return Err(CoreError::unsupported(format!(
+                    "Schema v1 style already contains {unsupported}"
+                )));
+            }
+        }
+        for unsupported in ["minW", "minH", "maxW", "maxH"] {
+            if layout.contains_key(unsupported) {
+                return Err(CoreError::unsupported(format!(
+                    "Schema v1 layout already contains {unsupported}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_schema_one_to_two(image: &mut Image) -> Result<()> {
+    let document = image
+        .files
+        .get_mut("document.json")
+        .ok_or_else(|| CoreError::invalid("Schema v1 project has no document.json"))?;
+    let mut value: Value = serde_json::from_slice(document)
+        .map_err(|e| CoreError::invalid(format!("Invalid schema v1 document: {e}")))?;
+    value["schemaVersion"] = serde_json::json!(2);
+    *document = json(&value)?;
+    image.manifest.schema_version = CURRENT.manifest;
+    image.manifest.snapshot_hash = super::fingerprint(document, &image.manifest.files);
+    Ok(())
+}
+
 fn validate_image(
     image: &Image,
     expected: Version,
     original_id: Uuid,
     original_revision: u64,
+    full: bool,
 ) -> Result<()> {
     let document = image
         .files
@@ -260,7 +366,7 @@ fn validate_image(
             "Migration cannot replace project.json directly",
         ));
     }
-    if expected.document == CURRENT.document {
+    if full {
         let model: Document = serde_json::from_value(value)
             .map_err(|e| CoreError::invalid(format!("Invalid migrated schema: {e}")))?;
         model.validate()?;
@@ -283,8 +389,22 @@ fn migrate_with(
     support: &Path,
     migrations: &[Migration],
 ) -> Result<Option<super::Loaded>> {
+    migrate_to(
+        root, marker, manifest, document, support, migrations, CURRENT,
+    )
+}
+
+fn migrate_to(
+    root: &Path,
+    marker: &[u8],
+    manifest: &Manifest,
+    document: &[u8],
+    support: &Path,
+    migrations: &[Migration],
+    target: Version,
+) -> Result<Option<super::Loaded>> {
     let original_version = version(document, manifest)?;
-    if original_version == CURRENT
+    if original_version == target
         || !migrations
             .iter()
             .any(|migration| migration.from == original_version)
@@ -316,6 +436,7 @@ fn migrate_with(
         manifest: manifest.clone(),
         files,
     };
+    let final_step = target == CURRENT;
     let mut at = original_version;
     loop {
         let mut candidates = migrations.iter().filter(|migration| migration.from == at);
@@ -326,20 +447,26 @@ fn migrate_with(
             || step.to.document < at.document
             || step.to.manifest < at.manifest
             || step.to == at
-            || step.to.document > CURRENT.document
-            || step.to.manifest > CURRENT.manifest
+            || step.to.document > target.document
+            || step.to.manifest > target.manifest
         {
             return Err(CoreError::invalid(
                 "Ambiguous or invalid migration version path",
             ));
         }
-        validate_image(&image, at, manifest.project_id, manifest.revision)?;
+        validate_image(&image, at, manifest.project_id, manifest.revision, false)?;
         (step.validate_source)(&image)?;
         (step.apply)(&mut image)?;
-        validate_image(&image, step.to, manifest.project_id, manifest.revision)?;
+        validate_image(
+            &image,
+            step.to,
+            manifest.project_id,
+            manifest.revision,
+            final_step && step.to == target,
+        )?;
         (step.validate_target)(&image)?;
         at = step.to;
-        if at == CURRENT {
+        if at == target {
             break;
         }
     }
@@ -476,18 +603,46 @@ mod tests {
 
     fn invalid_target(image: &mut Image) -> Result<()> {
         convert(image)?;
-        let mut doc: Value = serde_json::from_slice(&image.files["document.json"]).unwrap();
-        doc["pages"] = json!([]);
         image
             .files
-            .insert("document.json".into(), super::super::json(&doc)?);
+            .insert("document.json".into(), b"not a document".to_vec());
         Ok(())
+    }
+
+    const SYNTHETIC_TARGET: Version = Version {
+        document: 1,
+        manifest: 1,
+    };
+    const SYNTHETIC_MANIFEST_TARGET: Version = Version {
+        document: 2,
+        manifest: 1,
+    };
+
+    fn migrate_test(
+        root: &Path,
+        marker: &[u8],
+        manifest: &Manifest,
+        document: &[u8],
+        support: &Path,
+        migrations: &[Migration],
+    ) -> Result<Option<super::super::Loaded>> {
+        let target = if migrations
+            .iter()
+            .any(|migration| migration.to == SYNTHETIC_MANIFEST_TARGET)
+        {
+            SYNTHETIC_MANIFEST_TARGET
+        } else {
+            SYNTHETIC_TARGET
+        };
+        migrate_to(
+            root, marker, manifest, document, support, migrations, target,
+        )
     }
 
     fn migration(apply: fn(&mut Image) -> Result<()>) -> Migration {
         Migration {
             from: SYNTHETIC,
-            to: CURRENT,
+            to: SYNTHETIC_TARGET,
             validate_source: source,
             apply,
             validate_target: target,
@@ -520,7 +675,7 @@ mod tests {
         let (manifest, marker, doc) = fixture(&root);
         let support = temp.path().join("support");
         let _lock = super::super::lock(&root).unwrap();
-        assert!(migrate_with(&root, &marker, &manifest, &doc, &support, &[])
+        assert!(migrate_test(&root, &marker, &manifest, &doc, &support, &[])
             .unwrap()
             .is_none());
         assert!(!support.exists());
@@ -536,7 +691,7 @@ mod tests {
         let (manifest, marker, doc) = fixture(&root);
         let ignore = fs::read(root.join(".gitignore")).unwrap();
         let _lock = super::super::lock(&root).unwrap();
-        let result = migrate_with(
+        let result = migrate_test(
             &root,
             &marker,
             &manifest,
@@ -591,19 +746,19 @@ mod tests {
         fs::write(root.join("project.json"), &marker).unwrap();
         let step = Migration {
             from: Version {
-                document: 1,
+                document: 2,
                 manifest: 0,
             },
-            to: CURRENT,
+            to: SYNTHETIC_MANIFEST_TARGET,
             validate_source: target,
             apply: |image| {
-                image.manifest.schema_version = 1;
+                image.manifest.schema_version = SYNTHETIC_MANIFEST_TARGET.manifest;
                 Ok(())
             },
             validate_target: target,
         };
         let _lock = super::super::lock(&root).unwrap();
-        let updated = migrate_with(
+        let updated = migrate_test(
             &root,
             &marker,
             &manifest,
@@ -641,7 +796,7 @@ mod tests {
                 convert
             });
             let _lock = super::super::lock(&root).unwrap();
-            assert!(migrate_with(&root, &marker, &manifest, &doc, &support, &[step]).is_err());
+            assert!(migrate_test(&root, &marker, &manifest, &doc, &support, &[step]).is_err());
             assert!(!support.exists());
             assert_eq!(fs::read(root.join("project.json")).unwrap(), marker);
             assert_eq!(fs::read(root.join("document.json")).unwrap(), doc);
@@ -664,7 +819,7 @@ mod tests {
         let extended = super::super::json(&value).unwrap();
         fs::write(root.join("project.json"), &extended).unwrap();
         let _lock = super::super::lock(&root).unwrap();
-        let error = migrate_with(
+        let error = migrate_test(
             &root,
             &extended,
             &manifest,
@@ -689,7 +844,7 @@ mod tests {
             {
                 let _lock = super::super::lock(&root).unwrap();
                 super::super::INTERRUPT_AFTER.with(|hook| hook.set(Some(point)));
-                assert!(migrate_with(
+                assert!(migrate_test(
                     &root,
                     &marker,
                     &manifest,

@@ -29,6 +29,8 @@ pub(crate) use diagnostics::capture_external;
 pub(crate) use services::{chat_attachment_ids, rewrite_chats};
 const EXTERNAL_CHANGE_REASON: &str =
     "Project files were changed outside the editor; open read-only to avoid overwriting them";
+/// Manifest schema version written by this build. It tracks the document schema.
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests;
@@ -1135,7 +1137,7 @@ pub fn load(root: &Path) -> Result<Loaded> {
             }
             // Earlier releases stored generated-file protection only locally.
             // Promote those verified records through the normal file journal.
-            if manifest.schema_version == 1
+            if manifest.schema_version <= 2
                 && serde_json::from_slice::<crate::model::Document>(&document)
                     .ok()
                     .is_some_and(|model| model.editable() && model.validate().is_ok())

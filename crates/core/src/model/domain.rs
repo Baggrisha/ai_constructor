@@ -140,6 +140,66 @@ pub struct NodeStyle {
     pub letter_spacing: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_wrap: Option<TextWrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_align: Option<TextAlign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow: Option<Overflow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Stroke>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shadows: Vec<Shadow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<ImageFit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Stroke {
+    pub color: String,
+    pub width: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Shadow {
+    pub x: f64,
+    pub y: f64,
+    pub blur: f64,
+    pub spread: f64,
+    pub color: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextAlign {
+    Start,
+    Center,
+    End,
+    Justify,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Overflow {
+    Visible,
+    Hidden,
+    Clip,
+    Scroll,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImageFit {
+    Fill,
+    Contain,
+    Cover,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

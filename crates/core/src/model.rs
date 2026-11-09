@@ -71,6 +71,10 @@ pub struct Node {
     pub source_density: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responsive: Vec<ResponsiveOverride>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     pub style: FeatureMap<NodeStyle>,
     pub content: FeatureMap<NodeContent>,
     pub a11y: FeatureMap<NodeAccessibility>,
@@ -109,6 +113,14 @@ pub struct Layout {
     pub width_mode: Option<SizeMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_mode: Option<SizeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_w: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_h: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_w: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_h: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,7 +205,7 @@ impl Document {
     pub fn new(project_id: Uuid) -> Self {
         let root_id = Uuid::new_v4();
         Self {
-            schema_version: 1,
+            schema_version: 2,
             project_id,
             revision: 0,
             file_history_version: None,
@@ -215,11 +227,17 @@ impl Document {
                     flow: None,
                     width_mode: None,
                     height_mode: None,
+                    min_w: None,
+                    min_h: None,
+                    max_w: None,
+                    max_h: None,
                     h: 900.0,
                 },
                 source_bounds: None,
                 source_density: None,
                 responsive: Vec::new(),
+                hidden: false,
+                locked: false,
                 style: FeatureMap::Known(NodeStyle::default()),
                 content: FeatureMap::Known(NodeContent::default()),
                 a11y: FeatureMap::Known(NodeAccessibility::default()),

@@ -7,8 +7,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::domain::{
-    ActionKind, Binding, Component as DocumentComponent, FeatureItem, FeatureMap, Scalar,
-    ValueKind, VectorCommand, VectorShape,
+    ActionKind, Binding, Component as DocumentComponent, FeatureItem, FeatureMap, NodeStyle,
+    Scalar, ValueKind, VectorCommand, VectorShape,
 };
 use super::{CoreError, Document, Node, NodeKind, Result};
 
@@ -20,17 +20,32 @@ pub(super) fn property_kind(node: &Node, path: &str) -> Option<ValueKind> {
         | "/style/color"
         | "/style/fontFamily"
         | "/style/fontFallback"
+        | "/layout/flow/direction"
+        | "/layout/flow/align"
+        | "/style/textAlign"
+        | "/style/overflow"
         | "/a11y/label"
         | "/a11y/alt" => Some(String),
         "/layout/x"
         | "/layout/y"
         | "/layout/w"
         | "/layout/h"
+        | "/layout/minW"
+        | "/layout/minH"
+        | "/layout/maxW"
+        | "/layout/maxH"
+        | "/layout/flow/gap"
+        | "/layout/flow/padding/top"
+        | "/layout/flow/padding/right"
+        | "/layout/flow/padding/bottom"
+        | "/layout/flow/padding/left"
         | "/style/opacity"
         | "/style/fontSize"
         | "/style/fontWeight"
         | "/style/lineHeight"
-        | "/style/letterSpacing" => Some(Number),
+        | "/style/letterSpacing"
+        | "/style/radius"
+        | "/style/rotate" => Some(Number),
         "/content/text" if matches!(node.kind, NodeKind::Text | NodeKind::Button) => Some(String),
         "/content/placeholder" if matches!(node.kind, NodeKind::Input | NodeKind::Textarea) => {
             Some(String)
@@ -74,6 +89,73 @@ pub(super) fn node_supported(node: &Node) -> bool {
             .keys()
             .all(|path| property_kind(node, path).is_some())
         && events.keys().all(|key| identifier(key))
+}
+
+fn valid_color(value: &str) -> bool {
+    let value = value.trim();
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    (value.starts_with('#') && (hex.len() == 3 || hex.len() == 6))
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn sorted_bounds(minimum: Option<f64>, maximum: Option<f64>) -> bool {
+    minimum.zip(maximum).is_none_or(|(min, max)| min <= max)
+}
+
+fn validate_visual_style(node: &Node, style: &NodeStyle) -> Result<()> {
+    let invalid = |reason: &str| Err(CoreError::invalid(format!("{reason} on node {}", node.id)));
+    if style.radius.is_some_and(|n| !n.is_finite() || n < 0.0) {
+        return invalid("Invalid corner radius");
+    }
+    if style
+        .rotate
+        .is_some_and(|n| !n.is_finite() || !(-3600.0..=3600.0).contains(&n))
+    {
+        return invalid("Invalid rotation");
+    }
+    if style.max_lines == Some(0) {
+        return invalid("Invalid max lines");
+    }
+    if style.text_align.is_some() && !matches!(node.kind, NodeKind::Text | NodeKind::Button) {
+        return invalid("Text alignment requires a text node");
+    }
+    if style.fit.is_some() && !matches!(node.kind, NodeKind::Image) {
+        return invalid("Image fit requires an image node");
+    }
+    if let Some(stroke) = &style.stroke {
+        if !valid_color(&stroke.color)
+            || !stroke.width.is_finite()
+            || !(0.0..=10_000.0).contains(&stroke.width)
+        {
+            return invalid("Invalid stroke");
+        }
+    }
+    if style.shadows.len() > 8
+        || style.shadows.iter().any(|shadow| {
+            [shadow.x, shadow.y, shadow.blur, shadow.spread]
+                .into_iter()
+                .any(|n| !n.is_finite())
+                || shadow.blur < 0.0
+                || shadow.spread < 0.0
+                || !valid_color(&shadow.color)
+        })
+    {
+        return invalid("Invalid shadows");
+    }
+    let layout = &node.layout;
+    for (min, max) in [(layout.min_w, layout.max_w), (layout.min_h, layout.max_h)] {
+        if [min, max]
+            .into_iter()
+            .flatten()
+            .any(|n| !n.is_finite() || n < 0.0)
+        {
+            return invalid("Invalid min or max size");
+        }
+        if !sorted_bounds(min, max) {
+            return invalid("Minimum size exceeds maximum size");
+        }
+    }
+    Ok(())
 }
 
 fn relative_path(path: &str, prefix: &str) -> bool {
@@ -274,7 +356,7 @@ impl Document {
     }
 
     fn validate_with(&self, strict_bound_sizes: bool) -> Result<()> {
-        if self.schema_version != 1 || self.pages.is_empty() || self.file_history_version == Some(0)
+        if self.schema_version != 2 || self.pages.is_empty() || self.file_history_version == Some(0)
         {
             return Err(CoreError::invalid("Unsupported or empty document"));
         }
@@ -630,6 +712,7 @@ impl Document {
                     node.id
                 )));
             }
+            validate_visual_style(node, &style)?;
             if let Some(id) = style.font_asset_id {
                 let asset = assets.get(&id).ok_or_else(|| {
                     CoreError::new(

@@ -332,7 +332,7 @@ fn create_in_place(path: &Path, name: &str) -> Result<ProjectSession> {
     let value = serde_json::to_value(&document).map_err(|e| CoreError::invalid(e.to_string()))?;
     let bytes = storage::json(&value)?;
     let manifest = Manifest {
-        schema_version: 1,
+        schema_version: storage::CURRENT_SCHEMA_VERSION,
         project_id: document.project_id,
         name: name.trim().to_owned(),
         revision: 0,
@@ -367,9 +367,10 @@ pub fn open_project(path: impl AsRef<Path>) -> Result<ProjectSession> {
         read_only_reason =
             Some("This project manifest contains unsupported fields and is open read-only".into());
     }
-    if schema_version > 1 || loaded.manifest.schema_version > 1 {
+    let current = storage::CURRENT_SCHEMA_VERSION;
+    if schema_version > u64::from(current) || loaded.manifest.schema_version > current {
         read_only_reason = Some("This project uses a newer schema and is open read-only".into());
-    } else if schema_version != 1 || loaded.manifest.schema_version != 1 {
+    } else if schema_version != u64::from(current) || loaded.manifest.schema_version != current {
         return Err(CoreError::unsupported(
             "This project schema cannot be migrated",
         ));

@@ -236,7 +236,9 @@ fn validate_manifest(bytes: &[u8], manifest: &Manifest) -> Result<()> {
 
 /// Resolution rewrites the manifest; it must not discard fields it cannot model.
 pub(super) fn require_supported_manifest(bytes: &[u8], manifest: &Manifest) -> Result<()> {
-    if manifest.schema_version != 1 || super::manifest_has_unknown_fields(bytes)? {
+    if manifest.schema_version != crate::storage::CURRENT_SCHEMA_VERSION
+        || super::manifest_has_unknown_fields(bytes)?
+    {
         return Err(CoreError::new(
             "UNSUPPORTED_SCHEMA",
             "Project manifest contains an unsupported schema or unknown fields",
@@ -1862,7 +1864,10 @@ mod tests {
 
     #[test]
     fn future_or_unknown_base_manifest_stays_unchanged_during_external_resolution() {
-        for schema in [1, 2] {
+        for schema in [
+            crate::storage::CURRENT_SCHEMA_VERSION,
+            crate::storage::CURRENT_SCHEMA_VERSION + 1,
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("project");
             drop(crate::create_project(&root, "Example").unwrap());
@@ -1873,7 +1878,7 @@ mod tests {
             let original = super::super::json(&future).unwrap();
             fs::write(root.join("project.json"), &original).unwrap();
             let session = crate::open_project(&root).unwrap();
-            if schema == 2 {
+            if schema > crate::storage::CURRENT_SCHEMA_VERSION {
                 assert_eq!(snapshot(&session)["readOnly"], true);
             }
             fs::write(root.join(".gitignore"), b"future external edit\n").unwrap();
@@ -1891,7 +1896,7 @@ mod tests {
                 fs::read(root.join(".gitignore")).unwrap(),
                 b"future external edit\n"
             );
-            if schema == 2 {
+            if schema > crate::storage::CURRENT_SCHEMA_VERSION {
                 assert_eq!(snapshot(&session)["readOnly"], true);
             }
         }
@@ -1899,7 +1904,10 @@ mod tests {
 
     #[test]
     fn selected_future_or_unknown_disk_manifest_is_not_rewritten() {
-        for schema in [1, 2] {
+        for schema in [
+            crate::storage::CURRENT_SCHEMA_VERSION,
+            crate::storage::CURRENT_SCHEMA_VERSION + 1,
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("project");
             let session = crate::create_project(&root, "Example").unwrap();
