@@ -68,7 +68,10 @@ final class ProjectFileWatcher {
 
 struct Snapshot: Decodable {
     struct Document: Decodable {
-        struct Page: Decodable { let rootId: String }
+        struct Page: Decodable {
+            let id: String
+            let rootId: String
+        }
         struct Node: Decodable {
             struct Layout: Decodable { let x: Double; let y: Double; let w: Double; let h: Double }
             let id: String
@@ -264,6 +267,123 @@ struct RetentionSettings: Codable {
 
 struct ProjectIdentity: Decodable {
     let projectId: String
+}
+
+struct CanvasPage: Equatable {
+    let id: String
+    let rootId: String
+}
+
+struct CanvasNodeBounds: Decodable, Identifiable {
+    let id: String
+    let x: Double
+    let y: Double
+    let w: Double
+    let h: Double
+    let hidden: Bool
+    let kind: String
+    let inFlow: Bool
+    let parentId: String?
+    let rotation: Double
+
+    private enum CodingKeys: String, CodingKey { case id, x, y, w, h, hidden, kind, inFlow, parentId, rotation }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        x = try values.decode(Double.self, forKey: .x)
+        y = try values.decode(Double.self, forKey: .y)
+        w = try values.decode(Double.self, forKey: .w)
+        h = try values.decode(Double.self, forKey: .h)
+        hidden = (try? values.decode(Bool.self, forKey: .hidden)) ?? false
+        kind = (try? values.decode(String.self, forKey: .kind)) ?? ""
+        inFlow = (try? values.decode(Bool.self, forKey: .inFlow)) ?? false
+        parentId = try? values.decode(String.self, forKey: .parentId)
+        rotation = (try? values.decode(Double.self, forKey: .rotation)) ?? 0
+    }
+}
+
+struct CanvasContent {
+    let html: String
+    let nodes: [CanvasNodeBounds]
+    var root: CanvasNodeBounds? { nodes.first }
+
+    static let empty = CanvasContent(html: "", nodes: [])
+
+    init(html: String, nodes: [CanvasNodeBounds]) {
+        self.html = html
+        self.nodes = nodes
+    }
+
+    /// Injects the canvas styles and the inspection channel ahead of the
+    /// preview's own styles. The stored document HTML itself stays script-free.
+    /// The page is painted at `scale` document points per pixel, so the native
+    /// overlay and the WebView agree on one coordinate system.
+    static func prepared(html: String, nodes: [CanvasNodeBounds], bridge: String, scale: Double) throws -> CanvasContent {
+        guard let head = html.range(of: "</head>") else {
+            throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Превью документа не содержит заголовка страницы."])
+        }
+        var styled = html
+        styled.replaceSubrange(head, with: "<style>\(canvasCSS)\(css(scale: scale))</style><script>\(bridge)</script></head>")
+        return CanvasContent(html: styled, nodes: nodes)
+    }
+
+    static let canvasCSS = "html,body{background:transparent!important;overflow:hidden!important;}#canvas{margin:0;}\n"
+
+    static func css(scale: Double) -> String {
+        let value = String(format: "%.6f", scale)
+        return "#canvas{transform:scale(\(value));transform-origin:0 0;}\n"
+    }
+
+    func topmost(at point: CGPoint) -> CanvasNodeBounds? {
+        nodes.last { node in
+            !node.hidden && point.x >= node.x && point.y >= node.y && point.x < node.x + node.w && point.y < node.y + node.h
+        }
+    }
+
+    var rootSize: CGSize { root.map { CGSize(width: $0.w, height: $0.h) } ?? .zero }
+}
+
+struct CanvasHit: Equatable {
+    let id: String
+    let shift: Bool
+    let deep: Bool
+}
+
+enum CanvasGestureKind: String {
+    case move, resize, rotate
+}
+
+struct CanvasRect: Equatable {
+    var x: Double
+    var y: Double
+    var w: Double
+    var h: Double
+}
+
+struct CanvasGesture {
+    let kind: CanvasGestureKind
+    let ids: [String]
+    let start: CGPoint
+    let bounds: [CanvasNodeBounds]
+    let baseRevision: UInt64
+    let baseFingerprint: String
+    let inFlow: Bool
+    let rotation: Double
+}
+
+struct CanvasTaskRequest {
+    let session: ProjectSession
+    let page: CanvasPage
+    let scale: Double
+}
+
+@MainActor
+final class CanvasTaskState {
+    let request: CanvasTaskRequest
+    var task: Task<Void, Never>?
+    var queued = false
+    init(request: CanvasTaskRequest) { self.request = request }
 }
 
 struct LoadedProject {

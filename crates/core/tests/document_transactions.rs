@@ -3407,6 +3407,10 @@ fn layout_json_reports_flow_positions_and_computed_sizes() {
         (Some(400.0), Some(50.0))
     );
     assert_eq!(free_bounds["inFlow"], false);
+    // The canvas needs the parent for nesting and the rotation for its markers.
+    assert_eq!(frame_bounds["parentId"], json!(root.to_string()));
+    assert_eq!(root_bounds["parentId"], Value::Null);
+    assert_eq!(frame_bounds["rotation"], 0.0);
 }
 
 #[test]

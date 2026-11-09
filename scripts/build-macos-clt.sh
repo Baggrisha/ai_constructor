@@ -26,6 +26,9 @@ SOURCES=(
   apps/macos/AIConstructor/Views/AssetsPanel.swift
   apps/macos/AIConstructor/Views/DiagnosticsPanel.swift
   apps/macos/AIConstructor/Views/Components.swift
+  apps/macos/AIConstructor/Views/Canvas/CanvasView.swift
+  apps/macos/AIConstructor/Views/Canvas/CanvasWebView.swift
+  apps/macos/AIConstructor/Views/Canvas/CanvasOverlay.swift
   apps/macos/AIConstructor/Views/Sheets/ConflictResolutionSheet.swift
   apps/macos/AIConstructor/Views/Sheets/RecoveryResolutionSheet.swift
 )
@@ -41,7 +44,7 @@ xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 \
   -sdk "$SDK" -I "$ROOT/apps/macos/Generated" \
   "${SOURCES[@]}" apps/macos/Generated/aic_bridge.swift \
   "$ROOT/target/debug/libaic_bridge.a" \
-  -framework AppKit -framework SwiftUI -framework Security -framework CoreFoundation \
+  -framework AppKit -framework SwiftUI -framework Security -framework CoreFoundation -framework WebKit \
   -lc++ -lresolv -o "$STAGED_APP/Contents/MacOS/AIConstructor"
 if [ -e "$APP" ]; then
   printf '%s\n' 'build/AIConstructor.app appeared during the build; refusing to overwrite it.' >&2

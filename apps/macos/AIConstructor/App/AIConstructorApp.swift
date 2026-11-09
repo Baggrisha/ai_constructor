@@ -22,6 +22,36 @@ struct AIConstructorApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Test hooks duplicate macOS *scripts*: never enabled in a normal launch.
+        let debug = UserDefaults.standard.bool(forKey: "AICTestHooks")
+        let canvas = ProcessInfo.processInfo.environment["AIC_TEST_CANVAS"] == "1"
+        guard debug || canvas else { return }
+        // The window's workspace is registered on appear; test hooks wait for it.
+        if let path = ProcessInfo.processInfo.environment["AIC_TEST_OPEN"], let url = URL(string: "file://" + path) {
+            afterWorkspace { $0.openPath(url) }
+        }
+        if let path = ProcessInfo.processInfo.environment["AIC_TEST_CREATE"], let url = URL(string: "file://" + path) {
+            afterWorkspace { $0.createAt(url) }
+        }
+        if canvas {
+            afterWorkspace { $0.openFirstRecent() }
+        }
+    }
+
+    @MainActor
+    private func afterWorkspace(_ action: @escaping @MainActor (WorkspaceModel) -> Void) {
+        Task { @MainActor in
+            for _ in 0..<100 {
+                if let workspace = ProjectLibrary.shared.firstWorkspace() {
+                    action(workspace)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let workspace = ProjectLibrary.shared.blockingWorkspace, let reason = workspace.closeBlockReason else {
             return .terminateNow

@@ -51,9 +51,9 @@ struct WorkspaceView: View {
     private func panel(_ snapshot: Snapshot) -> some View {
         switch library.panels[snapshot.document.projectId] ?? .inspector {
         case .inspector:
-            if let root = snapshot.root {
-                FrameEditor(snapshot: snapshot, root: root, model: model, editorId: model.frameEditorId)
-                    .id(model.frameEditorId)
+            if snapshot.root != nil {
+                CanvasView(model: model, content: model.canvas)
+                    .id(snapshot.document.projectId)
             } else {
                 ContentUnavailableView("Нет корневого фрейма", systemImage: "exclamationmark.triangle")
             }
@@ -66,66 +66,117 @@ struct WorkspaceView: View {
         }
     }
 
+    /// The canvas takes the column above the page navigation; every chrome row
+    /// is fixed height, so the header's intrinsic width never reaches layout.
     @ViewBuilder
     private func selectedProject(_ snapshot: Snapshot) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(snapshot.name).font(.headline)
-                Text(model.hasUnsavedData ? "Не сохранено" : snapshot.readOnly ? "Только чтение" : model.diagnostics?.readOnly == true ? "Внешние изменения" : model.diagnosticsError != nil ? "Проверка не выполнена" : "Сохранено")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Отменить", systemImage: "arrow.uturn.backward") { model.undo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-            Button("Повторить", systemImage: "arrow.uturn.forward") { model.redo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-            Button("Сохранить", systemImage: "square.and.arrow.down") { model.save() }.disabled(model.writesBlocked || model.deferredFrameDraft != nil)
-            Menu {
-                Button("Закрыть проект") { model.closeProject() }
-                Button("Переименовать проект…") { projectName = snapshot.name; renameProject = true }
-                    .disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-                Button("В архив") { model.archiveCurrent() }
-                Button("Дублировать проект…") { model.duplicate() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-                Button("Создать переносимый снимок…") { confirmPortableSnapshot = true }
-                    .disabled(model.writesBlocked || model.hasUnsavedData || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-                Button("Создать контрольную точку") { model.createCheckpoint() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
-                Button("Обновить список контрольных точек") { model.refreshCheckpoints() }
-                    .disabled(model.writesBlocked)
-                Menu("Восстановить контрольную точку") {
-                    ForEach(model.checkpoints) { checkpoint in
-                        Button("Ревизия \(checkpoint.revision) · \(checkpoint.id.prefix(8))") {
-                            checkpointToRestore = checkpoint
-                        }
-                    }
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(snapshot.name).font(.headline)
+                    statusText(snapshot).font(.caption).foregroundStyle(.secondary)
                 }
-                .disabled(model.writesBlocked || model.checkpoints.isEmpty || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                .lineLimit(1)
+                Spacer(minLength: 12)
+                projectButtons(snapshot).fixedSize()
+            }
+            .padding(.horizontal, 20)
+            .frame(height: 50)
+            Divider()
+            diagnosticsChrome(snapshot)
+            pageNavigation(snapshot)
+                .frame(height: 44)
+            panel(snapshot)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func statusText(_ snapshot: Snapshot) -> Text {
+        Text(model.hasUnsavedData ? "Не сохранено" : snapshot.readOnly ? "Только чтение" : model.diagnostics?.readOnly == true ? "Внешние изменения" : model.diagnosticsError != nil ? "Проверка не выполнена" : "Сохранено")
+    }
+
+    private func projectButtons(_ snapshot: Snapshot) -> some View {
+        HStack(spacing: 8) {
+            Button("Отменить", systemImage: "arrow.uturn.backward") { model.undo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                .help("Отменить")
+                .labelStyle(.iconOnly)
+            Button("Повторить", systemImage: "arrow.uturn.forward") { model.redo() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+                .help("Повторить")
+                .labelStyle(.iconOnly)
+            Button("Сохранить", systemImage: "square.and.arrow.down") { model.save() }.disabled(model.writesBlocked || model.deferredFrameDraft != nil)
+                .labelStyle(.iconOnly)
+            Menu {
+                actionsMenu(snapshot)
             } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
             .accessibilityLabel("Действия с проектом")
             .accessibilityIdentifier("project-actions")
         }
-        .disabled(model.frameAutosaving)
-        .padding(20)
-        Divider()
+    }
+
+    @ViewBuilder
+    private func actionsMenu(_ snapshot: Snapshot) -> some View {
+        Button("Закрыть проект") { model.closeProject() }
+        Button("Переименовать проект…") { projectName = snapshot.name; renameProject = true }
+            .disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+        Button("В архив") { model.archiveCurrent() }
+        Button("Дублировать проект…") { model.duplicate() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+        Button("Создать переносимый снимок…") { confirmPortableSnapshot = true }
+            .disabled(model.writesBlocked || model.hasUnsavedData || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+        Button("Создать контрольную точку") { model.createCheckpoint() }.disabled(model.writesBlocked || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+        Button("Обновить список контрольных точек") { model.refreshCheckpoints() }
+            .disabled(model.writesBlocked)
+        Menu("Восстановить контрольную точку") {
+            ForEach(model.checkpoints) { checkpoint in
+                Button("Ревизия \(checkpoint.revision) · \(checkpoint.id.prefix(8))") {
+                    checkpointToRestore = checkpoint
+                }
+            }
+        }
+        .disabled(model.writesBlocked || model.checkpoints.isEmpty || model.hasBlockingFrameDraft || model.deferredFrameDraft != nil)
+    }
+
+    @ViewBuilder
+    private func diagnosticsChrome(_ snapshot: Snapshot) -> some View {
         if let reason = snapshot.readOnlyReason {
-            Text(reason).frame(maxWidth: .infinity, alignment: .leading).padding().background(.orange.opacity(0.12))
+            Text(reason)
+                .font(.caption)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 6)
+                .background(.orange.opacity(0.12))
         }
         if let diagnostics = model.diagnostics, diagnostics.manifestChanged || !diagnostics.files.isEmpty || !diagnostics.conflicts.isEmpty || diagnostics.blockedGenerated?.isEmpty == false {
-            HStack {
+            HStack(spacing: 8) {
                 Label("Обнаружены внешние изменения или конфликты.", systemImage: "exclamationmark.triangle")
-                Spacer()
-                Button("Открыть диагностику") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button("Открыть") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
                     .accessibilityIdentifier("open-diagnostics")
             }
-            .padding(10)
+            .font(.caption)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 6)
             .background(.orange.opacity(0.12))
         }
         if model.diagnosticsError != nil || model.watchWarning != nil {
-            HStack {
+            HStack(spacing: 8) {
                 Label(model.diagnosticsError ?? model.watchWarning ?? "", systemImage: "exclamationmark.triangle")
-                Spacer()
-                Button("Открыть диагностику") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button("Открыть") { library.setPanel(.diagnostics, for: snapshot.document.projectId) }
             }
-            .padding(10)
+            .font(.caption)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 6)
             .background(.orange.opacity(0.12))
         }
+    }
+
+    private func pageNavigation(_ snapshot: Snapshot) -> some View {
         Picker("Панель", selection: Binding(
             get: { library.panels[snapshot.document.projectId] ?? .inspector },
             set: { library.setPanel($0, for: snapshot.document.projectId) }
@@ -135,40 +186,43 @@ struct WorkspaceView: View {
             }
         }
         .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
         .accessibilityIdentifier("workspace-panel")
-        .disabled(model.frameAutosaving)
-        .padding([.horizontal, .top])
-        panel(snapshot)
-            .disabled(model.frameAutosaving && (library.panels[snapshot.document.projectId] ?? .inspector) != .inspector)
-        Spacer(minLength: 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
     }
 
     private var panelColumn: some View {
-        HStack(spacing: 0) {
-            Rectangle().fill(.separator).frame(width: 1)
-            ScrollView {
-                VStack(spacing: 16) {
-                    Text("Инспектор")
-                        .font(.headline)
-                    Text("Панель инспектора появится в M1.3.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity)
-                .padding()
+        ScrollView {
+            VStack(spacing: 16) {
+                Text("Инспектор")
+                    .font(.headline)
+                Text("Панель инспектора появится в M1.3.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
-            .frame(width: library.panelWidths.inspector)
+            .frame(maxWidth: .infinity)
+            .padding()
         }
+        .frame(width: library.panelWidths.inspector)
+        .overlay(alignment: .leading) { Rectangle().fill(.separator).frame(width: 1) }
     }
 
+    /// The inspector is a sibling with a fixed width; the page column takes
+    /// whatever is left.
     @ViewBuilder
     private var detailColumn: some View {
         if let snapshot = model.snapshot {
-            HStack(spacing: 0) {
-                selectedProject(snapshot)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                panelColumn
+            GeometryReader { geometry in
+                HStack(spacing: 0) {
+                    selectedProject(snapshot)
+                        .frame(width: max(0, geometry.size.width - library.panelWidths.inspector - 1), height: geometry.size.height, alignment: .topLeading)
+
+                    panelColumn
+                        .frame(width: library.panelWidths.inspector, height: geometry.size.height, alignment: .topLeading)
+                }
             }
         } else {
             ContentUnavailableView {
@@ -207,7 +261,6 @@ struct WorkspaceView: View {
                 }
                 .listStyle(.sidebar)
             }
-        .disabled(model.frameAutosaving)
         .padding(.horizontal, 16)
         .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
         .background(SidebarMaterial())
@@ -221,13 +274,13 @@ struct WorkspaceView: View {
                     .clipped()
                 Rectangle().fill(.separator).frame(width: 1)
                 detailColumn
-                    .frame(width: max(0, geometry.size.width - library.panelWidths.sidebar - 1), alignment: .topLeading)
+                    .frame(width: max(0, geometry.size.width - library.panelWidths.sidebar - 1), height: geometry.size.height, alignment: .topLeading)
             }
         }
         .background(WindowCloseGuard(model: model))
         .background(WindowSizingView())
         .onAppear { library.register(model) }
-        .disabled(model.operation != nil && !model.conflictReviewPresented && !model.frameAutosaving)
+        .disabled(model.operation != nil && !model.conflictReviewPresented)
         .overlay(alignment: .bottom) {
             if let operation = model.operation {
                 HStack {

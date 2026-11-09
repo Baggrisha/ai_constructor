@@ -592,7 +592,7 @@ impl<'a> Renderer<'a> {
             .pages
             .iter()
             .find(|page| page.id == self.page_id)
-            .ok_or_else(|| CoreError::invalid("Unknown page"))?;
+            .ok_or_else(|| CoreError::invalid("Unknown preview page"))?;
         let root = *self
             .nodes
             .get(&page.root_id)
@@ -624,7 +624,12 @@ impl Document {
             .iter()
             .map(|bounds| {
                 let (hidden, kind) = visibility[&bounds.id];
-                json!({
+                let node = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == bounds.id)
+                    .ok_or_else(|| CoreError::invalid("Missing node bounds"))?;
+                Ok(json!({
                     "id": bounds.id,
                     "x": bounds.x,
                     "y": bounds.y,
@@ -633,9 +638,11 @@ impl Document {
                     "hidden": hidden,
                     "kind": kind.token(),
                     "inFlow": bounds.in_flow,
-                })
+                    "parentId": node.parent_id,
+                    "rotation": node.style.known().and_then(|style| style.rotate).unwrap_or(0.0),
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<Value>>>()?;
         serde_json::to_string(&records).map_err(|e| CoreError::invalid(e.to_string()))
     }
 

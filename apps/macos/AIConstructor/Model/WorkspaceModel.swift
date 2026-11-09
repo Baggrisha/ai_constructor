@@ -27,16 +27,23 @@ final class WorkspaceModel: ObservableObject {
     @Published var conflictReviewPresented = false
     @Published var chatEditorPresented = false
     @Published private(set) var frameDraft: FrameDraft?
-    @Published private(set) var frameAutosaving = false
     @Published private(set) var frameDraftNeedsReview = false
     @Published private(set) var deferredFrameDraft: DeferredFrameDraft?
     @Published private(set) var frameEditorId = UUID()
+    @Published private(set) var canvas: CanvasContent = .empty
+    @Published private(set) var canvasGenerating = false
+    @Published var selectedNodeIds: Set<String> = []
+    @Published var canvasHoveredId: String?
+    @Published var canvasNotice: String?
+    @Published private(set) var canvasPreview: CanvasRect?
+    @Published private(set) var canvasRotation: Double?
+    private var canvasTaskState: CanvasTaskState?
+    private var canvasQueued = false
+    private var canvasScale = 0.0
+    private var pendingGesture: CanvasGesture?
     private var operationControl: OperationControl?
     private var diagnosticControl: OperationControl?
     private var possibleUnsaved = false
-    private var frameAutosaveTask: Task<Void, Never>?
-    private var frameSavePending = false
-    private var frameFocused = false
 
     var writesBlocked: Bool { snapshot?.readOnly == true || diagnostics?.readOnly == true }
 
@@ -93,7 +100,6 @@ final class WorkspaceModel: ObservableObject {
     }
 
     deinit {
-        frameAutosaveTask?.cancel()
         observationTask?.cancel()
         projectWatcher?.stop()
         let paths = Array(sessions.keys)
@@ -142,11 +148,7 @@ final class WorkspaceModel: ObservableObject {
 
     private func drainDeferredWork() {
         guard operation == nil else { return }
-        if frameSavePending {
-            frameSavePending = false
-            commitFrameDraft()
-            if operation != nil { return }
-        }
+        if canvasQueued { refreshCanvas() }
         if deferredChatLoad {
             let id = deferredChatId
             deferredChatLoad = false
@@ -244,6 +246,16 @@ final class WorkspaceModel: ObservableObject {
         selectedChatId = nil
         diagnostics = nil
         diagnosticsError = nil
+        selectedNodeIds = []
+        canvasHoveredId = nil
+        canvasNotice = nil
+        pendingGesture = nil
+        canvasPreview = nil
+        canvasTaskState?.task?.cancel()
+        canvasTaskState = nil
+        canvasQueued = false
+        canvasGenerating = false
+        canvas = .empty
         watchProject(url)
         remember(url, replacing: oldPath)
         refreshCheckpoints()
@@ -315,6 +327,21 @@ final class WorkspaceModel: ObservableObject {
         }) { loaded in
             self.install(loaded, at: url, replacing: expected?.path, reserved: reserved)
         }
+    }
+
+    func openFirstRecent() {
+        guard operation == nil, snapshot == nil, let first = library.recents.first(where: { $0.archived != true }) else { return }
+        select(URL(fileURLWithPath: first.path), expected: first)
+    }
+
+    func openPath(_ url: URL) {
+        guard operation == nil else { return }
+        select(url)
+    }
+
+    func createAt(_ url: URL) {
+        guard operation == nil else { return }
+        select(url, create: true)
     }
 
     func create() {
@@ -413,6 +440,16 @@ final class WorkspaceModel: ObservableObject {
             selectedChatId = nil
             diagnostics = nil
             diagnosticsError = nil
+            selectedNodeIds = []
+            canvasHoveredId = nil
+            canvasNotice = nil
+            pendingGesture = nil
+            canvasPreview = nil
+            canvasTaskState?.task?.cancel()
+            canvasTaskState = nil
+            canvasQueued = false
+            canvasGenerating = false
+            canvas = .empty
         }
     }
 
@@ -513,8 +550,6 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func invalidateFrameEditor() {
-        stopFrameAutosaveRetries()
-        frameFocused = false
         frameEditorId = UUID()
     }
 
@@ -529,26 +564,12 @@ final class WorkspaceModel: ObservableObject {
         guard deferredFrameDraft == nil, let snapshot, !snapshot.readOnly, let root = snapshot.root else { return }
         var draft = frameDraft ?? FrameDraft(root)
         draft[keyPath: field] = value
-        frameAutosaveTask?.cancel()
-        frameSavePending = false
         frameDraft = draft
         if writesBlocked { frameDraftNeedsReview = true }
-        guard draft.dimensions != nil, !writesBlocked, !frameDraftNeedsReview else { return }
-        frameAutosaveTask = Task {
-            do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
-            guard !Task.isCancelled else { return }
-            frameSavePending = true
-            drainDeferredWork()
-        }
-    }
-
-    func setFrameFocused(_ focused: Bool) {
-        frameFocused = focused
     }
 
     func discardFrameDraft() {
         guard operation == nil else { return }
-        stopFrameAutosaveRetries()
         frameDraft = nil
         frameDraftNeedsReview = false
     }
@@ -556,8 +577,7 @@ final class WorkspaceModel: ObservableObject {
     func deferFrameDraft() {
         guard operation == nil, deferredFrameDraft == nil, let draft = frameDraft,
               let root = snapshot?.root else { return }
-        stopFrameAutosaveRetries()
-        deferredFrameDraft = DeferredFrameDraft(draft: draft, base: FrameDraft(root), rootId: root.id)
+                deferredFrameDraft = DeferredFrameDraft(draft: draft, base: FrameDraft(root), rootId: root.id)
         frameDraft = nil
         frameDraftNeedsReview = false
     }
@@ -581,42 +601,29 @@ final class WorkspaceModel: ObservableObject {
     private func clearSavedFrameDraft() {
         guard let draft = frameDraft, let root = snapshot?.root,
               draft == FrameDraft(root), !hasUnsavedData else { return }
-        stopFrameAutosaveRetries()
         frameDraft = nil
     }
 
-    private func stopFrameAutosaveRetries() {
-        frameAutosaveTask?.cancel()
-        frameSavePending = false
-    }
-
     func commitFrameDraft(reviewed: Bool = false) {
-        frameAutosaveTask?.cancel()
-        frameSavePending = false
         guard let draft = frameDraft, let (width, height) = draft.dimensions else { return }
         guard !writesBlocked, !frameDraftNeedsReview || reviewed else { return }
-        guard operation == nil else { frameSavePending = true; return }
+        guard operation == nil else { return }
         guard let session, let snapshot, let root = snapshot.root, !snapshot.readOnly else { return }
         frameDraftNeedsReview = false
         if draft.matches(root) {
             if snapshot.dirty || possibleUnsaved {
                 let control = newOperationControl()
-                frameAutosaving = true
                 perform("Сохранение изменений…", control: control, errorContext: "Фрейм «\(root.name)» · \(root.id)", work: {
                     try saveSnapshot(session, control: control)
                 }, failure: { _ in
-                    self.frameAutosaving = false
-                    self.stopFrameAutosaveRetries()
                 }) { result in
-                    self.frameAutosaving = false
-                    if result.error != nil { self.stopFrameAutosaveRetries() }
                     self.accept(result, context: "Фрейм «\(root.name)» · \(root.id)")
-                    if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft && !self.frameFocused {
+                    if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft {
                         self.frameDraft = nil
                     }
                 }
             } else {
-                if !frameFocused { frameDraft = nil }
+                frameDraft = nil
             }
             return
         }
@@ -647,20 +654,15 @@ final class WorkspaceModel: ObservableObject {
             let previousUnsaved = possibleUnsaved
             possibleUnsaved = true
             let control = newOperationControl()
-            frameAutosaving = true
             perform("Сохранение изменений…", control: control, errorContext: "Фрейм «\(root.name)» · \(root.id)", work: {
                 try editAndSaveSnapshot(session) {
                     try session.applyTransactionAndSaveControlled(transactionJson: json, control: control)
                 }
             }, failure: { error in
-                self.frameAutosaving = false
-                self.stopFrameAutosaveRetries()
                 if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
             }) { result in
-                self.frameAutosaving = false
-                if result.error != nil { self.stopFrameAutosaveRetries() }
                 self.accept(result, context: "Фрейм «\(root.name)» · \(root.id)")
-                if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft && !self.frameFocused {
+                if result.error == nil && !result.snapshot.dirty && self.frameDraft == draft {
                     self.frameDraft = nil
                 }
             }
@@ -1125,14 +1127,273 @@ final class WorkspaceModel: ObservableObject {
             if result.readOnly {
                 clearSavedFrameDraft()
                 if frameDraft != nil {
-                    stopFrameAutosaveRetries()
-                    frameDraftNeedsReview = true
+                                        frameDraftNeedsReview = true
                 }
+                pendingGesture = nil
+                canvasPreview = nil
             }
             diagnosticsError = nil
         } catch {
             guard self.session === session, operation == nil, !Task.isCancelled else { return }
             diagnosticsError = wasCanceled(error) ? "Проверка отменена. Нажмите «Обновить», чтобы повторить её." : readableError(error)
         }
+    }
+
+    // MARK: Canvas (C.3, C.4, C.9)
+
+    /// Renders the current page to HTML and computed bounds. Revisions are
+    /// requested in order and every request re-reads the session, so a stale
+    /// result can never replace a newer one.
+    func refreshCanvas() {
+        guard let session, let path = currentPath, session === self.session else { return }
+        guard let page = snapshot?.document.pages.first else {
+            canvas = .empty
+            canvasTaskState = nil
+            canvasGenerating = false
+            return
+        }
+        canvasTaskState?.task?.cancel()
+        canvasTaskState = nil
+        guard operation == nil else {
+            canvasQueued = true
+            return
+        }
+        canvasQueued = false
+        let request = CanvasTaskRequest(session: session, page: CanvasPage(id: page.id, rootId: page.rootId), scale: canvasScale)
+        let item = CanvasTaskState(request: request)
+        canvasTaskState = item
+        canvasGenerating = true
+        item.task = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let html = try request.session.previewHtml(pageId: request.page.id)
+                    let boundsJSON = try request.session.layoutJson(pageId: request.page.id)
+                    guard let bounds = try? decodeJSON([CanvasNodeBounds].self, boundsJSON) else {
+                        throw NSError(domain: "AIConstructor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Не удалось прочитать вычисленные границы узлов."])
+                    }
+                    return try CanvasContent.prepared(html: html, nodes: bounds, bridge: CanvasBridge.script, scale: request.scale)
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.finishCanvas(result, request: request, path: path)
+        }
+    }
+
+    private func finishCanvas(_ result: Result<CanvasContent, Error>, request: CanvasTaskRequest, path: URL) {
+        guard let state = canvasTaskState, state.request.session === request.session, currentPath?.path == path.path else { return }
+        canvasTaskState = nil
+        canvasGenerating = false
+        switch result {
+        case .success(let content):
+            canvas = content
+            canvasNotice = nil
+            selectedNodeIds = selectedNodeIds.filter { id in content.nodes.contains { $0.id == id } }
+        case .failure(let error):
+            // A missing font or asset is a document problem that the user
+            // fixes; keep the last rendered page and say why it is stale.
+            if canvas.html.isEmpty { canvas = .empty }
+            canvasNotice = "Холст не обновлён: \(canvasReadableError(error))"
+        }
+        if canvasQueued { refreshCanvas() }
+    }
+
+    /// The page is pre-scaled into its HTML, so a new scale means new HTML.
+    func setCanvasScale(_ scale: Double) {
+        let rounded = (scale * 1000).rounded() / 1000
+        guard rounded > 0, rounded != canvasScale else { return }
+        canvasScale = rounded
+        refreshCanvas()
+    }
+
+    func selectNode(_ id: String?, extending: Bool) {
+        guard let id else {
+            if extending { selectedNodeIds.formIntersection([]) }
+            selectedNodeIds = []
+            canvasPreview = nil
+            return
+        }
+        if extending {
+            if selectedNodeIds.contains(id) { selectedNodeIds.remove(id) } else { selectedNodeIds.insert(id) }
+        } else if !selectedNodeIds.contains(id) || selectedNodeIds.count > 1 {
+            selectedNodeIds = [id]
+        }
+        canvasPreview = nil
+    }
+
+    func clearSelection() {
+        selectedNodeIds = []
+        canvasPreview = nil
+    }
+
+    private func canvasNode(_ id: String) -> CanvasNodeBounds? {
+        canvas.nodes.first { $0.id == id }
+    }
+
+    /// Starts a drag gesture from the topmost visible node under the point.
+    /// The gesture is committed once on release, so it is one undo step.
+    func beginCanvasGesture(_ kind: CanvasGestureKind, at point: CGPoint, hit: CanvasHit, extending: Bool) {
+        guard !writesBlocked, operation == nil, !canvasGenerating, let snapshot, let root = snapshot.root else { return }
+        let ids: [String]
+        switch kind {
+        case .move:
+            selectNode(hit.id, extending: extending)
+            guard selectedNodeIds.contains(hit.id) else { return }
+            ids = orderedSelection()
+            if ids.count > 1, canvas.nodes.first(where: { $0.id == ids[0] })?.parentId != canvas.nodes.first(where: { $0.id == hit.id })?.parentId {
+                canvasNotice = "Перемещать вместе можно только элементы одного родителя."
+                return
+            }
+        case .resize, .rotate:
+            if !selectedNodeIds.contains(hit.id) { selectNode(hit.id, extending: false) }
+            guard selectedNodeIds == [hit.id] else {
+                canvasNotice = "Изменение размера и поворот применяются к одному выделенному элементу."
+                return
+            }
+            ids = [hit.id]
+        }
+        let nodes = ids.compactMap { canvasNode($0) }
+        guard nodes.count == ids.count, let primary = nodes.first(where: { $0.id == hit.id }) else { return }
+        for id in ids where id == root.id {
+            if kind != .move {
+                canvasNotice = "Корневой фрейм нельзя изменять этим жестом."
+                return
+            }
+        }
+        let flowParent = primary.parentId.flatMap { parent in canvas.nodes.first { $0.id == parent } }
+        if kind == .move, nodes.count > 1, flowParent != nil, primary.inFlow {
+            canvasNotice = "Внутри потока перемещается один элемент: он меняет порядок среди соседей."
+            return
+        }
+        pendingGesture = CanvasGesture(kind: kind, ids: ids, start: point, bounds: nodes, baseRevision: snapshot.document.revision,
+                                       baseFingerprint: snapshot.fingerprint, inFlow: primary.inFlow, rotation: primary.rotation)
+        canvasPreview = CanvasRect(x: primary.x, y: primary.y, w: primary.w, h: primary.h)
+        canvasNotice = nil
+    }
+
+    func updateCanvasGesture(_ kind: CanvasGestureKind, at point: CGPoint) {
+        guard let gesture = pendingGesture, gesture.kind == kind else { return }
+        let dx = point.x - gesture.start.x
+        let dy = point.y - gesture.start.y
+        switch kind {
+        case .move:
+            let base = gesture.bounds.first { gesture.ids.first == $0.id } ?? gesture.bounds[0]
+            canvasPreview = CanvasRect(x: base.x + dx, y: base.y + dy, w: base.w, h: base.h)
+        case .resize:
+            let base = gesture.bounds[0]
+            canvasPreview = CanvasRect(x: base.x, y: base.y, w: max(1, base.w + dx), h: max(1, base.h + dy))
+        case .rotate:
+            let base = gesture.bounds[0]
+            let startAngle = atan2(gesture.start.y - (base.y + base.h / 2), gesture.start.x - (base.x + base.w / 2))
+            let angle = atan2(point.y - (base.y + base.h / 2), point.x - (base.x + base.w / 2))
+            let degrees = (angle - startAngle) * 180 / .pi
+            canvasRotation = (base.rotation + degrees).truncatingRemainder(dividingBy: 360)
+        }
+    }
+
+    func endCanvasGesture(_ kind: CanvasGestureKind, at point: CGPoint) {
+        guard let gesture = pendingGesture, gesture.kind == kind else { return }
+        updateCanvasGesture(kind, at: point)
+        let preview = canvasPreview
+        let rotation = canvasRotation
+        pendingGesture = nil
+        canvasPreview = nil
+        canvasRotation = nil
+        guard let preview, let operations = gestureOperations(gesture, preview: preview, rotation: rotation) else { return }
+        if operations.isEmpty { return }
+        applyCanvasOperations(operations, scope: gesture.ids, baseRevision: gesture.baseRevision, baseFingerprint: gesture.baseFingerprint)
+    }
+
+    func cancelCanvasGesture() {
+        pendingGesture = nil
+        canvasPreview = nil
+        canvasRotation = nil
+    }
+
+    var canvasEditing: Bool {
+        pendingGesture != nil
+    }
+
+    private func orderedSelection() -> [String] {
+        canvas.nodes.filter { selectedNodeIds.contains($0.id) }.map(\.id)
+    }
+
+    private func gestureOperations(_ gesture: CanvasGesture, preview: CanvasRect, rotation: Double?) -> [[String: Any]]? {
+        switch gesture.kind {
+        case .move:
+            var operations: [[String: Any]] = []
+            for bounds in gesture.bounds {
+                let x = round(bounds.x + preview.x - (gesture.bounds.first(where: { $0.id == gesture.ids.first })?.x ?? preview.x))
+                let y = round(bounds.y + preview.y - (gesture.bounds.first(where: { $0.id == gesture.ids.first })?.y ?? preview.y))
+                if x != bounds.x {
+                    operations.append(["type": "setProperty", "nodeId": bounds.id, "path": "/layout/x", "value": x])
+                }
+                if y != bounds.y {
+                    operations.append(["type": "setProperty", "nodeId": bounds.id, "path": "/layout/y", "value": y])
+                }
+            }
+            return operations
+        case .resize:
+            guard let bounds = gesture.bounds.first else { return nil }
+            let w = round(preview.w)
+            let h = round(preview.h)
+            var operations: [[String: Any]] = []
+            if w != bounds.w { operations.append(["type": "setProperty", "nodeId": bounds.id, "path": "/layout/w", "value": w]) }
+            if h != bounds.h { operations.append(["type": "setProperty", "nodeId": bounds.id, "path": "/layout/h", "value": h]) }
+            return operations
+        case .rotate:
+            guard let bounds = gesture.bounds.first, let rotation else { return nil }
+            let value = ((rotation.truncatingRemainder(dividingBy: 360)) + 360).truncatingRemainder(dividingBy: 360)
+            return [["type": "setProperty", "nodeId": bounds.id, "path": "/style/rotate", "value": value]]
+        }
+    }
+
+    private func applyCanvasOperations(_ operations: [[String: Any]], scope: [String], baseRevision: UInt64, baseFingerprint: String) {
+        guard let session else { return }
+        let transaction: [String: Any] = [
+            "transactionId": UUID().uuidString.lowercased(),
+            "baseRevision": baseRevision,
+            "baseFingerprint": baseFingerprint,
+            "origin": "user",
+            "scopeNodeIds": scope,
+            "operations": operations
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: transaction, options: [.sortedKeys])
+            guard let json = String(data: data, encoding: .utf8) else { throw CocoaError(.fileWriteInapplicableStringEncoding) }
+            let previousUnsaved = possibleUnsaved
+            possibleUnsaved = true
+            let control = newOperationControl()
+            perform("Сохранение изменений…", control: control, work: {
+                try editAndSaveSnapshot(session) {
+                    try session.applyTransactionAndSaveControlled(transactionJson: json, control: control)
+                }
+            }, failure: { error in
+                if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
+            }) { result in
+                if let error = result.error {
+                    // The core already refuses conflicting transactions, so the
+                    // snapshot is authoritative and the canvas must follow it.
+                    self.accept(result)
+                    self.error = [error, "Действие не сохранено; холст показывает состояние проекта."].joined(separator: "\n")
+                } else {
+                    self.accept(result)
+                }
+                self.refreshCanvas()
+            }
+        } catch {
+            self.error = readableError(error)
+        }
+    }
+
+
+    private func canvasReadableError(_ error: Error) -> String {
+        if let coreError = error as? CoreError, case let .Failure(code, message) = coreError {
+            switch code {
+            case "MISSING_FONT": return "не найден шрифт проекта. \(message)"
+            case "MISSING_ASSET": return "не найден ресурс страницы. \(message)"
+            default: break
+            }
+        }
+        return readableError(error)
     }
 }

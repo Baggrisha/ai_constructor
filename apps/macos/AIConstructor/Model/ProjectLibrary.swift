@@ -133,6 +133,10 @@ final class ProjectLibrary: ObservableObject {
     }
     func endTrash(_ path: String) { trashing.remove(path) }
 
+    func firstWorkspace() -> WorkspaceModel? {
+        workspaces.compactMap(\.value).first
+    }
+
     func register(_ workspace: WorkspaceModel) {
         workspaces.removeAll { $0.value == nil }
         if !workspaces.contains(where: { $0.value === workspace }) {
