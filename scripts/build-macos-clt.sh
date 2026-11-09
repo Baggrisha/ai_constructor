@@ -15,9 +15,31 @@ trap 'rm -rf -- "$STAGE"' EXIT
 STAGED_APP="$STAGE/AIConstructor.app"
 mkdir -p "$STAGED_APP/Contents/MacOS"
 cp apps/macos/Info.plist "$STAGED_APP/Contents/Info.plist"
+SOURCES=(
+  apps/macos/AIConstructor/App/AIConstructorApp.swift
+  apps/macos/AIConstructor/App/WindowLayout.swift
+  apps/macos/AIConstructor/Model/SnapshotModel.swift
+  apps/macos/AIConstructor/Model/ProjectLibrary.swift
+  apps/macos/AIConstructor/Model/WorkspaceModel.swift
+  apps/macos/AIConstructor/Views/ProjectBrowser.swift
+  apps/macos/AIConstructor/Views/ChatsPanel.swift
+  apps/macos/AIConstructor/Views/AssetsPanel.swift
+  apps/macos/AIConstructor/Views/DiagnosticsPanel.swift
+  apps/macos/AIConstructor/Views/Components.swift
+  apps/macos/AIConstructor/Views/Sheets/ConflictResolutionSheet.swift
+  apps/macos/AIConstructor/Views/Sheets/RecoveryResolutionSheet.swift
+)
+missing=0
+for source in "${SOURCES[@]}"; do
+  if [ ! -f "$source" ]; then
+    printf 'Missing source: %s\n' "$source" >&2
+    missing=1
+  fi
+done
+[ "$missing" -eq 0 ] || exit 1
 xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 \
   -sdk "$SDK" -I "$ROOT/apps/macos/Generated" \
-  apps/macos/AIConstructor/AIConstructorApp.swift apps/macos/Generated/aic_bridge.swift \
+  "${SOURCES[@]}" apps/macos/Generated/aic_bridge.swift \
   "$ROOT/target/debug/libaic_bridge.a" \
   -framework AppKit -framework SwiftUI -framework Security -framework CoreFoundation \
   -lc++ -lresolv -o "$STAGED_APP/Contents/MacOS/AIConstructor"
