@@ -29,8 +29,62 @@ enum CanvasBridge {
       }, true);
       document.addEventListener('mousedown', function (event) { event.preventDefault(); }, true);
       document.addEventListener('keydown', function (event) { event.preventDefault(); }, true);
+      // Applies a style or text change to the generated page without reloading
+      // it, so the core stays the only writer of the document.
+      // Text properties stay on the node box; the flex label inside it
+      // inherits font, colour and wrap from there.
+      window.aicPatch = function (id, key, value) {
+        var element = document.querySelector('[data-id="' + id + '"]');
+        if (!element) { return; }
+        if (key === 'text') {
+          element.textContent = value === null ? '' : value;
+          return;
+        }
+        element.style.setProperty(key, value === null ? '' : value);
+      };
     })();
     """
+}
+
+struct CanvasPatch: Equatable {
+    let id: String
+    let key: String
+    let value: String?
+
+    init(_ id: String, _ key: String, _ value: String?) {
+        self.id = id
+        self.key = key
+        self.value = value
+    }
+
+    var script: String {
+        let value = value.map { "\"\(CanvasPatch.escape($0))\"" } ?? "null"
+        return "window.aicPatch(\"\(CanvasPatch.escape(id))\", \"\(CanvasPatch.escape(key))\", \(value));"
+    }
+
+    private static func escape(_ text: String) -> String {
+        var output = ""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": output += "\\\""
+            case "\\": output += "\\\\"
+            case "<": output += "\\u003c"
+            case ">": output += "\\u003e"
+            case "&": output += "\\u0026"
+            case "\n": output += "\\n"
+            case "\r": output += "\\r"
+            case "\u{2028}": output += "\\u2028"
+            case "\u{2029}": output += "\\u2029"
+            default:
+                if scalar.value < 0x20 {
+                    output += String(format: "\\u%04x", scalar.value)
+                } else {
+                    output.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return output
+    }
 }
 
 enum CanvasMessage {
@@ -54,6 +108,16 @@ struct CanvasWebView: NSViewRepresentable {
     let html: String
     let scale: Double
     let onMessage: (CanvasMessage) -> Void
+    private let patches: [CanvasPatch]
+    private let onView: @MainActor (WKWebView?) -> Void
+
+    init(html: String, scale: Double, patches: [CanvasPatch] = [], onView: @escaping @MainActor (WKWebView?) -> Void = { _ in }, onMessage: @escaping (CanvasMessage) -> Void) {
+        self.html = html
+        self.scale = scale
+        self.patches = patches
+        self.onView = onView
+        self.onMessage = onMessage
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -74,16 +138,26 @@ struct CanvasWebView: NSViewRepresentable {
         view.allowsBackForwardNavigationGestures = false
         context.coordinator.view = view
         context.coordinator.onMessage = onMessage
+        context.coordinator.patches = { patches }
         context.coordinator.loadedHTML = html
         context.coordinator.load(html)
+        onView(view)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
         context.coordinator.onMessage = onMessage
-        guard context.coordinator.loadedHTML != html else { return }
-        context.coordinator.loadedHTML = html
-        context.coordinator.load(html)
+        if context.coordinator.loadedHTML != html {
+            context.coordinator.loadedHTML = html
+            context.coordinator.load(html)
+        }
+        onView(view)
+    }
+
+    /// Applies small edits to the loaded page without reloading it.
+    static func patch(_ patches: [CanvasPatch], in view: WKWebView?) {
+        guard let view, !patches.isEmpty else { return }
+        view.evaluateJavaScript(patches.map(\.script).joined(separator: "\n")) { _, _ in }
     }
 
     static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
@@ -101,6 +175,8 @@ struct CanvasWebView: NSViewRepresentable {
         weak var view: WKWebView?
         var onMessage: ((CanvasMessage) -> Void)?
         var loadedHTML: String?
+        /// Re-applied after each load: the page starts from the core's HTML.
+        var patches: () -> [CanvasPatch] = { [] }
         private var generation = 0
 
         func load(_ html: String) {
@@ -127,6 +203,10 @@ struct CanvasWebView: NSViewRepresentable {
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             if let html = loadedHTML { load(html) }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            CanvasWebView.patch(patches(), in: webView)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {

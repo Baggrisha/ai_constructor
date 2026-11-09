@@ -3414,6 +3414,39 @@ fn layout_json_reports_flow_positions_and_computed_sizes() {
 }
 
 #[test]
+fn preview_html_clips_labels_and_centres_button_text() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Labels").unwrap();
+    let root = root(&session);
+    let text = Uuid::new_v4();
+    let button = Uuid::new_v4();
+    let mut text_node = node(text, root, "text");
+    text_node["content"]["text"] = json!("Длинный заголовок, который не помещается в рамку");
+    text_node["layout"]["w"] = json!(120);
+    text_node["layout"]["h"] = json!(24);
+    let mut button_node = node(button, root, "button");
+    button_node["content"]["text"] = json!("Сохранить");
+    apply_ok(
+        &session,
+        &[root, text, button],
+        json!([
+            {"type": "insertNode", "parentId": root, "index": 0, "node": text_node},
+            {"type": "insertNode", "parentId": root, "index": 1, "node": button_node}
+        ]),
+    );
+    let html = session.preview_html(None).unwrap();
+    for id in [text, button] {
+        let node_html = html.split(&format!("data-id=\"{id}\"")).nth(1).unwrap();
+        let style = node_html.split("style=\"").nth(1).unwrap().split('"').next().unwrap();
+        assert!(style.contains("overflow:hidden;"), "{id}: {style}");
+    }
+    assert!(html.contains(".node.k-button .text"));
+    let button_html = html.split(&format!("data-id=\"{button}\"")).nth(1).unwrap();
+    assert!(button_html.contains("<span class=\"text\">Сохранить</span>"));
+}
+
+#[test]
 fn preview_html_is_deterministic_self_contained_and_escaped() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("project");

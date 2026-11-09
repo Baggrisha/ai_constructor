@@ -110,6 +110,23 @@ fn number(value: f64) -> String {
     text
 }
 
+fn node_kind(node: &Node) -> &'static str {
+    match node.kind {
+        NodeKind::Frame => "k-frame",
+        NodeKind::Group => "k-group",
+        NodeKind::Text => "k-text",
+        NodeKind::Image => "k-image",
+        NodeKind::Vector => "k-vector",
+        NodeKind::Button => "k-button",
+        NodeKind::Input => "k-input",
+        NodeKind::Textarea => "k-textarea",
+        NodeKind::Checkbox => "k-checkbox",
+        NodeKind::Select => "k-select",
+        NodeKind::ComponentInstance => "k-instance",
+        NodeKind::CodeComponent => "k-code",
+    }
+}
+
 fn class_token(prefix: char, id: Uuid) -> String {
     format!("{prefix}{}", id.simple())
 }
@@ -349,9 +366,13 @@ impl<'a> Styles<'a> {
                 Some(TextWrap::None) => "white-space:pre;",
                 Some(TextWrap::Word | TextWrap::WordOrGlyph) | None => "white-space:pre-wrap;",
             });
+            // Without a line limit the label still must not spill outside its
+            // frame: it is clipped at the box edge instead of overlapping
+            // neighbours.
+            css.push_str("overflow:hidden;");
             if let Some(lines) = style.max_lines {
                 css.push_str(&format!(
-                    "display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:{lines};overflow:hidden;"
+                    "display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:{lines};"
                 ));
             }
         }
@@ -514,7 +535,8 @@ impl<'a> Renderer<'a> {
             .unwrap_or_else(NodeStyle::default);
         let css = self.styles.style(node, &style, &bounds)?;
         let mut html = format!(
-            "<div class=\"node {class}\" data-id=\"{data_id}\" style=\"{}\">",
+            "<div class=\"node {class} {}\" data-id=\"{data_id}\" style=\"{}\">",
+            node_kind(node),
             xml_escape(&css)
         );
         match node.kind {
@@ -720,7 +742,7 @@ impl Document {
         html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'\"><title>");
         html.push_str(&xml_text(&page.name));
         html.push_str("</title><style>\n");
-        faces.push_str("html,body{margin:0;padding:0;background:#ffffff;}\n.page{position:relative;overflow:hidden;}\n.node{position:absolute;box-sizing:border-box;margin:0;padding:0;border:0;}\n.text,.placeholder{display:block;width:100%;height:100%;white-space:inherit;}\n.node img{display:block;width:100%;height:100%;}\n.node svg{display:block;}\n");
+        faces.push_str("html,body{margin:0;padding:0;background:#ffffff;}\n.page{position:relative;overflow:hidden;}\n.node{position:absolute;box-sizing:border-box;margin:0;padding:0;border:0;}\n.text,.placeholder{display:block;width:100%;height:100%;white-space:inherit;}\n.node.k-button .text,.node.k-input .placeholder,.node.k-textarea .placeholder,.node.k-select .placeholder{display:flex;align-items:center;justify-content:center;padding:0 12px;text-align:center;box-sizing:border-box;}\n.node.k-input .placeholder,.node.k-textarea .placeholder,.node.k-select .placeholder{justify-content:flex-start;text-align:left;}\n.node.k-textarea .placeholder{align-items:flex-start;padding-top:10px;}\n.node img{display:block;width:100%;height:100%;}\n.node svg{display:block;}\n");
         html.push_str(&faces);
         html.push_str("</style></head><body><div id=\"canvas\" style=\"position:relative;width:");
         html.push_str(&number(root.w.max(0.0)));

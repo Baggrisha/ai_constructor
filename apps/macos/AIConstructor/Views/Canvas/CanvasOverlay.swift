@@ -62,6 +62,7 @@ struct CanvasOverlay: View {
     let onEnd: (CanvasGestureKind, CGPoint) -> Void
     let onPlainHover: (String?) -> Void
     let onDeviceHover: (CGPoint) -> Void
+    let onDoubleClick: (CGPoint) -> Void
 
     private static let handleSize: CGFloat = 7
 
@@ -83,7 +84,7 @@ struct CanvasOverlay: View {
             Color.white.opacity(0.001)
                 .frame(width: size.width, height: size.height)
                 .contentShape(Rectangle())
-                .modifier(MouseGesture(onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onPlainHover))
+                .modifier(MouseGesture(onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onPlainHover, onDoubleClick: onDoubleClick))
                 DeviceHoverCatcher(onMove: onDeviceHover)
             if geometry.scale >= 0.5 {
                 ForEach(highlighted) { node in
@@ -254,9 +255,11 @@ struct MouseGesture: ViewModifier {
     let onDrag: @MainActor (CanvasGestureKind, CGPoint) -> Void
     let onEnd: @MainActor (CanvasGestureKind, CGPoint) -> Void
     let onHover: @MainActor (String?) -> Void
+    var onDoubleClick: (@MainActor (CGPoint) -> Void)?
 
     func body(content: Content) -> some View {
-        content.background(MouseEventCatcher(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onHover))
+        content.background(MouseEventCatcher(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd,
+                                             onHover: onHover, onDoubleClick: onDoubleClick))
     }
 }
 
@@ -266,15 +269,38 @@ struct MouseEventCatcher: NSViewRepresentable {
     let onDrag: (CanvasGestureKind, CGPoint) -> Void
     let onEnd: (CanvasGestureKind, CGPoint) -> Void
     let onHover: (String?) -> Void
+    var onDoubleClick: (@MainActor (CGPoint) -> Void)?
 
-    func makeNSView(context: Context) -> MouseCatcherView {
-        let view = MouseCatcherView()
-        view.configure(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onHover)
-        return view
-    }
+    func makeNSView(context: Context) -> MouseCatcherView { MouseCatcherView() }
 
     func updateNSView(_ view: MouseCatcherView, context: Context) {
+        EditingFocus.shared.remember(view)
+        view.onDoubleClick = onDoubleClick.map { action in
+            { [weak view] in
+                guard let view else { return }
+                let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+                action(view.convert(center, from: nil))
+            }
+        }
         view.configure(kind: kind, onPress: onPress, onDrag: onDrag, onEnd: onEnd, onHover: onHover)
+    }
+}
+
+/// The remembered first responder of the window before in-place text
+/// editing, so Esc and Enter hand focus back to where it was.
+@MainActor
+final class EditingFocus {
+    static let shared = EditingFocus()
+    private weak var view: NSView?
+
+    func remember(_ view: NSView?) {
+        guard let view, view.window?.firstResponder !== view else { return }
+        self.view = view
+    }
+
+    func restore() {
+        guard let view, let window = view.window else { return }
+        window.makeFirstResponder(view)
     }
 }
 
@@ -284,6 +310,10 @@ final class MouseCatcherView: NSView {
     var onDrag: ((CanvasGestureKind, CGPoint) -> Void)?
     var onEnd: ((CanvasGestureKind, CGPoint) -> Void)?
     var onHover: ((String?) -> Void)?
+    var onDoubleClick: (() -> Void)?
+    var onEnter: (() -> Void)?
+    var onEscape: (() -> Void)?
+    private var lastClick: (time: TimeInterval, point: CGPoint)?
 
     private var pressed = false
     private var dragging = false
@@ -291,6 +321,7 @@ final class MouseCatcherView: NSView {
     private static let threshold: CGFloat = 3
 
     override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
 
     func configure(kind: CanvasGestureKind,
                    onPress: @escaping @MainActor (CGPoint, CGPoint, NSEvent.ModifierFlags) -> Void,
@@ -311,9 +342,19 @@ final class MouseCatcherView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         pressed = true
         dragging = false
         start = point(event)
+        let now = event.timestamp
+        if let last = lastClick, now - last.time < NSEvent.doubleClickInterval,
+           hypot(start.x - last.point.x, start.y - last.point.y) < 4 {
+            lastClick = nil
+            pressed = false
+            onDoubleClick?()
+            return
+        }
+        lastClick = (now, start)
         onPress?(start, event.locationInWindow, event.modifierFlags)
     }
 
@@ -330,6 +371,12 @@ final class MouseCatcherView: NSView {
         pressed = false
         if dragging { onEnd?(kind, point(event)) }
         dragging = false
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onEscape?(); return }
+        if event.keyCode == 36 || event.keyCode == 76 { onEnter?(); return }
+        super.keyDown(with: event)
     }
 
     override func resetCursorRects() {

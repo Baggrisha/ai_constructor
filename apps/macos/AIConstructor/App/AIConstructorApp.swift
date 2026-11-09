@@ -14,8 +14,60 @@ struct AIConstructorApp: App {
         }
         .defaultSize(width: WindowLayout.defaultWidth, height: WindowLayout.defaultHeight)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button("Отменить") { WorkspaceCommands.shared.undo() }
+                    .keyboardShortcut("z", modifiers: .command)
+                Button("Повторить") { WorkspaceCommands.shared.redo() }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+            }
+            CommandGroup(replacing: .saveItem) {
+                Button("Сохранить") { WorkspaceCommands.shared.save() }
+                    .keyboardShortcut("s", modifiers: .command)
+            }
+            CommandGroup(replacing: .textEditing) {
+                Button("Найти и заменить…") { WorkspaceCommands.shared.search = true }
+                    .keyboardShortcut("f", modifiers: .command)
+            }
+            CommandMenu("Вставка") {
+                ForEach(WorkspaceCommands.insertKinds, id: \.self) { kind in
+                    Button(WorkspaceCommands.title(kind)) { WorkspaceCommands.shared.insert(kind: kind) }
+                }
+            }
+        }
         Settings {
             RetentionSettingsView()
+        }
+    }
+}
+
+/// Menu commands reach the front window's workspace through this registry:
+/// the model is owned by the view, the menus live outside it.
+@MainActor
+final class WorkspaceCommands {
+    static let shared = WorkspaceCommands()
+    static let insertKinds = InsertedNodeTemplate.kinds
+
+    weak var model: WorkspaceModel?
+    var search = false
+
+    func undo() { model?.undo() }
+    func redo() { model?.redo() }
+    func save() { model?.save() }
+    func insert(kind: String) { model?.insertNode(kind) }
+
+    static func title(_ kind: String) -> String {
+        switch kind {
+        case "frame": return "Фрейм"
+        case "text": return "Текст"
+        case "image": return "Изображение"
+        case "vector": return "Вектор"
+        case "button": return "Кнопка"
+        case "input": return "Поле ввода"
+        case "textarea": return "Многострочное поле"
+        case "checkbox": return "Флажок"
+        case "select": return "Список"
+        default: return kind
         }
     }
 }

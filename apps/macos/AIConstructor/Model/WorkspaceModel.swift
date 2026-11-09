@@ -5,7 +5,9 @@ import SwiftUI
 
 @MainActor
 final class WorkspaceModel: ObservableObject {
-    @Published var snapshot: Snapshot?
+    /// Every write goes through `applySnapshot` so the inspector draft is
+    /// dropped when the document moves under it.
+    @Published private(set) var snapshot: Snapshot?
     @Published var checkpoints: [Checkpoint] = []
     @Published var checkpointAwaitingModeConfirmation: Checkpoint?
     @Published var chats: [Chat] = []
@@ -37,6 +39,14 @@ final class WorkspaceModel: ObservableObject {
     @Published var canvasNotice: String?
     @Published private(set) var canvasPreview: CanvasRect?
     @Published private(set) var canvasRotation: Double?
+    /// Pending inspector input, one node at a time.
+    /// Pending inspector input; writes bump `draftVersion` so views that read
+    /// `inspectorValue` re-render.
+    private(set) var inspectorDraft: InspectorDraft?
+    @Published private(set) var draftVersion = 0
+    /// CSS patches for the pending input, applied to the loaded page live.
+    @Published private(set) var canvasPatches: [CanvasPatch] = []
+    private var inspectorCommitTask: Task<Void, Never>?
     private var canvasTaskState: CanvasTaskState?
     private var canvasQueued = false
     private var canvasScale = 0.0
@@ -55,6 +65,7 @@ final class WorkspaceModel: ObservableObject {
 
     var hasUnsavedData: Bool {
         if snapshot?.dirty == true || possibleUnsaved || deferredFrameDraft != nil || frameDraftNeedsReview { return true }
+        if inspectorDraft != nil { return true }
         guard let frameDraft else { return false }
         guard let root = snapshot?.root else { return true }
         return !frameDraft.matches(root)
@@ -63,6 +74,7 @@ final class WorkspaceModel: ObservableObject {
     var closeBlockReason: String? {
         if operation != nil { return "Дождитесь завершения операции перед закрытием окна или приложения." }
         if diagnosticsInFlight { return "Проверка проекта завершается. Дождитесь результата и повторите закрытие." }
+        if inspectorDraft != nil { return "Есть несохранённый ввод инспектора" }
         if deferredFrameDraft != nil {
             return "Верните отложенный черновик фрейма и завершите ввод перед закрытием."
         }
@@ -234,7 +246,7 @@ final class WorkspaceModel: ObservableObject {
         sessionProjectIds[url.path] = loaded.snapshot.document.projectId
         currentPath = url
         invalidateFrameEditor()
-        snapshot = loaded.snapshot
+        applySnapshot(loaded.snapshot)
         possibleUnsaved = loaded.snapshot.dirty
         checkpoints = []
         checkpointAwaitingModeConfirmation = nil
@@ -430,7 +442,7 @@ final class WorkspaceModel: ObservableObject {
             watchWarning = nil
             currentPath = nil
             invalidateFrameEditor()
-            snapshot = nil
+            applySnapshot(nil)
             possibleUnsaved = false
             checkpoints = []
             checkpointAwaitingModeConfirmation = nil
@@ -477,7 +489,7 @@ final class WorkspaceModel: ObservableObject {
         if currentPath?.path == path && (snapshot?.dirty == true || possibleUnsaved) {
             let control = newOperationControl()
             perform("Сохранение перед закрытием…", control: control, work: { try saveSnapshot(closing, control: control) }) { result in
-                self.snapshot = result.snapshot
+                self.applySnapshot(result.snapshot)
                 self.possibleUnsaved = result.snapshot.dirty
                 if let error = result.error {
                     self.error = "Проект не закрыт: изменения не сохранены. \(error)"
@@ -540,7 +552,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func accept(_ result: SaveResult, context: String? = nil) {
-        snapshot = result.snapshot
+        applySnapshot(result.snapshot)
         possibleUnsaved = result.snapshot.dirty
         if let error = result.error {
             self.error = [context, "Операция не завершена: \(error)\nСостояние редактора сохранено в памяти."].compactMap { $0 }.joined(separator: "\n")
@@ -671,6 +683,10 @@ final class WorkspaceModel: ObservableObject {
 
     func save() {
         guard operation == nil, !writesBlocked, deferredFrameDraft == nil, let session else { return }
+        if inspectorDraft != nil {
+            error = "Есть несохранённый ввод инспектора. Завершите ввод или явно отбросьте его черновик."
+            return
+        }
         if frameDraftNeedsReview {
             error = "Проверьте отложенный черновик и нажмите «Применить»."
             return
@@ -753,7 +769,7 @@ final class WorkspaceModel: ObservableObject {
             if wasCanceled(error) { self.possibleUnsaved = previousUnsaved }
         }) { result in
             if !allowMissingModes && result.errorCode == "CHECKPOINT_MODE_CONFIRMATION_REQUIRED" {
-                self.snapshot = result.snapshot
+                self.applySnapshot(result.snapshot)
                 self.possibleUnsaved = result.snapshot.dirty
                 self.checkpointAwaitingModeConfirmation = checkpoint
             } else {
@@ -969,7 +985,7 @@ final class WorkspaceModel: ObservableObject {
             _ = try session.importAssetControlled(path: url.path, control: control)
             return try decodeJSON(Snapshot.self, session.snapshotJson())
         }) {
-            self.snapshot = $0
+            self.applySnapshot($0)
             self.watchChanged()
         }
     }
@@ -988,7 +1004,7 @@ final class WorkspaceModel: ObservableObject {
             return try decodeJSON(Snapshot.self, session.snapshotJson())
         }) {
             let wasReadOnly = self.snapshot?.readOnly == true
-            self.snapshot = $0
+            self.applySnapshot($0)
             if wasReadOnly && !$0.readOnly { self.refreshCheckpoints() }
             self.watchChanged()
         }
@@ -1066,7 +1082,7 @@ final class WorkspaceModel: ObservableObject {
 
     private func applyResolvedSnapshot(_ snapshot: Snapshot, completion: () -> Void) {
         invalidateFrameEditor()
-        self.snapshot = snapshot
+        applySnapshot(snapshot)
         possibleUnsaved = snapshot.dirty
         diagnostics = nil
         diagnosticsError = nil
@@ -1146,7 +1162,8 @@ final class WorkspaceModel: ObservableObject {
     /// result can never replace a newer one.
     func refreshCanvas() {
         guard let session, let path = currentPath, session === self.session else { return }
-        guard let page = snapshot?.document.pages.first else {
+        guard let page = snapshot?.document.pages.first(where: { $0.id == selectedPageId })
+                ?? snapshot?.document.pages.first else {
             canvas = .empty
             canvasTaskState = nil
             canvasGenerating = false
@@ -1206,6 +1223,8 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectNode(_ id: String?, extending: Bool) {
+        commitDraft()
+        if textEditingId != nil { textEditingId = nil; EditingFocus.shared.restore() }
         guard let id else {
             if extending { selectedNodeIds.formIntersection([]) }
             selectedNodeIds = []
@@ -1221,6 +1240,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func clearSelection() {
+        commitDraft()
         selectedNodeIds = []
         canvasPreview = nil
     }
@@ -1385,6 +1405,405 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    // MARK: Inspector draft (M1.3)
+
+    /// Inspector input is collected per keystroke and committed as one
+    /// transaction. Patches show it on the loaded page without reloading.
+    nonisolated static let inspectorCommitDelay: UInt64 = 500_000_000
+
+    /// The node the inspector edits: exactly one selected node.
+    var inspectorNodeId: String? {
+        selectedNodeIds.count == 1 ? selectedNodeIds.first : nil
+    }
+
+    func editProperty(_ path: String, value: Any?) {
+        guard !writesBlocked, operation == nil || operation == "Сохранение изменений…",
+              let snapshot, let nodeId = inspectorNodeId else { return }
+        if let draft = inspectorDraft, draft.nodeId != nodeId { discardDraft() }
+        var draft = inspectorDraft ?? InspectorDraft(nodeId: nodeId,
+                                                     baseRevision: snapshot.document.revision,
+                                                     baseFingerprint: snapshot.fingerprint)
+        draft.set(path, value)
+        inspectorDraft = draft
+        draftVersion += 1
+        rebuildCanvasPatches()
+        scheduleInspectorCommit()
+    }
+
+    /// Commits the pending input `after` nanoseconds of inactivity; every call
+    /// restarts the timer, so typing produces one transaction.
+    func scheduleInspectorCommit(after delay: UInt64 = WorkspaceModel.inspectorCommitDelay) {
+        inspectorCommitTask?.cancel()
+        guard inspectorDraft != nil else { return }
+        inspectorCommitTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.inspectorCommitTask = nil
+            self.commitDraft()
+        }
+    }
+
+    func cancelScheduledCommit() {
+        inspectorCommitTask?.cancel()
+        inspectorCommitTask = nil
+    }
+
+    /// Commits the pending input now if it differs from the document.
+    func commitDraft() {
+        cancelScheduledCommit()
+        guard let draft = inspectorDraft else { return }
+        guard operation == nil, session != nil, let snapshot, !snapshot.readOnly else { return }
+        guard draft.baseRevision == snapshot.document.revision, draft.baseFingerprint == snapshot.fingerprint,
+              let node = rawNode(draft.nodeId) else {
+            discardDraft()
+            error = "Состояние проекта изменилось; ввод инспектора не применён."
+            return
+        }
+        var operations: [[String: Any]] = []
+        for path in draft.values.keys.sorted() {
+            let value = draft.value(path)
+            if let current = InspectorJSON.value(in: node, path: path), InspectorJSON.equal(current, value ?? NSNull()) { continue }
+            operations.append(["type": "setProperty", "nodeId": draft.nodeId, "path": path, "value": value ?? NSNull()])
+        }
+        inspectorDraft = nil
+        draftVersion += 1
+        canvasPatches = []
+        guard !operations.isEmpty else { return }
+        applyInspectorOperations(operations, scope: [draft.nodeId], baseRevision: draft.baseRevision, baseFingerprint: draft.baseFingerprint)
+    }
+
+    func discardDraft() {
+        cancelScheduledCommit()
+        guard inspectorDraft != nil || !canvasPatches.isEmpty else { return }
+        inspectorDraft = nil
+        draftVersion += 1
+        canvasPatches = []
+    }
+
+    private func applySnapshot(_ next: Snapshot?) {
+        let previous = snapshot
+        snapshot = next
+        rawNodes = nil
+        if snapshot != nil, let session, let json = try? session.snapshotJson(),
+           let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
+           let document = object["document"] as? [String: Any],
+           let nodes = document["nodes"] as? [[String: Any]] {
+            rawNodes = nodes
+        }
+        guard let previous else { return }
+        if next == nil || previous.document.revision != next?.document.revision || previous.fingerprint != next?.fingerprint {
+            discardInspectorDraft()
+        }
+    }
+
+    var hasInspectorDraft: Bool { inspectorDraft.map { !$0.isEmpty } ?? false }
+
+    /// Drops the draft because the document moved under it.
+    private func discardInspectorDraft() {
+        cancelScheduledCommit()
+        if inspectorDraft != nil || !canvasPatches.isEmpty {
+            inspectorDraft = nil
+            draftVersion += 1
+            canvasPatches = []
+        }
+    }
+
+    /// The value the inspector shows: the pending draft first, the document
+    /// second. Reads `draftVersion` to stay in the view's observation.
+    func inspectorValue(_ node: [String: Any], _ path: String) -> Any? {
+        _ = draftVersion
+        if let draft = inspectorDraft, draft.nodeId == node["id"] as? String, draft.values[path] != nil {
+            return draft.value(path)
+        }
+        let direct = InspectorJSON.value(in: node, path: path)
+        return direct
+    }
+
+    private func rebuildCanvasPatches() {
+        guard let draft = inspectorDraft else {
+            canvasPatches = []
+            return
+        }
+        canvasPatches = draft.values.keys.sorted().compactMap { path in
+            guard let css = CanvasPatch.css(for: path, value: draft.value(path)) else { return nil }
+            return CanvasPatch(draft.nodeId, css.key, css.value)
+        }
+    }
+
+    /// One transaction for many property changes, committed through the same
+    /// path as the canvas gestures.
+    func applyPropertyOperations(_ operations: [[String: Any]], scope: [String]) {
+        guard !operations.isEmpty, let snapshot else { return }
+        applyCanvasOperations(operations, scope: scope, baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
+    }
+
+    /// Inspector writes keep a draft that is being committed visible until it
+    /// lands, so the page does not flicker back to the old values.
+    private func applyInspectorOperations(_ operations: [[String: Any]], scope: [String], baseRevision: UInt64, baseFingerprint: String) {
+        applyCanvasOperations(operations, scope: scope, baseRevision: baseRevision, baseFingerprint: baseFingerprint)
+    }
+
+    // MARK: In-place text editing
+
+    @Published private(set) var textEditingId: String?
+    private var selectedPageId: String?
+
+    var textEditing: Bool { textEditingId != nil }
+
+    /// Starts in-place editing of a text-bearing node; the pending inspector
+    /// input is committed first so the editor opens on the saved value.
+    func beginTextEditing(_ id: String) {
+        guard let node = rawNode(id), ["text", "button", "input", "textarea", "select", "checkbox"].contains(node["kind"] as? String ?? "") else { return }
+        commitDraft()
+        selectedNodeIds = [id]
+        EditingFocus.shared.remember(windowFocus())
+        textEditingId = id
+    }
+
+    /// The window's first responder, taken before the text editor replaces
+    /// it, so focus can return there when editing ends as a click elsewhere.
+    private func windowFocus() -> NSView? {
+        NSApp.keyWindow?.firstResponder as? NSView
+    }
+
+    /// Ends editing and keeps focus on the edited node.
+    func endTextEditing() {
+        cancelScheduledCommit()
+        guard textEditingId != nil else { return }
+        textEditingId = nil
+        EditingFocus.shared.restore()
+    }
+
+    // MARK: Nodes
+
+    func insertNode(_ kind: String) {
+        guard operation == nil, !writesBlocked, let snapshot, let root = snapshot.root,
+              let template = InsertedNodeTemplate.template(kind) else { return }
+        let raw = rawDocumentNodes
+        func rawNode(_ id: String) -> [String: Any]? { raw.first { $0["id"] as? String == id } }
+
+        let selection = inspectorNodeId
+        var parentId = root.id
+        var anchor: String? = nil
+        if let selection, let selected = rawNode(selection) {
+            let selectedKind = selected["kind"] as? String ?? ""
+            if ["frame", "group", "button", "componentInstance"].contains(selectedKind) {
+                parentId = selection
+            } else {
+                parentId = selected["parentId"] as? String ?? root.id
+                anchor = selection
+            }
+        }
+        guard let parent = rawNode(parentId) else { return }
+        let children = parent["children"] as? [String] ?? []
+        var x = 24.0
+        var y = 12.0
+        let nextTo = anchor.flatMap { rawNode($0) } ?? children.last.flatMap { rawNode($0) }
+        if let layout = nextTo?["layout"] as? [String: Any] {
+            x = InspectorJSON.number(layout["x"]) ?? 0
+            y = (InspectorJSON.number(layout["y"]) ?? 0) + (InspectorJSON.number(layout["h"]) ?? 0) + 16
+        }
+        let nodeId = UUID().uuidString.lowercased()
+        var node: [String: Any] = [
+            "id": nodeId,
+            "parentId": parentId,
+            "kind": template.kind,
+            "name": uniqueName(template.name, template.kind, nodes: raw),
+            "children": [Any](),
+            "layout": ["x": x, "y": y, "w": template.width, "h": template.height],
+            "hidden": false,
+            "locked": false,
+            "style": template.style,
+            "content": template.content,
+            "a11y": [String: Any](),
+            "bindings": [String: Any](),
+            "events": [String: Any](),
+            "propertyMeta": [String: Any]()
+        ]
+        if template.flow {
+            let padding: [String: Any] = ["top": 16.0, "right": 16.0, "bottom": 16.0, "left": 16.0]
+            node["layout"] = ["x": x, "y": y, "w": template.width, "h": template.height,
+                              "flow": ["direction": "column", "gap": 12.0, "padding": padding, "align": "stretch"]]
+        }
+        let operation: [String: Any] = ["type": "insertNode", "parentId": parentId, "index": children.count, "node": node]
+        applyCanvasOperations([operation], scope: [parentId, nodeId], baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
+        selectedNodeIds = [nodeId]
+        canvasPreview = nil
+    }
+
+    private func uniqueName(_ name: String, _ kind: String, nodes: [[String: Any]]) -> String {
+        let names = Set(nodes.filter { $0["kind"] as? String == kind }.compactMap { $0["name"] as? String })
+        guard names.contains(name) else { return name }
+        var index = 2
+        while names.contains("\(name) \(index)") { index += 1 }
+        return "\(name) \(index)"
+    }
+
+    func renameNode(_ id: String, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !writesBlocked else { return }
+        setNodeProperty(id, "/name", trimmed)
+    }
+
+    func setHidden(_ id: String, _ hidden: Bool) {
+        guard !writesBlocked else { return }
+        setNodeProperty(id, "/hidden", hidden)
+    }
+
+    func setLocked(_ id: String, _ locked: Bool) {
+        guard !writesBlocked else { return }
+        setNodeProperty(id, "/locked", locked)
+    }
+
+    /// Moves a node to `index` among its current siblings.
+    func reorderNode(_ id: String, toIndex index: Int) {
+        guard operation == nil, !writesBlocked, let snapshot,
+              let node = rawNode(id), let parentId = node["parentId"] as? String,
+              let siblings = rawNode(parentId)?["children"] as? [String],
+              let current = siblings.firstIndex(of: id) else { return }
+        let target = min(max(index, 0), siblings.count - 1)
+        guard target != current else { return }
+        let operation: [String: Any] = ["type": "moveNode", "nodeId": id, "parentId": parentId, "index": target]
+        applyCanvasOperations([operation], scope: [id, parentId], baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
+    }
+
+    /// Whether the agent may change `path`; a locked property keeps
+    /// `agentLocked` true in the document.
+    func agentUnlocked(_ node: [String: Any], _ path: String) -> Bool {
+        guard let propertyMeta = node["propertyMeta"] as? [String: Any],
+              let meta = propertyMeta[path] as? [String: Any] else { return true }
+        return !(InspectorJSON.flag(meta["agentLocked"]) ?? false)
+    }
+
+    func setAgentLock(_ id: String, path: String, unlocked: Bool) {
+        guard !writesBlocked else { return }
+        let escaped = path.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
+        setNodeProperty(id, "/propertyMeta/\(escaped)/agentLocked", !unlocked)
+    }
+
+    private func setNodeProperty(_ id: String, _ path: String, _ value: Any) {
+        guard let snapshot, rawNode(id) != nil else { return }
+        let operation: [String: Any] = ["type": "setProperty", "nodeId": id, "path": path, "value": value]
+        applyCanvasOperations([operation], scope: [id], baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
+    }
+
+    // MARK: Read-only document view
+
+    /// The document as raw JSON, captured whenever a snapshot is applied: the
+    /// typed Snapshot omits style, content and children. Only the latest
+    /// snapshot is needed, so earlier ones are not retained.
+    private var rawNodes: [[String: Any]]?
+
+    private var rawDocumentNodes: [[String: Any]] {
+        if rawNodes == nil, snapshot != nil, let session, let json = try? session.snapshotJson(),
+           let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
+           let nodes = (object["document"] as? [String: Any])?["nodes"] as? [[String: Any]] {
+            rawNodes = nodes
+        }
+        return rawNodes ?? []
+    }
+
+    func rawNode(_ id: String) -> [String: Any]? {
+        let nodes = rawDocumentNodes
+        if let node = nodes.first(where: { $0["id"] as? String == id }) { return node }
+        guard let node = snapshot?.document.nodes.first(where: { $0.id == id }) else { return nil }
+        return ["id": node.id, "name": node.name,
+                "layout": ["x": node.layout.x, "y": node.layout.y, "w": node.layout.w, "h": node.layout.h]]
+    }
+
+    // MARK: Text search
+
+    /// Case-insensitive search over the editable text fields of the document.
+    func searchText(_ query: String) -> [TextHit] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty, snapshot != nil else { return [] }
+        let nodes = rawDocumentNodes
+        var hits: [TextHit] = []
+        for node in nodes {
+            guard let nodeId = node["id"] as? String else { continue }
+            let nodeName = node["name"] as? String ?? nodeId
+            var fields: [(String, String)] = []
+            if let content = InspectorJSON.feature(node["content"]) as? [String: Any], let text = content["text"] as? String { fields.append(("text", text)) }
+            if let content = InspectorJSON.feature(node["content"]) as? [String: Any], let placeholder = content["placeholder"] as? String { fields.append(("placeholder", placeholder)) }
+            if let a11y = InspectorJSON.feature(node["a11y"]) as? [String: Any], let label = a11y["label"] as? String { fields.append(("a11y.label", label)) }
+            if let a11y = InspectorJSON.feature(node["a11y"]) as? [String: Any], let alt = a11y["alt"] as? String { fields.append(("a11y.alt", alt)) }
+            for (field, value) in fields where value.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                hits.append(TextHit(nodeId: nodeId, nodeName: nodeName, field: field, snippet: value))
+            }
+        }
+        return hits
+    }
+
+    /// Replaces every match of `query` in one transaction.
+    func replaceAll(_ query: String, with replacement: String) {
+        guard operation == nil, !writesBlocked, let snapshot else { return }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return }
+        var operations: [[String: Any]] = []
+        var byPath: [String: String] = [:]
+        for hit in searchText(needle) {
+            let key = "\(hit.nodeId)|\(hit.path)"
+            let source = byPath[key] ?? hit.snippet
+            let next = source.replacingOccurrences(of: needle, with: replacement,
+                                                   options: [.caseInsensitive, .diacriticInsensitive])
+            guard next != source else { continue }
+            byPath[key] = next
+            operations.append(["type": "setProperty", "nodeId": hit.nodeId, "path": hit.path, "value": next])
+        }
+        guard !operations.isEmpty else { return }
+        let scope = Array(Set(operations.compactMap { $0["nodeId"] as? String })).sorted()
+        applyCanvasOperations(operations, scope: scope, baseRevision: snapshot.document.revision, baseFingerprint: snapshot.fingerprint)
+    }
+
+    // MARK: Pages and preview
+
+    var currentPageId: String? {
+        snapshot?.document.pages.first(where: { $0.id == selectedPageId })?.id
+            ?? snapshot?.document.pages.first?.id
+    }
+
+    func selectPage(_ id: String) {
+        guard snapshot?.document.pages.contains(where: { $0.id == id }) == true else { return }
+        selectedPageId = id
+        refreshCanvas()
+    }
+
+    /// The project's self-contained page preview, rendered off the main thread.
+    /// Returns nil when cancelled, so a stale page never replaces a newer one.
+    func previewHTML(pageId: String?) async -> String? {
+        guard let session else { return nil }
+        let id = pageId ?? currentPageId
+        let result = await Task.detached(priority: .userInitiated) {
+            Result { try session.previewHtml(pageId: id) }
+        }.value
+        guard !Task.isCancelled else { return nil }
+        return try? result.get()
+    }
+
+    // MARK: Layers
+
+    /// Breadth-first rows of the page tree, deepest levels last; callers
+    /// reverse sibling order to show the topmost node first.
+    func layerRows() -> [LayerRow] {
+        guard let root = snapshot?.root else { return [] }
+        var rows: [LayerRow] = []
+        var stack: [(node: Snapshot.Document.Node, depth: Int)] = [(root, 0)]
+        let nodes = snapshot?.document.nodes ?? []
+        while let (node, depth) = stack.popLast() {
+            let raw = rawNode(node.id)
+            let children = (raw?["children"] as? [String]) ?? []
+            rows.append(LayerRow(id: node.id, name: node.name, kind: (raw?["kind"] as? String) ?? "frame",
+                                 depth: depth, hasChildren: !children.isEmpty,
+                                 hidden: InspectorJSON.flag(raw?["hidden"]) ?? false,
+                                 locked: InspectorJSON.flag(raw?["locked"]) ?? false))
+            var pending: [(node: Snapshot.Document.Node, depth: Int)] = []
+            for childId in children.reversed() {
+                if let child = nodes.first(where: { $0.id == childId }) { pending.append((child, depth + 1)) }
+            }
+            stack.append(contentsOf: pending.reversed())
+        }
+        return rows
+    }
 
     private func canvasReadableError(_ error: Error) -> String {
         if let coreError = error as? CoreError, case let .Failure(code, message) = coreError {

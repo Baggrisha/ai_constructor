@@ -1,11 +1,23 @@
 import AppKit
 import SwiftUI
+import WebKit
 
 /// The editing canvas (C.3): the Rust-rendered page in a WebKit view with a
-/// native marker and gesture overlay above it.
+/// native marker and gesture overlay above it. The pending inspector patches
+/// are pushed into the loaded page when the list changes and after every
+/// load, because a load starts from the core's HTML again.
 struct CanvasView: View {
     @ObservedObject var model: WorkspaceModel
     let content: CanvasContent
+    /// Live inspector input, applied to the loaded page without a reload.
+    let patches: [CanvasPatch]
+    @StoredState private var webViewBridge = CanvasWebViewBridge()
+
+    init(model: WorkspaceModel, content: CanvasContent, patches: [CanvasPatch] = []) {
+        self.model = model
+        self.content = content
+        self.patches = patches
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -41,7 +53,15 @@ struct CanvasView: View {
                               onDrag: { kind, point in model.updateCanvasGesture(kind, at: document(point, scale: scale)) },
                               onEnd: { kind, point in model.endCanvasGesture(kind, at: document(point, scale: scale)) },
                               onPlainHover: { model.canvasHoveredId = $0 },
-                              onDeviceHover: { model.canvasHoveredId = content.topmost(at: document($0, scale: scale))?.id })
+                              onDeviceHover: { model.canvasHoveredId = content.topmost(at: document($0, scale: scale))?.id },
+                              onDoubleClick: { point in
+                                  guard let hit = content.topmost(at: document(point, scale: scale)) else { return }
+                                  model.beginTextEditing(hit.id)
+                              })
+                if let editingId = model.textEditingId {
+                    TextEditorOverlay(model: model, content: content, scale: scale, editingId: editingId)
+                        .id(editingId)
+                }
             }
             if model.canvasGenerating && !content.nodes.isEmpty {
                 ProgressView().controlSize(.small).padding(10)
@@ -60,6 +80,10 @@ struct CanvasView: View {
         .task(id: model.snapshot?.document.revision) {
             model.refreshCanvas()
         }
+        .onChange(of: patches) {
+            CanvasWebView.patch(patches, in: webViewBridge.webView)
+        }
+        .onDisappear { webViewBridge.webView = nil }
         // The page is scaled to fill the available width, so the native overlay
         // and the WebView agree on one coordinate system; the stack is a fixed
         // frame because unpositioned children accept no click gestures.
@@ -77,15 +101,18 @@ struct CanvasView: View {
 
     private func page(_ content: CanvasContent, scale: Double) -> some View {
         let size = CGSize(width: content.rootSize.width * scale, height: content.rootSize.height * scale)
-        return CanvasWebView(html: content.html, scale: scale) { message in
-        switch message {
-        case .hover(let id):
-            model.canvasHoveredId = id.flatMap { id in content.nodes.first { $0.id == id }?.id }
-        case .down:
-            // The overlay resolves the press against the same computed
-            // bounds; the page only contributes hover.
-            break
-        }
+        return CanvasWebView(html: content.html, scale: scale, patches: patches,
+                             onView: { webView in
+                                 if webViewBridge.webView !== webView { webViewBridge.webView = webView }
+                             }) { message in
+            switch message {
+            case .hover(let id):
+                model.canvasHoveredId = id.flatMap { id in content.nodes.first { $0.id == id }?.id }
+            case .down:
+                // The overlay resolves the press against the same computed
+                // bounds; the page only contributes hover.
+                break
+            }
         }
         .frame(width: size.width, height: size.height)
         .allowsHitTesting(false)
@@ -122,4 +149,12 @@ struct CanvasView: View {
         }
         return levels
     }
+}
+
+/// Holds the WKWebView the canvas created so the view can push inspector
+/// patches into the already loaded document between reloads.
+@MainActor
+@Observable
+final class CanvasWebViewBridge {
+    weak var webView: WKWebView?
 }

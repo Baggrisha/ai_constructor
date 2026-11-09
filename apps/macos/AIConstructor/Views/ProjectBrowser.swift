@@ -12,6 +12,8 @@ struct WorkspaceView: View {
     @StoredState private var trashProject: RecentProject?
     @StoredState private var checkpointToRestore: Checkpoint?
     @StoredState private var confirmPortableSnapshot = false
+    @StoredState private var searchOpen = false
+    @StoredState private var sidebarTab = 0
 
     @ViewBuilder
     private func projectActions(_ project: RecentProject) -> some View {
@@ -51,11 +53,29 @@ struct WorkspaceView: View {
     private func panel(_ snapshot: Snapshot) -> some View {
         switch library.panels[snapshot.document.projectId] ?? .inspector {
         case .inspector:
-            if snapshot.root != nil {
-                CanvasView(model: model, content: model.canvas)
-                    .id(snapshot.document.projectId)
-            } else {
-                ContentUnavailableView("Нет корневого фрейма", systemImage: "exclamationmark.triangle")
+            VStack(spacing: 0) {
+                Picker("", selection: $sidebarTab) {
+                    Text("Инспектор").tag(0)
+                    Text("Слои").tag(1)
+                    Text("Страницы").tag(2)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(8)
+                .accessibilityIdentifier("inspector-tabs")
+                Group {
+                    switch sidebarTab {
+                    case 1: LayersPanel(model: model)
+                    case 2: pagesList(snapshot)
+                    default:
+                        if snapshot.root != nil {
+                            InspectorView(model: model, snapshot: snapshot)
+                        } else {
+                            ContentUnavailableView("Нет корневого фрейма", systemImage: "exclamationmark.triangle")
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         case .chats:
             ChatPanel(model: model, snapshot: snapshot).id(snapshot.document.projectId)
@@ -70,7 +90,8 @@ struct WorkspaceView: View {
     /// is fixed height, so the header's intrinsic width never reaches layout.
     @ViewBuilder
     private func selectedProject(_ snapshot: Snapshot) -> some View {
-        VStack(spacing: 0) {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(snapshot.name).font(.headline)
@@ -86,14 +107,61 @@ struct WorkspaceView: View {
             diagnosticsChrome(snapshot)
             pageNavigation(snapshot)
                 .frame(height: 44)
-            panel(snapshot)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack(spacing: 0) {
+                panelColumn
+                    .frame(width: max(0, geometry.size.width - library.panelWidths.inspector - 1), height: geometry.size.height, alignment: .topLeading)
+                Rectangle().fill(.separator).frame(width: 1)
+                panel(snapshot)
+                    .frame(width: library.panelWidths.inspector, height: geometry.size.height, alignment: .topLeading)
+            }
+        }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .topTrailing) {
+            if searchOpen {
+                SearchPanel(model: model, isPresented: $searchOpen)
+                    .padding(16)
+            }
+        }
+        .onAppear { WorkspaceCommands.shared.model = model }
+        .onChange(of: WorkspaceCommands.shared.search) { _, open in
+            if open { searchOpen = true; WorkspaceCommands.shared.search = false }
+        }
+        .onChange(of: searchOpen) { _, open in
+            if !open { WorkspaceCommands.shared.search = false }
+        }
+    }
+
+    private func pageName(_ page: Snapshot.Document.Page) -> String {
+        model.rawNode(page.rootId)?["name"] as? String ?? page.id
+    }
+
+    private func pagesList(_ snapshot: Snapshot) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(snapshot.document.pages, id: \.id) { page in
+                    Button {
+                        model.selectPage(page.id)
+                    } label: {
+                        Label(pageName(page), systemImage: page.id == model.currentPageId ? "doc.text.fill" : "doc.text")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 4)
+                    .accessibilityIdentifier("page-\(page.id)")
+                }
+                Text("Создание и удаление страниц — в следующих версиях")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 8)
+            }
+            .padding(8)
+        }
     }
 
     private func statusText(_ snapshot: Snapshot) -> Text {
-        Text(model.hasUnsavedData ? "Не сохранено" : snapshot.readOnly ? "Только чтение" : model.diagnostics?.readOnly == true ? "Внешние изменения" : model.diagnosticsError != nil ? "Проверка не выполнена" : "Сохранено")
+        Text(model.textEditing ? "Редактирование текста" : model.hasUnsavedData ? "Не сохранено" : snapshot.readOnly ? "Только чтение" : model.diagnostics?.readOnly == true ? "Внешние изменения" : model.diagnosticsError != nil ? "Проверка не выполнена" : "Сохранено")
     }
 
     private func projectButtons(_ snapshot: Snapshot) -> some View {
@@ -193,37 +261,18 @@ struct WorkspaceView: View {
         .padding(.horizontal, 20)
     }
 
+    /// The canvas sits beside the right-hand panel; it takes whatever width
+    /// the two side panels leave.
     private var panelColumn: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                Text("Инспектор")
-                    .font(.headline)
-                Text("Панель инспектора появится в M1.3.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .frame(maxWidth: .infinity)
-            .padding()
-        }
-        .frame(width: library.panelWidths.inspector)
-        .overlay(alignment: .leading) { Rectangle().fill(.separator).frame(width: 1) }
+        CanvasView(model: model, content: model.canvas, patches: model.canvasPatches)
+            .id("canvas-\(model.snapshot?.document.projectId ?? "none")")
     }
 
-    /// The inspector is a sibling with a fixed width; the page column takes
-    /// whatever is left.
+
     @ViewBuilder
     private var detailColumn: some View {
         if let snapshot = model.snapshot {
-            GeometryReader { geometry in
-                HStack(spacing: 0) {
-                    selectedProject(snapshot)
-                        .frame(width: max(0, geometry.size.width - library.panelWidths.inspector - 1), height: geometry.size.height, alignment: .topLeading)
-
-                    panelColumn
-                        .frame(width: library.panelWidths.inspector, height: geometry.size.height, alignment: .topLeading)
-                }
-            }
+            selectedProject(snapshot)
         } else {
             ContentUnavailableView {
                 Label("Выберите проект", systemImage: "square.stack.3d.up")

@@ -26,9 +26,15 @@ SOURCES=(
   apps/macos/AIConstructor/Views/AssetsPanel.swift
   apps/macos/AIConstructor/Views/DiagnosticsPanel.swift
   apps/macos/AIConstructor/Views/Components.swift
+  apps/macos/AIConstructor/Views/LayersPanel.swift
+  apps/macos/AIConstructor/Views/Inspector/InspectorSupport.swift
+  apps/macos/AIConstructor/Views/Inspector/InspectorView.swift
+  apps/macos/AIConstructor/Views/Canvas/TextEditorOverlay.swift
+  apps/macos/AIConstructor/Views/SearchPanel.swift
   apps/macos/AIConstructor/Views/Canvas/CanvasView.swift
   apps/macos/AIConstructor/Views/Canvas/CanvasWebView.swift
   apps/macos/AIConstructor/Views/Canvas/CanvasOverlay.swift
+  apps/macos/AIConstructor/Views/Canvas/PreviewThumbnail.swift
   apps/macos/AIConstructor/Views/Sheets/ConflictResolutionSheet.swift
   apps/macos/AIConstructor/Views/Sheets/RecoveryResolutionSheet.swift
 )
