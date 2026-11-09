@@ -2,6 +2,9 @@ pub mod cancellation;
 mod model;
 mod storage;
 
+pub use model::{Component, Node, Page, Transaction};
+pub use serde_json;
+
 pub use storage::control::{create_project_controlled, open_project_controlled};
 
 use std::{
@@ -13,7 +16,7 @@ use std::{
     },
 };
 
-use model::{Document, Transaction};
+use model::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::Manifest;

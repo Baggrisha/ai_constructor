@@ -5,7 +5,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{CoreError, Result};
+mod commands;
 mod domain;
+mod editing;
 mod geometry;
 mod operations;
 mod render;
@@ -13,10 +15,12 @@ mod text;
 mod validation;
 mod vector;
 
+pub use domain::{Component, FeatureItem};
+
 use domain::{
-    Action, Animation, Asset, Binding, Bounds, CodeModule, Component, FeatureItem, FeatureMap,
-    Flow, NodeAccessibility, NodeContent, NodeStyle, ReferenceBaseline, ResponsiveOverride,
-    SizeMode, Target, Token, Variable,
+    Action, Animation, Asset, Binding, Bounds, CodeModule, FeatureMap, Flow, NodeAccessibility,
+    NodeContent, NodeStyle, ReferenceBaseline, ResponsiveOverride, SizeMode, Target, Token,
+    Variable,
 };
 
 fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -84,7 +88,7 @@ pub struct Node {
     pub property_meta: BTreeMap<String, PropertyMeta>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum NodeKind {
     Frame,
@@ -196,6 +200,11 @@ pub enum Operation {
         path: String,
         value: Value,
     },
+    /// Replaces a node with a copy that keeps its id, parent and index. The
+    /// copy must not carry children; they are re-inserted separately.
+    SwapNode {
+        node: Box<Node>,
+    },
     SetBinding {
         node_id: Uuid,
         path: String,
@@ -218,6 +227,12 @@ pub enum Operation {
         node_id: Uuid,
         width: f64,
         height: f64,
+    },
+    SetComponent {
+        component_id: Uuid,
+        root_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
 }
 

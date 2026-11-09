@@ -462,6 +462,78 @@ fn actual_axis_size(
     Ok(size)
 }
 
+fn check_instance(
+    document: &Document,
+    node: &Node,
+    root_id: Uuid,
+    visiting: &mut Vec<Uuid>,
+) -> Result<()> {
+    if node.children.is_empty() {
+        return Ok(());
+    }
+    if visiting.contains(&root_id) {
+        return Err(CoreError::unsupported(format!(
+            "Cyclic component layout on node {}",
+            node.id
+        )));
+    }
+    let root = document
+        .nodes
+        .iter()
+        .find(|item| item.id == root_id)
+        .ok_or_else(|| CoreError::invalid(format!("Missing component root {root_id}")))?;
+    visiting.push(root_id);
+    if !same_shape(root, node) {
+        let result = Err(CoreError::unsupported(format!(
+            "Instance {} does not match its component subtree",
+            node.id
+        )));
+        visiting.pop();
+        return result;
+    }
+    let nodes: HashMap<_, _> = document.nodes.iter().map(|item| (item.id, item)).collect();
+    let mut pending = vec![node.id];
+    while let Some(id) = pending.pop() {
+        for child in &nodes[&id].children {
+            let child = nodes[child];
+            if matches!(child.kind, NodeKind::ComponentInstance) {
+                let Some(component_id) = child
+                    .content
+                    .known()
+                    .and_then(|content| content.component_id)
+                else {
+                    visiting.pop();
+                    return Err(CoreError::unsupported(format!(
+                        "Instance {} has no component",
+                        child.id
+                    )));
+                };
+                let Some(nested) = document.component_root(component_id) else {
+                    visiting.pop();
+                    return Err(CoreError::invalid(format!(
+                        "Missing component {component_id}"
+                    )));
+                };
+                if let Err(error) = check_instance(document, child, nested, visiting) {
+                    visiting.pop();
+                    return Err(error);
+                }
+            }
+            pending.push(child.id);
+        }
+    }
+    visiting.pop();
+    Ok(())
+}
+
+// An instance takes the place of its component root, so kinds differ by design.
+fn same_shape(a: &Node, b: &Node) -> bool {
+    a.children.len() == b.children.len()
+        && a.layout.flow == b.layout.flow
+        && a.layout.width_mode == b.layout.width_mode
+        && a.layout.height_mode == b.layout.height_mode
+}
+
 // CSS flex subset: fixed/hug items do not shrink; fill is flex: 1 1 0 with
 // minimum size 0. Unspecified sizes are fixed except stretch on the cross axis.
 fn flow_child(
@@ -602,6 +674,7 @@ impl Document {
         let root = *nodes
             .get(&page.root_id)
             .ok_or_else(|| CoreError::invalid(format!("Unknown root {}", page.root_id)))?;
+        self.check_component_instances()?;
         let mut sizes = HashMap::new();
         let mut text = LayoutContext::new(self, project_path);
         let mut result = Vec::with_capacity(self.nodes.len());
@@ -632,6 +705,45 @@ impl Document {
             }
         }
         Ok(result)
+    }
+
+    /// Instances either own a detached copy of their component's subtree
+    /// (resolved by `break`) or have no children and measure from the root.
+    /// Mixed or broken subtrees must not be rendered silently.
+    fn check_component_instances(&self) -> Result<()> {
+        for node in &self.nodes {
+            if !matches!(node.kind, NodeKind::ComponentInstance) {
+                continue;
+            }
+            let Some(component_id) = node
+                .content
+                .known()
+                .and_then(|content| content.component_id)
+            else {
+                return Err(CoreError::unsupported(format!(
+                    "Instance {} has no component",
+                    node.id
+                )));
+            };
+            let Some(root_id) = self.component_root(component_id) else {
+                return Err(CoreError::invalid(format!(
+                    "Missing component {component_id}"
+                )));
+            };
+            check_instance(self, node, root_id, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn component_root(&self, component_id: Uuid) -> Option<Uuid> {
+        self.components
+            .iter()
+            .find_map(|component| match component {
+                FeatureItem::Known(component) if component.id == component_id => {
+                    Some(component.root_id)
+                }
+                _ => None,
+            })
     }
 
     /// Line-break offsets of a text node's `content.text` at `width`, in

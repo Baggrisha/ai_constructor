@@ -1,5 +1,12 @@
 use std::sync::Arc;
 
+fn invalid(message: String) -> CoreError {
+    CoreError::Failure {
+        code: "INVALID_ARGUMENT".into(),
+        message,
+    }
+}
+
 uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -97,6 +104,86 @@ impl ProjectSession {
     }
     pub fn line_breaks_json(&self, node_id: String, width: f64) -> Result<String, CoreError> {
         Ok(self.inner.line_breaks_json(&node_id, width)?)
+    }
+    /// Editor gestures return a transaction for `apply_transaction`, so one
+    /// gesture is one undo step.
+    pub fn group_json(
+        &self,
+        node_ids: Vec<String>,
+        name: Option<String>,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.group_json(node_ids, name)?)
+            .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn ungroup_json(&self, group_id: String) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.ungroup_json(&group_id)?)
+            .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn create_component_json(
+        &self,
+        node_ids: Vec<String>,
+        name: Option<String>,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.create_component_json(node_ids, name)?)
+            .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn insert_component_instance_json(
+        &self,
+        component_id: String,
+        parent_id: String,
+        index: Option<u32>,
+        x: f64,
+        y: f64,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.insert_component_instance_json(
+            &component_id,
+            &parent_id,
+            index,
+            x,
+            y,
+        )?)
+        .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn break_component_link_json(&self, instance_id: String) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.break_component_link_json(&instance_id)?)
+            .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn paste_nodes_json(
+        &self,
+        node_ids: Vec<String>,
+        parent_id: String,
+        index: Option<u32>,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.paste_nodes_json(node_ids, &parent_id, index)?)
+            .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn paste_from_project_json(
+        &self,
+        source_path: String,
+        node_ids: Vec<String>,
+        parent_id: String,
+        index: Option<u32>,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.paste_from_project_json(
+            std::path::Path::new(&source_path),
+            node_ids,
+            &parent_id,
+            index,
+        )?)
+        .map_err(|error| invalid(error.to_string()))
+    }
+    pub fn set_component_json(
+        &self,
+        component_id: String,
+        root_id: String,
+        name: Option<String>,
+    ) -> Result<String, CoreError> {
+        aic_core::serde_json::to_string(&self.inner.set_component_json(
+            &component_id,
+            &root_id,
+            name,
+        )?)
+        .map_err(|error| invalid(error.to_string()))
     }
     #[expect(clippy::too_many_arguments, reason = "Preserve the flat UniFFI API")]
     pub fn transform_point_json(

@@ -5,7 +5,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::domain::{
-    ActionKind, Binding, Bounds, FeatureMap, Flow, ResponsiveOverride, Scalar, SizeMode,
+    self, ActionKind, Binding, Bounds, FeatureMap, Flow, ResponsiveOverride, Scalar, SizeMode,
 };
 use super::validation::{identifier, node_supported, property_kind};
 use super::{
@@ -183,6 +183,10 @@ fn known_mut<T>(map: &mut FeatureMap<T>) -> Result<&mut T> {
 
 fn set_property(node: &mut Node, path: &str, value: &Value) -> Result<()> {
     match path {
+        "/kind" => {
+            node.kind = serde_json::from_value(value.clone())
+                .map_err(|e| CoreError::invalid(e.to_string()))?
+        }
         "/name" => {
             node.name = value
                 .as_str()
@@ -705,6 +709,40 @@ impl Document {
                         revision,
                     );
                 }
+                Operation::SwapNode { node } => {
+                    scoped(transaction, node.id)?;
+                    let index = node_index(self, node.id)?;
+                    let existing = &self.nodes[index];
+                    let parent_id = existing.parent_id.ok_or_else(|| {
+                        CoreError::invalid(format!("The page root {} cannot be replaced", node.id))
+                    })?;
+                    if node.parent_id != Some(parent_id) {
+                        return Err(CoreError::invalid(format!(
+                            "Replacement for node {} must keep its parent",
+                            node.id
+                        )));
+                    }
+                    if !node.children.is_empty() {
+                        return Err(CoreError::invalid(format!(
+                            "Replacement for node {} must not carry children",
+                            node.id
+                        )));
+                    }
+                    scoped(transaction, parent_id)?;
+                    unlocked(existing, "/kind", transaction.origin)?;
+                    unlocked(
+                        &self.nodes[node_index(self, parent_id)?],
+                        "/children",
+                        transaction.origin,
+                    )?;
+                    self.nodes[index] = node.as_ref().clone();
+                    mark(
+                        &mut self.nodes[index],
+                        "/kind",
+                        transaction.origin,
+                        revision,
+                    );
+                }
                 Operation::SetProperty {
                     node_id,
                     path,
@@ -787,6 +825,44 @@ impl Document {
                 ),
                 Operation::SetToken { token } => {
                     upsert(&mut self.tokens, token.clone(), token.id, |v| v.id)
+                }
+                Operation::SetComponent {
+                    component_id,
+                    root_id,
+                    name,
+                } => {
+                    scoped(transaction, *root_id)?;
+                    if !matches!(transaction.origin, Origin::User) {
+                        return Err(CoreError::locked("Only the user can define components"));
+                    }
+                    if self.components.iter().any(|item| {
+                        matches!(item, domain::FeatureItem::Known(existing) if existing.id == *component_id)
+                    }) {
+                        return Err(CoreError::invalid(format!(
+                            "Component {component_id} already exists"
+                        )));
+                    }
+                    let root = &self.nodes[node_index(self, *root_id)?];
+                    if !matches!(root.kind, NodeKind::Frame | NodeKind::Group) {
+                        return Err(CoreError::invalid(format!(
+                            "Component root {root_id} must be an unlocked frame or group"
+                        )));
+                    }
+                    if root
+                        .property_meta
+                        .values()
+                        .any(|meta| meta.agent_locked && matches!(meta.origin, Origin::Agent))
+                    {
+                        return Err(CoreError::invalid(format!(
+                            "Component root {root_id} must be an unlocked frame or group"
+                        )));
+                    }
+                    self.components
+                        .push(domain::FeatureItem::Known(domain::Component {
+                            id: *component_id,
+                            root_id: *root_id,
+                            name: name.clone(),
+                        }));
                 }
                 Operation::SetViewport {
                     node_id,

@@ -3532,3 +3532,493 @@ fn line_breaks_follow_the_measured_text_width() {
         "UNSUPPORTED_FEATURE"
     );
 }
+
+fn json_of(value: aic_core::Transaction) -> Value {
+    serde_json::to_value(value).unwrap()
+}
+
+fn apply(session: &ProjectSession, transaction: Value) -> Value {
+    let result = session.apply_transaction(&transaction.to_string()).unwrap();
+    let snapshot: Value = serde_json::from_str(&result).unwrap();
+    snapshot["document"].clone()
+}
+
+fn find(document: &Value, id: Uuid) -> &Value {
+    document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == json!(id))
+        .unwrap_or_else(|| panic!("node {id} is missing in {document}"))
+}
+
+fn layout(session: &ProjectSession) -> Value {
+    serde_json::from_str(&session.layout_json(None).unwrap()).unwrap()
+}
+
+fn box_of(session: &ProjectSession, id: Uuid) -> (f64, f64, f64, f64) {
+    let layout = layout(session);
+    let item = layout
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == json!(id))
+        .unwrap();
+    let value = |key: &str| item[key].as_f64().unwrap();
+    (value("x"), value("y"), value("w"), value("h"))
+}
+
+fn document_of(session: &ProjectSession) -> Value {
+    snapshot(session)["document"].clone()
+}
+
+#[test]
+fn group_and_ungroup_keep_screen_positions_in_one_step() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Group").unwrap();
+    let root = root(&session);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut first_node = node(first, root, "frame");
+    first_node["children"] = json!([]);
+    first_node["layout"] = json!({"x": 40, "y": 20, "w": 100, "h": 50});
+    let mut second_node = node(second, root, "frame");
+    second_node["layout"] = json!({"x": 200, "y": 100, "w": 60, "h": 40});
+    apply(
+        &session,
+        transaction(
+            &session,
+            &[root, first, second],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": first_node},
+                {"type": "insertNode", "parentId": root, "index": 1, "node": second_node}
+            ]),
+        ),
+    );
+    let grouped = apply(
+        &session,
+        json_of(
+            session
+                .group_json(
+                    vec![first.to_string(), second.to_string()],
+                    Some("Hero".into()),
+                )
+                .unwrap(),
+        ),
+    );
+    let shallow = |value: &Value| value["nodes"][0]["children"].as_array().unwrap().clone();
+    let root_children = shallow(&grouped);
+    assert_eq!(root_children.len(), 1);
+    let group_id = Uuid::parse_str(root_children[0].as_str().unwrap()).unwrap();
+    let group = find(&grouped, group_id);
+    assert_eq!(group["kind"], "group");
+    assert_eq!(group["name"], "Hero");
+    assert_eq!(group["layout"]["x"], 40.0);
+    assert_eq!(group["layout"]["y"], 20.0);
+    assert_eq!(group["layout"]["w"], 220.0);
+    assert_eq!(group["layout"]["h"], 120.0);
+    assert_eq!(find(&grouped, first)["layout"]["x"], 0.0);
+    assert_eq!(find(&grouped, second)["layout"]["y"], 80.0);
+    assert_eq!(
+        find(&grouped, first)["propertyMeta"]["/layout/x"]["origin"],
+        "user"
+    );
+    assert_eq!(box_of(&session, second), (200.0, 100.0, 60.0, 40.0));
+
+    session.undo().unwrap();
+    assert!(snapshot(&session)["document"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["kind"] != "group"));
+
+    let regrouped = apply(
+        &session,
+        json_of(
+            session
+                .group_json(vec![first.to_string(), second.to_string()], None)
+                .unwrap(),
+        ),
+    );
+    let root_children = shallow(&regrouped);
+    assert_eq!(root_children.len(), 1);
+    let group_id = Uuid::parse_str(root_children[0].as_str().unwrap()).unwrap();
+    let ungrouped = apply(
+        &session,
+        json_of(session.ungroup_json(&group_id.to_string()).unwrap()),
+    );
+    assert!(ungrouped["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["kind"] != "group"));
+    assert_eq!(box_of(&session, first), (40.0, 20.0, 100.0, 50.0));
+    assert_eq!(box_of(&session, second), (200.0, 100.0, 60.0, 40.0));
+    assert_eq!(ungrouped["nodes"][0]["children"], json!([first, second]));
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(box_of(&reopened, second), (200.0, 100.0, 60.0, 40.0));
+}
+
+#[test]
+fn group_rejects_mixed_parents_roots_and_ancestors() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Group errors").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let stray = Uuid::new_v4();
+    let mut frame_node = node(frame, root, "frame");
+    frame_node["children"] = json!([]);
+    apply(
+        &session,
+        transaction(
+            &session,
+            &[root, frame, child, stray],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": frame_node},
+                {"type": "insertNode", "parentId": frame, "index": 0, "node": node(child, frame, "text")},
+                {"type": "insertNode", "parentId": root, "index": 1, "node": node(stray, root, "text")}
+            ]),
+        ),
+    );
+    // The minimal fixture caps the node count, so the ancestor pairing is
+    // exercised after grouping an existing child instead of on the raw tree.
+    let first_group = apply(
+        &session,
+        json_of(session.group_json(vec![stray.to_string()], None).unwrap()),
+    );
+    let group = Uuid::parse_str(first_group["nodes"][0]["children"][1].as_str().unwrap()).unwrap();
+    let ancestor = find(&first_group, group)["children"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = snapshot(&session);
+    let error = session
+        .group_json(vec![group.to_string(), ancestor], None)
+        .unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_FEATURE");
+    for (ids, codes) in [
+        (
+            vec![frame.to_string(), stray.to_string()],
+            &["UNSUPPORTED_FEATURE"][..],
+        ),
+        (
+            vec![frame.to_string(), child.to_string()],
+            &["UNSUPPORTED_FEATURE"][..],
+        ),
+        (
+            vec![stray.to_string(), stray.to_string()],
+            &["INVALID_DOCUMENT"][..],
+        ),
+        (vec![Uuid::new_v4().to_string()], &["INVALID_DOCUMENT"][..]),
+    ] {
+        let error = session.group_json(ids, None).unwrap_err();
+        assert!(codes.contains(&error.code), "{error:?}");
+    }
+    assert_eq!(snapshot(&session), before);
+}
+
+#[test]
+fn paste_rewrites_ids_actions_and_keeps_assets_but_drops_agent_locks() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    drop(create_project(&path, "Paste").unwrap());
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(path.join("document.json")).unwrap()).unwrap();
+    let root = Uuid::parse_str(document["pages"][0]["rootId"].as_str().unwrap()).unwrap();
+    let frame = Uuid::new_v4();
+    let text = Uuid::new_v4();
+    let action = Uuid::new_v4();
+    let mut frame_node = node(frame, root, "frame");
+    frame_node["children"] = json!([]);
+    frame_node["propertyMeta"] =
+        json!({"/name": {"origin": "agent", "lastRevision": 0, "agentLocked": true}});
+    let mut text_node = node(text, frame, "text");
+    text_node["content"]["text"] = json!("Привет");
+    text_node["events"] = json!({"click": action});
+    document["nodes"][0]["children"] = json!([frame]);
+    frame_node["children"] = json!([text]);
+    document["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .extend([frame_node, text_node]);
+    document["actions"] =
+        json!([{"id": action, "kind": {"type": "openUrl", "url": "https://example.com"}}]);
+    write_document_fixture(&path, &document);
+    let session = open_project(&path).unwrap();
+    let pasted = apply(
+        &session,
+        json_of(
+            session
+                .paste_nodes_json(vec![frame.to_string()], &root.to_string(), None)
+                .unwrap(),
+        ),
+    );
+    let document = &pasted;
+    let root_children = document["nodes"][0]["children"].as_array().unwrap();
+    assert_eq!(root_children.len(), 2);
+    let copy_id = root_children[1].as_str().unwrap();
+    let copy = document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == json!(copy_id))
+        .unwrap();
+    assert_ne!(copy_id, frame.to_string());
+    let copied_text_id = copy["children"][0].as_str().unwrap().to_owned();
+    assert_ne!(copied_text_id, text.to_string());
+    // The insert itself locks every property as a user edit, so the source's
+    // agent lock cannot leak through.
+    assert!(copy["propertyMeta"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|meta| meta["origin"] == "user"));
+    let copied_text = document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == json!(copied_text_id.as_str()))
+        .unwrap();
+
+    assert_eq!(copied_text["parentId"], copy["id"]);
+    assert_eq!(copied_text["content"]["text"], "Привет");
+    let new_action = copied_text["events"]["click"].as_str().unwrap();
+    assert_ne!(new_action, action.to_string());
+    assert!(document["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == json!(new_action) && item["kind"]["type"] == "openUrl"));
+    session.undo().unwrap();
+    assert_eq!(document_of(&session)["nodes"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn paste_from_another_project_reuses_shared_assets_and_rejects_missing_ones() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("pixel.png");
+    png_asset(&file, 1, 1);
+
+    let source_path = temp.path().join("source");
+    let source = create_project(&source_path, "Source").unwrap();
+    let source_root = root(&source);
+    let asset_id = import_asset(&source, &file);
+    let image = Uuid::new_v4();
+    let mut image_node = node(image, source_root, "image");
+    image_node["layout"] = json!({"x": 10, "y": 10, "w": 10, "h": 10});
+    image_node["content"] = json!({"assetId": asset_id});
+    // The cross-project paste re-reads the source from disk.
+    apply(
+        &source,
+        transaction(
+            &source,
+            &[source_root, image],
+            json!([{"type": "insertNode", "parentId": source_root, "index": 0, "node": image_node}]),
+        ),
+    );
+    source.save().unwrap();
+
+    let missing_path = temp.path().join("missing");
+    let missing = create_project(&missing_path, "Missing").unwrap();
+    let missing_root = root(&missing);
+    let error = missing
+        .paste_from_project_json(
+            &source_path,
+            vec![image.to_string()],
+            &missing_root.to_string(),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_FEATURE");
+    assert!(error.message.contains("assets/"), "{}", error.message);
+
+    let target_path = temp.path().join("target");
+    let target = create_project(&target_path, "Target").unwrap();
+    let target_root = root(&target);
+    let shared = import_asset(&target, &file);
+    let pasted = apply(
+        &target,
+        json_of(
+            target
+                .paste_from_project_json(
+                    &source_path,
+                    vec![image.to_string()],
+                    &target_root.to_string(),
+                    None,
+                )
+                .unwrap(),
+        ),
+    );
+    let copy = pasted["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "image")
+        .unwrap();
+    assert_eq!(copy["content"]["assetId"], json!(shared));
+    assert_ne!(copy["id"], json!(image));
+}
+
+#[test]
+fn component_lifecycle_resolves_instances_and_breaking_is_deep() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Components").unwrap();
+    let root = root(&session);
+    let card = Uuid::new_v4();
+    let label = Uuid::new_v4();
+    let mut card_node = node(card, root, "frame");
+    card_node["layout"] = json!({"x": 100, "y": 50, "w": 200, "h": 80});
+    card_node["children"] = json!([]);
+    let mut label_node = node(label, card, "text");
+    label_node["content"]["text"] = json!("Карточка");
+    apply(
+        &session,
+        transaction(
+            &session,
+            &[root, card, label],
+            json!([
+                {"type": "insertNode", "parentId": root, "index": 0, "node": card_node},
+                {"type": "insertNode", "parentId": card, "index": 0, "node": label_node}
+            ]),
+        ),
+    );
+    let component_id = Uuid::new_v4();
+    let created = apply(
+        &session,
+        transaction(
+            &session,
+            &[card],
+            json!([{"type": "setComponent", "componentId": component_id, "rootId": card, "name": "Card"}]),
+        ),
+    );
+    let component = created["components"][0].clone();
+    assert_eq!(component["rootId"], json!(card));
+    assert_eq!(component["name"], "Card");
+    let inserted = apply(
+        &session,
+        json_of(
+            session
+                .insert_component_instance_json(
+                    &component_id.to_string(),
+                    &root.to_string(),
+                    None,
+                    400.0,
+                    300.0,
+                )
+                .unwrap(),
+        ),
+    );
+    let instance_id =
+        Uuid::parse_str(inserted["nodes"][0]["children"][1].as_str().unwrap()).unwrap();
+    let instance = find(&inserted, instance_id);
+    assert_eq!(instance["kind"], "componentInstance");
+    assert_eq!(instance["layout"]["w"], 200.0);
+    assert_eq!(instance["children"].as_array().unwrap().len(), 1);
+    assert_eq!(box_of(&session, instance_id), (400.0, 300.0, 200.0, 80.0));
+    let copy_label = instance["children"][0].as_str().unwrap();
+    assert_ne!(copy_label, label.to_string());
+    assert_eq!(
+        find(&inserted, Uuid::parse_str(copy_label).unwrap())["content"]["text"],
+        "Карточка"
+    );
+
+    let broken = apply(
+        &session,
+        json_of(
+            session
+                .break_component_link_json(&instance_id.to_string())
+                .unwrap(),
+        ),
+    );
+    let instance = find(&broken, instance_id);
+    assert_eq!(instance["kind"], "frame");
+    assert!(instance["content"].get("componentId").is_none());
+    assert_eq!(instance["children"].as_array().unwrap().len(), 1);
+    assert_eq!(box_of(&session, instance_id), (400.0, 300.0, 200.0, 80.0));
+    assert_eq!(
+        broken["components"],
+        json!([{
+            "id": component["id"], "rootId": card, "name": "Card"
+        }])
+    );
+    session.undo().unwrap();
+    assert!(find(&document_of(&session), instance_id)["content"]["componentId"].is_string());
+    let error = session
+        .create_component_json(vec![instance_id.to_string()], None)
+        .unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_FEATURE");
+    session.save().unwrap();
+    drop(session);
+    let reopened = open_project(&path).unwrap();
+    assert_eq!(box_of(&reopened, instance_id), (400.0, 300.0, 200.0, 80.0));
+}
+
+#[test]
+fn defining_a_component_checks_the_root_and_records_history() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("project");
+    let session = create_project(&path, "Detached").unwrap();
+    let root = root(&session);
+    let frame = Uuid::new_v4();
+    let component = Uuid::new_v4();
+    apply(
+        &session,
+        transaction(
+            &session,
+            &[root, frame],
+            json!([{"type": "insertNode", "parentId": root, "index": 0, "node": node(frame, root, "frame")}]),
+        ),
+    );
+    let defined = apply(
+        &session,
+        json_of(
+            session
+                .set_component_json(
+                    &component.to_string(),
+                    &frame.to_string(),
+                    Some("Direct".into()),
+                )
+                .unwrap(),
+        ),
+    );
+    assert_eq!(defined["components"].as_array().unwrap().len(), 1);
+    assert_eq!(defined["components"][0]["rootId"], json!(frame));
+    assert_eq!(defined["components"][0]["name"], "Direct");
+    // Reusing the component ID would silently rewrite an existing definition.
+    assert!(session
+        .set_component_json(&component.to_string(), &frame.to_string(), None)
+        .unwrap_err()
+        .message
+        .contains("already exists"));
+    let error = session
+        .set_component_json(
+            &Uuid::new_v4().to_string(),
+            &Uuid::new_v4().to_string(),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "INVALID_DOCUMENT");
+    assert!(
+        error.message.starts_with("Unknown node"),
+        "{}",
+        error.message
+    );
+    let mut defined = document_of(&session);
+    defined.as_object_mut().unwrap().remove("revision");
+    session.undo().unwrap();
+    assert!(document_of(&session)["components"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(document_of(&session)["nodes"].as_array().unwrap().len(), 2);
+    session.redo().unwrap();
+    let mut after = document_of(&session);
+    after.as_object_mut().unwrap().remove("revision");
+    assert_eq!(after, defined);
+}
