@@ -58,6 +58,7 @@ struct WorkspaceView: View {
                     Text("Инспектор").tag(0)
                     Text("Слои").tag(1)
                     Text("Страницы").tag(2)
+                    Text("Токены").tag(3)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
@@ -67,6 +68,7 @@ struct WorkspaceView: View {
                     switch sidebarTab {
                     case 1: LayersPanel(model: model)
                     case 2: pagesList(snapshot)
+                    case 3: TokensPanel(model: model)
                     default:
                         if snapshot.root != nil {
                             InspectorView(model: model, snapshot: snapshot)
@@ -129,6 +131,13 @@ struct WorkspaceView: View {
         }
         .onChange(of: searchOpen) { _, open in
             if !open { WorkspaceCommands.shared.search = false }
+        }
+        .sheet(isPresented: Binding(
+            get: { model.restoreTextTarget != nil },
+            set: { if !$0 { model.restoreTextTarget = nil } })) {
+            if let id = model.restoreTextTarget {
+                RestoreTextSheet(model: model, nodeId: id).id(id)
+            }
         }
     }
 

@@ -21,12 +21,14 @@ SOURCES=(
   apps/macos/AIConstructor/Model/SnapshotModel.swift
   apps/macos/AIConstructor/Model/ProjectLibrary.swift
   apps/macos/AIConstructor/Model/WorkspaceModel.swift
+  apps/macos/AIConstructor/Model/EditingActions.swift
   apps/macos/AIConstructor/Views/ProjectBrowser.swift
   apps/macos/AIConstructor/Views/ChatsPanel.swift
   apps/macos/AIConstructor/Views/AssetsPanel.swift
   apps/macos/AIConstructor/Views/DiagnosticsPanel.swift
   apps/macos/AIConstructor/Views/Components.swift
   apps/macos/AIConstructor/Views/LayersPanel.swift
+  apps/macos/AIConstructor/Views/TokensPanel.swift
   apps/macos/AIConstructor/Views/Inspector/InspectorSupport.swift
   apps/macos/AIConstructor/Views/Inspector/InspectorView.swift
   apps/macos/AIConstructor/Views/Canvas/TextEditorOverlay.swift

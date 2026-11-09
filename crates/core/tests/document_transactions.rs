@@ -3438,7 +3438,13 @@ fn preview_html_clips_labels_and_centres_button_text() {
     let html = session.preview_html(None).unwrap();
     for id in [text, button] {
         let node_html = html.split(&format!("data-id=\"{id}\"")).nth(1).unwrap();
-        let style = node_html.split("style=\"").nth(1).unwrap().split('"').next().unwrap();
+        let style = node_html
+            .split("style=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
         assert!(style.contains("overflow:hidden;"), "{id}: {style}");
     }
     assert!(html.contains(".node.k-button .text"));
